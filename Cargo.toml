@@ -1,0 +1,24 @@
+[package]
+name = "rust-binance-event-driven"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio-tungstenite = "0.20"
+futures-util = "0.3"
+url = "2.0"
+log = "0.4"
+env_logger = "0.10"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+uuid = { version = "1.0", features = ["v4"] }
+thiserror = "1.0"
+config = "0.13"
+parking_lot = "0.12"
+dashmap = "5.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
