@@ -1,10 +1,5 @@
-use thiserror::Error;
-pub type Result<T> = std::result::Result<T, InfrastructureError>;
+//! 基础设施错误模块
+//! 
+//! 统一使用 crate::error 模块中的 InfrastructureError
 
-#[derive(Error, Debug)]
-pub enum InfrastructureError {
-    /// 配置错误
-    #[error("配置错误: {0}")]
-    ConfigError(String),
-    
-}
+pub use crate::error::InfrastructureError;
