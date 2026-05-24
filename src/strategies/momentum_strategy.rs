@@ -46,8 +46,15 @@ impl PersistentState {
         }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(STATE_FILE, &json) {
-                    log::error!("保存策略状态失败: {}", e);
+                // 原子写入：先写临时文件，再rename，防止并发写入损坏
+                let temp_file = format!("{}.tmp", STATE_FILE);
+                if let Err(e) = std::fs::write(&temp_file, &json) {
+                    log::error!("保存策略状态失败(写临时文件): {}", e);
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&temp_file, STATE_FILE) {
+                    log::error!("保存策略状态失败(rename): {}", e);
+                    let _ = std::fs::remove_file(&temp_file);
                 }
             }
             Err(e) => log::error!("序列化策略状态失败: {}", e),
@@ -144,24 +151,30 @@ impl StrategyState {
             kline_5m_count: 0,
         };
         
-        // 恢复持久化状态
+        // 恢复持久化状态（含合法性校验）
         if let Some(ps) = persisted {
-            log::info!("恢复持仓状态: {:?} | 入场价: {:.2}", ps.position, ps.entry_price);
-            state.position = ps.position;
-            state.entry_price = ps.entry_price;
-            state.entry_time = ps.entry_time;
-            state.last_trade_time = ps.last_trade_time;
-            state.daily_trades = ps.daily_trades;
-            state.daily_pnl = ps.daily_pnl;
-            state.last_day = ps.last_day;
+            if ps.position == Position::Long && ps.entry_price <= 0.0 {
+                log::error!("恢复状态异常: 持仓中但entry_price={:.8}，丢弃该状态", ps.entry_price);
+            } else if ps.position == Position::Long && ps.entry_time == 0 {
+                log::error!("恢复状态异常: 持仓中但entry_time=0，丢弃该状态");
+            } else {
+                log::info!("恢复持仓状态: {:?} | 入场价: {:.2}", ps.position, ps.entry_price);
+                state.position = ps.position;
+                state.entry_price = ps.entry_price;
+                state.entry_time = ps.entry_time;
+                state.last_trade_time = ps.last_trade_time;
+                state.daily_trades = ps.daily_trades;
+                state.daily_pnl = ps.daily_pnl;
+                state.last_day = ps.last_day;
+            }
         }
         
         state
     }
     
-    /// 保存当前状态到文件
-    fn persist(&self) {
-        let ps = PersistentState {
+    /// 创建持久化快照（不执行IO，可在锁外保存）
+    fn snapshot(&self) -> PersistentState {
+        PersistentState {
             position: self.position.clone(),
             entry_price: self.entry_price,
             entry_time: self.entry_time,
@@ -169,8 +182,7 @@ impl StrategyState {
             daily_trades: self.daily_trades,
             daily_pnl: self.daily_pnl,
             last_day: self.last_day,
-        };
-        ps.save();
+        }
     }
 
     /// 是否完成预热（需要足够的K线数据）
@@ -225,22 +237,22 @@ impl MomentumStrategy {
         let mut state = self.state.lock().await;
 
         // 数据超时检测：如果持仓中且超过30秒没收到BookTicker，紧急平仓
-        if state.position == Position::Long && state.last_data_time > 0 {
+        if state.position == Position::Long && state.last_data_time > 0 && state.entry_price > 0.0 {
             let kline_time = event.close_time;
             if kline_time > state.last_data_time && (kline_time - state.last_data_time) > 30000 {
                 let current_price = event.close;
                 let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
-                println!("\n紧急平仓 | {} | 盈亏: {:.3}% | 价: {:.2} | 原因: 数据超时",
-                    self.config.symbol, pnl_pct, current_price);
                 log::warn!("⚠️ 数据超时紧急平仓 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}%",
                     self.config.symbol, state.entry_price, current_price, pnl_pct);
                 
                 state.position = Position::None;
                 state.daily_pnl += pnl_pct;
                 state.daily_trades += 1;
-                state.persist();
-                
+                state.rsi_was_oversold = false;
+                state.rsi_was_overbought = false;
+                let snap = state.snapshot();
                 drop(state);
+                tokio::task::spawn_blocking(move || snap.save());
                 self.emit_signal("SELL", current_price, kline_time).await;
                 return;
             }
@@ -309,6 +321,14 @@ impl MomentumStrategy {
             return;
         }
 
+        // 价差异常保护：点差超过0.5%视为异常行情，不交易
+        let spread_pct = (event.best_ask - event.best_bid) / event.best_bid * 100.0;
+        if spread_pct > 0.5 {
+            log::warn!("异常点差: {:.4}%，跳过本次信号 (bid={:.2}, ask={:.2})",
+                spread_pct, event.best_bid, event.best_ask);
+            return;
+        }
+
         // 日重置检查
         state.check_daily_reset(event.timestamp);
 
@@ -320,7 +340,7 @@ impl MomentumStrategy {
         let now_ms = event.timestamp;
 
         // 检查出场条件（持仓时）
-        if state.position == Position::Long {
+        if state.position == Position::Long && state.entry_price > 0.0 {
             let current_price = state.best_bid; // 卖出用bid
             let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
             let hold_secs = (now_ms - state.entry_time) / 1000;
@@ -342,8 +362,6 @@ impl MomentumStrategy {
                     "RSI超买"
                 };
 
-                println!("\n平仓信号 | {} | 入场:{:.2} | 当前:{:.2} | 盈亏:{:.3}% | 原因:{} | 持仓:{}s",
-                    self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
                 log::info!("🔴 平仓 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {} | 持仓: {}s",
                     self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
 
@@ -351,10 +369,11 @@ impl MomentumStrategy {
                 state.daily_pnl += pnl_pct;
                 state.last_trade_time = now_ms;
                 state.daily_trades += 1;
-                state.persist();
-
-                // 发布卖出信号
+                state.rsi_was_oversold = false;
+                state.rsi_was_overbought = false;
+                let snap = state.snapshot();
                 drop(state);
+                tokio::task::spawn_blocking(move || snap.save());
                 self.emit_signal("SELL", current_price, now_ms).await;
                 return;
             }
@@ -398,9 +417,6 @@ impl MomentumStrategy {
             if trend_up && rsi_recovering && buy_dominant && bid_support {
                 let entry_price = state.best_ask; // 买入用ask
 
-                println!("\n做多信号 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 盘口:{:.4}/{:.4}",
-                    self.config.symbol, entry_price, rsi, vol_ratio,
-                    ema_fast_5m, ema_slow_5m, state.best_bid_qty, state.best_ask_qty);
                 log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 盘口:{:.4}/{:.4}",
                     self.config.symbol, entry_price, rsi, vol_ratio,
                     ema_fast_5m, ema_slow_5m, state.best_bid_qty, state.best_ask_qty);
@@ -411,9 +427,9 @@ impl MomentumStrategy {
                 state.rsi_was_oversold = false;
                 state.last_trade_time = now_ms;
                 state.daily_trades += 1;
-                state.persist();
-
+                let snap = state.snapshot();
                 drop(state);
+                tokio::task::spawn_blocking(move || snap.save());
                 self.emit_signal("BUY", entry_price, now_ms).await;
             }
         }
@@ -443,7 +459,7 @@ impl MomentumStrategy {
         };
 
         if let Err(e) = self.event_bus.publish(DomainEvent::TradingSignal(signal)).await {
-            eprintln!("发布交易信号失败: {}", e);
+            log::error!("发布交易信号失败: {}", e);
         }
     }
 }

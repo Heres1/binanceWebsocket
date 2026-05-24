@@ -80,8 +80,8 @@ impl TokioEventBus {
         }
     }
     
-    /// 获取事件总线容量
-    pub fn capacity(&self) -> usize {
+    /// 获取事件总线当前未消费的消息数
+    pub fn pending_count(&self) -> usize {
         self.sender.len()
     }
 }

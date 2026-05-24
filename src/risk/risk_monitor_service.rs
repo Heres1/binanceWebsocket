@@ -54,7 +54,7 @@ impl RiskMonitorService {
                 // 发布风控告警事件
                 let event = DomainEvent::RiskAlert(alert.clone());
                 if let Err(e) = self.event_bus.publish(event).await {
-                    eprintln!("发布风控告警事件失败: {}", e);
+                    log::error!("发布风控告警事件失败: {}", e);
                 }
                 
                 Err(alert)

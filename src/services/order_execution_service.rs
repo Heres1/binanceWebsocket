@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use std::time::Duration;
 
 use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
 use crate::events::{
@@ -94,6 +95,44 @@ impl OrderExecutionService {
         }
     }
 
+    /// 启动定期余额同步任务（每60秒同步一次）
+    pub fn start_balance_sync_task(&self) {
+        let client = self.client.clone();
+        let balance = self.balance.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await; // 跳过第一次立即触发
+            
+            loop {
+                interval.tick().await;
+                match client.get_account().await {
+                    Ok(account) => {
+                        let mut bal = balance.lock().await;
+                        for b in &account.balances {
+                            match b.asset.as_str() {
+                                "USDT" => {
+                                    bal.available_usdt = b.free.parse().unwrap_or(0.0);
+                                    bal.locked_usdt = b.locked.parse().unwrap_or(0.0);
+                                }
+                                "BTC" => {
+                                    bal.btc_free = b.free.parse().unwrap_or(0.0);
+                                    bal.btc_locked = b.locked.parse().unwrap_or(0.0);
+                                }
+                                _ => {}
+                            }
+                        }
+                        log::debug!("定期余额同步 | USDT: {:.2} | BTC: {:.6}",
+                            bal.available_usdt, bal.btc_free);
+                    }
+                    Err(e) => {
+                        log::warn!("定期余额同步失败: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
     /// 执行交易信号 - 使用市价单快速成交
     pub async fn execute_signal(
         &self,
@@ -165,7 +204,21 @@ impl OrderExecutionService {
         let actual_quote_qty = order_result.cummulative_quote_qty.parse::<f64>()
             .unwrap_or(order_amount); // 实际花费/收入的 USDT
 
-        // 7. 更新本地余额缓存（使用实际成交金额）
+        // 从API返回的fills中获取实际手续费
+        let (commission, commission_asset) = if let Some(ref fills) = order_result.fills {
+            let total_commission: f64 = fills.iter()
+                .filter_map(|f| f.commission.parse::<f64>().ok())
+                .sum();
+            let asset = fills.first()
+                .map(|f| f.commission_asset.clone())
+                .unwrap_or_else(|| "USDT".to_string());
+            (total_commission, asset)
+        } else {
+            // 备用：用默认0.1%估算
+            (fill_qty * fill_price * 0.001, "USDT".to_string())
+        };
+
+        // 7. 更新本地余额缓存（使用实际成交金额，保护不变为负数）
         {
             let mut bal = self.balance.lock().await;
             if side == "BUY" {
@@ -173,7 +226,12 @@ impl OrderExecutionService {
                 bal.btc_free += fill_qty;
             } else {
                 bal.available_usdt += actual_quote_qty;
-                bal.btc_free -= fill_qty;
+                bal.btc_free = (bal.btc_free - fill_qty).max(0.0);
+            }
+            // 安全下限保护
+            if bal.available_usdt < 0.0 {
+                log::warn!("本地余额缓存异常: USDT={:.4}，强制置0", bal.available_usdt);
+                bal.available_usdt = 0.0;
             }
         }
 
@@ -183,8 +241,8 @@ impl OrderExecutionService {
             fill_id: format!("fill_{}", order_result.order_id),
             fill_price,
             fill_qty,
-            commission: fill_qty * fill_price * 0.001, // Binance现货手续费0.1%
-            commission_asset: "USDT".to_string(),
+            commission,
+            commission_asset: commission_asset.clone(),
             is_maker: false,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
         });
@@ -192,9 +250,9 @@ impl OrderExecutionService {
         self.event_bus.publish(fill_event).await
             .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
 
-        log::info!("市价单成交 | {} | {} | 价: {:.2} | 量: {:.6} | 手续费: {:.4} | order_id: {}",
+        log::info!("市价单成交 | {} | {} | 价: {:.2} | 量: {:.6} | 手续费: {:.6} {} | order_id: {}",
             order_result.symbol, side, fill_price, fill_qty,
-            fill_qty * fill_price * 0.001, order_result.order_id);
+            commission, commission_asset, order_result.order_id);
 
         Ok(())
     }

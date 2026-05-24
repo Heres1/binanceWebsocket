@@ -120,6 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     // 启动时同步真实账户余额
     order_execution.sync_balance().await?;
+    // 启动定期余额同步（每60秒与交易所对账）
+    order_execution.start_balance_sync_task();
     event_bus.subscribe(order_execution.clone());
     
     // ==========================================

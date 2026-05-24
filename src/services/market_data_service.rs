@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::time::{interval, timeout};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
@@ -36,6 +35,7 @@ pub struct MarketDataService {
     symbols: Vec<String>,
     ws_url: String,
     reconnect_interval: u64,
+    max_reconnect_interval: u64,
     connect_timeout: u64,
     connection_mode: ConnectionMode,
 }
@@ -79,6 +79,7 @@ impl MarketDataService {
             symbols,
             ws_url,
             reconnect_interval: 5,
+            max_reconnect_interval: 60,
             connect_timeout: 30,
             connection_mode: ConnectionMode::Auto,
         }
@@ -102,19 +103,28 @@ impl MarketDataService {
         self
     }
     
-    /// 启动服务（带自动重连）
+    /// 启动服务（带指数退避重连）
     pub async fn start(&self) -> Result<(), DomainError> {
         log::info!("启动市场数据服务，订阅: {:?}", self.symbols);
         
+        let mut retry_interval = self.reconnect_interval;
+        
         loop {
+            let connect_start = std::time::Instant::now();
             match self.connect_and_run().await {
                 Ok(_) => {
                     log::info!("WebSocket连接正常关闭");
                     break;
                 }
                 Err(e) => {
-                    log::warn!("WebSocket连接失败: {}，{}秒后重连", e, self.reconnect_interval);
-                    tokio::time::sleep(Duration::from_secs(self.reconnect_interval)).await;
+                    // 如果运行超过30秒，说明曾成功连接过，重置退避间隔
+                    if connect_start.elapsed() > Duration::from_secs(30) {
+                        retry_interval = self.reconnect_interval;
+                    }
+                    log::warn!("WebSocket连接失败: {}，{}秒后重连", e, retry_interval);
+                    tokio::time::sleep(Duration::from_secs(retry_interval)).await;
+                    // 指数退避：5s → 10s → 20s → 40s → 60s(封顶)
+                    retry_interval = (retry_interval * 2).min(self.max_reconnect_interval);
                 }
             }
         }
@@ -346,17 +356,13 @@ impl MarketDataService {
             log::info!("发送订阅消息: {}", subscribe_msg);
         }
         
-        // 启动心跳检测
-        let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel(1);
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(30));
-            loop {
-                ticker.tick().await;
-                if heartbeat_tx.send(()).await.is_err() {
-                    break;
-                }
-            }
-        });
+        // 心跳超时检测：如果60秒内没有收到任何消息，认为连接已断
+        let heartbeat_interval = Duration::from_secs(30);
+        let heartbeat_timeout = Duration::from_secs(60);
+        let mut last_message_time = std::time::Instant::now();
+        let mut heartbeat_ticker = interval(heartbeat_interval);
+        // 跳过第一次立即触发
+        heartbeat_ticker.tick().await;
         
         // 主循环：接收消息
         loop {
@@ -365,6 +371,7 @@ impl MarketDataService {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
+                            last_message_time = std::time::Instant::now();
                             if let Err(e) = self.handle_message(&text).await {
                                 log::error!("处理消息失败: {}", e);
                             }
@@ -374,26 +381,41 @@ impl MarketDataService {
                             break;
                         }
                         Some(Ok(Message::Ping(data))) => {
-                            // 自动回复pong
+                            last_message_time = std::time::Instant::now();
                             write.send(Message::Pong(data)).await.ok();
+                        }
+                        Some(Ok(Message::Pong(_))) => {
+                            last_message_time = std::time::Instant::now();
                         }
                         Some(Err(e)) => {
                             log::error!("WebSocket错误: {}", e);
+                            break;
+                        }
+                        None => {
+                            log::warn!("WebSocket流结束");
                             break;
                         }
                         _ => {}
                     }
                 }
                 
-                // 心跳检测
-                _ = heartbeat_rx.recv() => {
+                // 定时心跳 + 超时检测
+                _ = heartbeat_ticker.tick() => {
+                    // 检查是否超时（无消息时间超过60秒）
+                    if last_message_time.elapsed() > heartbeat_timeout {
+                        log::error!("心跳超时: {}s未收到任何消息，断开重连",
+                            last_message_time.elapsed().as_secs());
+                        break;
+                    }
                     // 发送ping保持连接
-                    write.send(Message::Ping(vec![])).await.ok();
+                    if write.send(Message::Ping(vec![])).await.is_err() {
+                        log::error!("Ping发送失败，连接可能已断");
+                        break;
+                    }
                 }
             }
         }
         
-        heartbeat_handle.abort();
         Ok(())
     }
     
@@ -472,6 +494,15 @@ impl MarketDataService {
         let close_time = k.get("T").and_then(|v| v.as_u64()).unwrap_or(0);
         let is_closed = k.get("x").and_then(|v| v.as_bool()).unwrap_or(false);
         let trades_count = k.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        // 关键字段校验：close或open为0表示数据异常
+        if close <= 0.0 || open <= 0.0 {
+            log::warn!("K线数据异常: symbol={} interval={} open={} close={}，跳过",
+                symbol, interval, open, close);
+            return Err(DomainError::Service(
+                ServiceError::MarketData(format!("K线价格异常: open={}, close={}", open, close))
+            ));
+        }
         
         Ok(KlineCompletedEvent {
             symbol: symbol.to_string(),

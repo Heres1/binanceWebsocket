@@ -173,6 +173,25 @@ impl AppConfig {
             ));
         }
         
+        if self.risk.max_single_order_usdt > self.risk.max_position_usdt {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "风控配置冲突",
+                    format!("单笔最大金额({:.2})不应超过最大持仓金额({:.2})",
+                        self.risk.max_single_order_usdt, self.risk.max_position_usdt)
+                )
+            ));
+        }
+        
+        if self.risk.max_daily_loss_usdt <= 0.0 {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "日亏损上限",
+                    "必须大于0".to_string()
+                )
+            ));
+        }
+        
         // 验证网络配置
         match self.network.connection_mode.as_str() {
             "auto" | "direct" | "proxy" | "ssh_tunnel" => {},

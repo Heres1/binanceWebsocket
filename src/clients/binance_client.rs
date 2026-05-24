@@ -21,6 +21,7 @@ pub struct BinanceClient {
     secret_key: String,
     base_url: String,
     recv_window: u64,  // 毫秒，默认 5000
+    max_retries: u32,  // 最大重试次数
 }
 
 /// 订单响应
@@ -168,6 +169,7 @@ impl BinanceClient {
             secret_key,
             base_url,
             recv_window: 5000,  // 5秒
+            max_retries: 2,     // 最多重试2次（共试3次）
         }
     }
 
@@ -211,49 +213,92 @@ impl BinanceClient {
         format!("{}&signature={}", query_string, signature)
     }
 
-    /// 发送 GET 请求
+    /// 发送 GET 请求（带重试）
     async fn get(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
-        let query = self.build_signed_query(params);
-        let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
-
-        let response = self.client
-            .get(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ServiceError::MarketData(format!("HTTP 请求失败: {}", e)))?;
-
-        self.handle_response(response).await
+        let mut last_err = None;
+        
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                log::warn!("GET {} 重试 {}/{}", path, attempt, self.max_retries);
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
+            
+            // 每次重试重新生成签名（timestamp会变）
+            let query = self.build_signed_query(params);
+            let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
+            
+            match self.client
+                .get(&url)
+                .header("X-MBX-APIKEY", &self.api_key)
+                .send()
+                .await
+            {
+                Ok(response) => return self.handle_response(response).await,
+                Err(e) => {
+                    last_err = Some(ServiceError::MarketData(format!("HTTP 请求失败: {}", e)));
+                }
+            }
+        }
+        
+        Err(last_err.unwrap().into())
     }
 
-    /// 发送 POST 请求
+    /// 发送 POST 请求（带重试，仅网络层失败时重试）
     async fn post(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
-        let query = self.build_signed_query(params);
-        let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
-
-        let response = self.client
-            .post(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ServiceError::Order(format!("HTTP 请求失败: {}", e)))?;
-
-        self.handle_response(response).await
+        let mut last_err = None;
+        
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                log::warn!("POST {} 重试 {}/{}", path, attempt, self.max_retries);
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
+            
+            let query = self.build_signed_query(params);
+            let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
+            
+            match self.client
+                .post(&url)
+                .header("X-MBX-APIKEY", &self.api_key)
+                .send()
+                .await
+            {
+                Ok(response) => return self.handle_response(response).await,
+                Err(e) => {
+                    last_err = Some(ServiceError::Order(format!("HTTP 请求失败: {}", e)));
+                }
+            }
+        }
+        
+        Err(last_err.unwrap().into())
     }
 
-    /// 发送 DELETE 请求
+    /// 发送 DELETE 请求（带重试）
     async fn delete(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
-        let query = self.build_signed_query(params);
-        let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
-
-        let response = self.client
-            .delete(&url)
-            .header("X-MBX-APIKEY", &self.api_key)
-            .send()
-            .await
-            .map_err(|e| ServiceError::Order(format!("HTTP 请求失败: {}", e)))?;
-
-        self.handle_response(response).await
+        let mut last_err = None;
+        
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                log::warn!("DELETE {} 重试 {}/{}", path, attempt, self.max_retries);
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
+            
+            let query = self.build_signed_query(params);
+            let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
+            
+            match self.client
+                .delete(&url)
+                .header("X-MBX-APIKEY", &self.api_key)
+                .send()
+                .await
+            {
+                Ok(response) => return self.handle_response(response).await,
+                Err(e) => {
+                    last_err = Some(ServiceError::Order(format!("HTTP 请求失败: {}", e)));
+                }
+            }
+        }
+        
+        Err(last_err.unwrap().into())
     }
 
     /// 处理 HTTP 响应
