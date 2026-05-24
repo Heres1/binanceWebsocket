@@ -123,87 +123,75 @@ impl MarketDataService {
         Ok(())
     }
     
-    /// 连接WebSocket并运行（支持HTTP代理）
+    /// 连接WebSocket并运行
     async fn connect_and_run(&self) -> Result<(), DomainError> {
         log::info!("WebSocket连接: {}", self.ws_url);
         
-        // 解析WebSocket URL
-        let ws_url = Url::parse(&self.ws_url).map_err(|e| {
-            DomainError::Service(ServiceError::MarketData(format!("URL解析失败: {}", e)))
-        })?;
+        // SSH隧道模式：手动TCP+TLS+WS
+        if env::var("USE_SSH_TUNNEL").is_ok() {
+            log::info!("使用SSH隧道模式");
+            let tls_stream = self.connect_direct_with_tls_host("127.0.0.1", 9443, "stream.binance.com").await?;
+            let ws_request = self.build_ws_request()?;
+            log::info!("WebSocket握手中... (SSH隧道)");
+            let (ws_stream, response) = timeout(
+                Duration::from_secs(self.connect_timeout),
+                tokio_tungstenite::client_async(ws_request, tls_stream)
+            ).await
+            .map_err(|_| DomainError::Service(ServiceError::MarketData("WebSocket握手超时".to_string())))?
+            .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("WebSocket握手失败: {}", e))))?;
+            log::info!("WebSocket连接成功 | 状态码: {} | 模式: SSH隧道", response.status());
+            return self.handle_connection_generic(ws_stream).await;
+        }
         
-        let host = ws_url.host_str().ok_or_else(|| {
-            DomainError::Service(ServiceError::MarketData("缺少host".to_string()))
-        })?;
-        let port = ws_url.port_or_known_default().unwrap_or(443);
-        
-        // SSH隧道模式：连接localhost，但TLS验证stream.binance.com
-        let (connect_host, connect_port, tls_host) = if env::var("USE_SSH_TUNNEL").is_ok() {
-            ("127.0.0.1", 9443, "stream.binance.com")
-        } else {
-            (host, port, host)
+        // 代理模式：手动CONNECT+TLS+WS
+        let use_proxy = match self.connection_mode {
+            ConnectionMode::Direct => false,
+            ConnectionMode::Proxy => true,
+            ConnectionMode::Auto => env::var("HTTPS_PROXY").is_ok() || env::var("https_proxy").is_ok(),
         };
         
-        // 根据连接模式决定是否使用代理
-        // SSH隧道模式下强制直连，忽略代理设置
-        let use_proxy = if env::var("USE_SSH_TUNNEL").is_ok() {
-            false
-        } else {
-            match self.connection_mode {
-                ConnectionMode::Direct => false,
-                ConnectionMode::Proxy => true,
-                ConnectionMode::Auto => env::var("HTTPS_PROXY").is_ok() || env::var("https_proxy").is_ok(),
-            }
-        };
+        if use_proxy {
+            let proxy = env::var("HTTPS_PROXY").or_else(|_| env::var("https_proxy"))
+                .map_err(|_| DomainError::Service(ServiceError::MarketData("代理模式但未设置 HTTPS_PROXY".to_string())))?;
+            log::info!("使用HTTP代理: {}", proxy);
+            let tls_stream = self.connect_via_proxy(&proxy, "stream.binance.com", 443).await?;
+            let ws_request = self.build_ws_request()?;
+            log::info!("WebSocket握手中... (代理模式)");
+            let (ws_stream, response) = timeout(
+                Duration::from_secs(self.connect_timeout),
+                tokio_tungstenite::client_async(ws_request, tls_stream)
+            ).await
+            .map_err(|_| DomainError::Service(ServiceError::MarketData("WebSocket握手超时".to_string())))?
+            .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("WebSocket握手失败: {}", e))))?;
+            log::info!("WebSocket连接成功 | 状态码: {} | 模式: 代理", response.status());
+            return self.handle_connection_generic(ws_stream).await;
+        }
         
-        let tls_stream = if use_proxy {
-            match env::var("HTTPS_PROXY").or_else(|_| env::var("https_proxy")) {
-                Ok(proxy) => {
-                    println!("使用HTTP代理: {}", proxy);
-                    self.connect_via_proxy(&proxy, tls_host, connect_port).await?
-                }
-                Err(_) => {
-                    return Err(DomainError::Service(ServiceError::MarketData(
-                        "代理模式但未设置 HTTPS_PROXY 环境变量".to_string()
-                    )));
-                }
-            }
-        } else {
-            println!("直接连接（无代理）到 {}:{}", connect_host, connect_port);
-            self.connect_direct_with_tls_host(connect_host, connect_port, tls_host).await?
-        };
-        
-        // WebSocket握手 - 手动构建请求确保头正确
-        log::info!("WebSocket握手中...");
-        let ws_request = self.build_ws_request()?;
+        // 直连模式：使用 tokio-tungstenite 内置的 connect_async（最标准的方式）
+        log::info!("直连模式 | 目标: {}", self.ws_url);
         let (ws_stream, response) = timeout(
             Duration::from_secs(self.connect_timeout),
-            tokio_tungstenite::client_async(ws_request, tls_stream)
+            tokio_tungstenite::connect_async(&self.ws_url)
         ).await
-        .map_err(|_| DomainError::Service(ServiceError::MarketData("WebSocket握手超时".to_string())))?
-        .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("WebSocket握手失败: {}", e))))?;
+        .map_err(|_| DomainError::Service(ServiceError::MarketData("WebSocket连接超时(30s)".to_string())))?
+        .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("WebSocket连接失败: {}", e))))?;
         
-        log::info!("WebSocket连接成功 | 状态码: {}", response.status());
-        
-        self.handle_connection(ws_stream).await
+        log::info!("WebSocket连接成功 | 状态码: {} | 模式: 直连", response.status());
+        self.handle_connection_generic(ws_stream).await
     }
     
-    /// 手动构建 WebSocket 升级请求，避免 tungstenite 自动解析 URL 可能导致的头问题
+    /// 手动构建 WebSocket 升级请求，确保 Host/Origin 头正确
     fn build_ws_request(&self) -> Result<http::Request<()>, DomainError> {
         let url = Url::parse(&self.ws_url).map_err(|e| {
             DomainError::Service(ServiceError::MarketData(format!("URL解析失败: {}", e)))
         })?;
         
         let host = url.host_str().unwrap_or("stream.binance.com");
-        let path_and_query = if let Some(query) = url.query() {
-            format!("{}?{}", url.path(), query)
-        } else {
-            url.path().to_string()
-        };
         
+        // URI 必须包含完整 wss:// 前缀，tungstenite 需要验证 scheme
         let request = http::Request::builder()
             .method("GET")
-            .uri(&path_and_query)
+            .uri(self.ws_url.as_str())
             .header("Host", host)
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
@@ -212,6 +200,8 @@ impl MarketDataService {
             .header("Origin", "https://stream.binance.com")
             .body(())
             .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("构建请求失败: {}", e))))?;
+        
+        log::info!("WebSocket请求头 | Host: {} | URI: {} | Origin: https://stream.binance.com", host, self.ws_url);
         
         Ok(request)
     }
@@ -339,11 +329,14 @@ impl MarketDataService {
         self.tls_handshake(target_host, tcp).await
     }
     
-    /// 处理WebSocket连接
-    async fn handle_connection(
+    /// 处理WebSocket连接（泛型，支持不同流类型）
+    async fn handle_connection_generic<S>(
         &self,
-        ws_stream: WebSocketStream<TlsStream<TcpStream>>,
-    ) -> Result<(), DomainError> {
+        ws_stream: WebSocketStream<S>,
+    ) -> Result<(), DomainError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (mut write, mut read) = ws_stream.split();
         
         // 发送订阅消息（组合流需要发送订阅）
