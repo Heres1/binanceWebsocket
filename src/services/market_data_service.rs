@@ -71,7 +71,8 @@ impl MarketDataService {
         let ws_url = if env::var("USE_SSH_TUNNEL").is_ok() {
             build_ws_url("localhost:9443", &streams)
         } else {
-            build_ws_url("stream.binance.com:9443", &streams)
+            // 使用443端口，避免9443被安全组拦截
+            build_ws_url("stream.binance.com:443", &streams)
         };
         
         Self {
