@@ -1,9 +1,9 @@
 use log::{LevelFilter, Metadata, Record};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::sync::mpsc;
 use std::thread;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use chrono::Local;
 use crate::infrastructure::error::error::InfrastructureError;
 type Result<T> = std::result::Result<T, InfrastructureError>;
@@ -18,9 +18,9 @@ pub enum LogFormat {
 pub struct LoggerConfig {
     level: LevelFilter,      // 日志级别
     format: LogFormat,       // 日志格式
-    file_path: Option<String>, // 日志路径
-    rotate_size: Option<u64>,  // 日志轮转大小（字节）
-    max_files: usize,        // 最大文件数
+    file_path: Option<String>, // 日志基础路径（如 logs/trading.log）
+    rotate_size: Option<u64>,  // 单次运行日志文件大小上限（字节）
+    max_files: usize,        // 历史日志最大保留数
     buffer_size: Option<usize>, // 缓冲区大小
 }
 
@@ -52,8 +52,8 @@ impl LoggerConfig {
             level: LevelFilter::Info,
             format: LogFormat::Text,
             file_path: None,
-            rotate_size: Some(400 * 1024 * 1024), // 默认400MB轮转
-            max_files: 5,
+            rotate_size: Some(100 * 1024 * 1024), // 单文件100MB上限
+            max_files: 10,                         // 保留最近10个历史日志
             buffer_size: Some(1024),
         }
     }
@@ -78,62 +78,83 @@ impl LoggerConfig {
     }
 }
 
-// 日志轮转处理器
-struct LogRotator {
-    base_path: String,
-    max_size: u64,
-    max_files: usize,
+/// 生成带时间戳的日志文件路径
+/// 输入: "logs/trading.log" → 输出: "logs/trading_2026-05-24_163506.log"
+fn generate_session_log_path(base_path: &str) -> String {
+    let path = Path::new(base_path);
+    let stem = path.file_stem().unwrap_or_default().to_str().unwrap_or("trading");
+    let ext = path.extension().unwrap_or_default().to_str().unwrap_or("log");
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let timestamp = Local::now().format("%Y-%m-%d_%H%M%S");
+    dir.join(format!("{}_{}.{}", stem, timestamp, ext)).to_string_lossy().to_string()
 }
 
-impl LogRotator {
-    fn new(base_path: String, max_size: u64, max_files: usize) -> Self {
-        LogRotator {
-            base_path,
-            max_size,
-            max_files,
+/// 清理历史日志，只保留最近 max_files 个
+fn cleanup_old_logs(base_path: &str, max_files: usize) {
+    let path = Path::new(base_path);
+    let stem = path.file_stem().unwrap_or_default().to_str().unwrap_or("trading");
+    let ext = path.extension().unwrap_or_default().to_str().unwrap_or("log");
+    let dir = path.parent().unwrap_or(Path::new("."));
+    
+    // 收集匹配 trading_*.log 的文件
+    let pattern = format!("{}_{}", stem, ""); // prefix: "trading_"
+    let mut log_files: Vec<PathBuf> = Vec::new();
+    
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(&pattern) && file_name.ends_with(&format!(".{}", ext)) {
+                log_files.push(entry.path());
+            }
         }
     }
+    
+    // 按文件名排序（时间戳格式天然有序）
+    log_files.sort();
+    
+    // 如果超过max_files个，删除最旧的
+    if log_files.len() > max_files {
+        let to_remove = log_files.len() - max_files;
+        for old_file in log_files.iter().take(to_remove) {
+            if let Err(e) = fs::remove_file(old_file) {
+                eprintln!("清理旧日志失败 {:?}: {}", old_file, e);
+            }
+        }
+    }
+}
 
-    fn should_rotate(&self) -> bool {
-        match std::fs::metadata(&self.base_path){
-            Ok(metadata) => {
-                if metadata.is_file(){
-                    metadata.len() > self.max_size
-                }else{
-                    false
-                }
-                }
+/// 运行内日志大小监控
+struct SizeMonitor {
+    current_path: String,
+    max_size: u64,
+    base_path: String,
+}
+
+impl SizeMonitor {
+    fn new(current_path: String, max_size: u64, base_path: String) -> Self {
+        SizeMonitor { current_path, max_size, base_path }
+    }
+
+    fn should_split(&self) -> bool {
+        match fs::metadata(&self.current_path) {
+            Ok(m) => m.len() > self.max_size,
             Err(_) => false,
         }
     }
 
-    fn rotate(&self) -> Result<()> {
-        let oldest = format!("{}.{}", self.base_path, self.max_files);
-        if Path::new(&oldest).exists() {
-            std::fs::remove_file(&oldest)
-                .map_err(|e| InfrastructureError::io_with_operation("删除最旧日志文件", e))?;
-        }
-        // 从最后一个文件开始向前重命名
-        for i in (1..self.max_files).rev() {
-            let old_name = format!("{}.{}", self.base_path, i);
-            let new_name = format!("{}.{}", self.base_path, i + 1);
-            // 重命名旧文件
-            if Path::new(&old_name).exists() {
-                std::fs::rename(&old_name, &new_name)
-                    .map_err(|e| InfrastructureError::io_with_operation(
-                        format!("重命名日志文件 {} -> {}", old_name, new_name), e
-                    ))?;
+    /// 当前文件超大时，切换到新文件
+    fn split(&mut self) -> Option<File> {
+        let new_path = generate_session_log_path(&self.base_path);
+        match OpenOptions::new().create(true).append(true).open(&new_path) {
+            Ok(file) => {
+                self.current_path = new_path;
+                Some(file)
+            }
+            Err(e) => {
+                eprintln!("日志分割失败: {}", e);
+                None
             }
         }
-        //将当前日志文件重命名为 .1
-        let backup_name = format!("{}.1", self.base_path);
-        if Path::new(&self.base_path).exists() {
-            std::fs::rename(&self.base_path, &backup_name)
-                .map_err(|e| InfrastructureError::io_with_operation(
-                    format!("备份日志文件 {} -> {}", self.base_path, backup_name), e
-                ))?;
-        }
-        Ok(())
     }
 }
 
@@ -158,31 +179,40 @@ impl AsyncLogger {
         
         let config_clone = config.clone();
         let handle = thread::spawn(move || {
-            // 创建初始日志文件
             let mut current_file: Option<File> = None;
-            let mut rotator: Option<LogRotator> = None;
+            let mut size_monitor: Option<SizeMonitor> = None;
             
-            if let Some(ref file_path) = config_clone.file_path {
+            if let Some(ref base_path) = config_clone.file_path {
                 // 自动创建日志目录
-                if let Some(parent) = Path::new(file_path).parent() {
+                if let Some(parent) = Path::new(base_path).parent() {
                     if !parent.exists() {
-                        if let Err(e) = std::fs::create_dir_all(parent) {
-                            eprintln!("Failed to create log directory {:?}: {}", parent, e);
+                        if let Err(e) = fs::create_dir_all(parent) {
+                            eprintln!("创建日志目录失败 {:?}: {}", parent, e);
                         }
                     }
                 }
                 
-                // 尝试打开日志文件
-                match OpenOptions::new().create(true).append(true).open(file_path) {
+                // 清理历史日志
+                cleanup_old_logs(base_path, config_clone.max_files);
+                
+                // 生成本次运行的日志文件名（带时间戳）
+                let session_path = generate_session_log_path(base_path);
+                
+                match OpenOptions::new().create(true).append(true).open(&session_path) {
                     Ok(file) => {
                         current_file = Some(file);
                         
-                        if let Some(size) = config_clone.rotate_size {
-                            rotator = Some(LogRotator::new(file_path.clone(), size, config_clone.max_files));
+                        if let Some(max_size) = config_clone.rotate_size {
+                            size_monitor = Some(SizeMonitor::new(
+                                session_path.clone(), max_size, base_path.clone()
+                            ));
                         }
+                        
+                        // 创建/更新软链接，方便 tail -f 查看最新日志
+                        let _ = Self::update_symlink(base_path, &session_path);
                     },
                     Err(e) => {
-                        eprintln!("Failed to open log file {}: {}", file_path, e);
+                        eprintln!("打开日志文件失败 {}: {}", session_path, e);
                     }
                 }
             }
@@ -192,22 +222,14 @@ impl AsyncLogger {
                     Ok(msg) => {
                         let formatted_msg = Self::format_message(&config_clone, &msg);
                         
-                        // 检查是否需要轮转
-                        if let Some(ref rotator_val) = rotator {
-                            if rotator_val.should_rotate() {
-                                if let Err(e) = rotator_val.rotate() {
-                                    eprintln!("Log rotation failed: {}", e);
-                                }
-                                
-                                // 重新打开文件
-                                if let Some(ref file_path) = config_clone.file_path {
-                                    match OpenOptions::new().create(true).append(true).open(file_path) {
-                                        Ok(new_file) => {
-                                            current_file = Some(new_file);
-                                        },
-                                        Err(e) => {
-                                            eprintln!("Failed to reopen log file {}: {}", file_path, e);
-                                        }
+                        // 检查是否需要分割（单文件超过上限）
+                        if let Some(ref mut monitor) = size_monitor {
+                            if monitor.should_split() {
+                                if let Some(new_file) = monitor.split() {
+                                    current_file = Some(new_file);
+                                    // 更新软链接指向新文件
+                                    if let Some(ref base_path) = config_clone.file_path {
+                                        let _ = Self::update_symlink(base_path, &monitor.current_path);
                                     }
                                 }
                             }
@@ -216,24 +238,17 @@ impl AsyncLogger {
                         // 写入日志文件
                         if let Some(ref mut file) = current_file {
                             if writeln!(file, "{}", formatted_msg).is_err() {
-                                eprintln!("Failed to write to log file");
+                                eprintln!("日志写入失败");
                             }
-                            
-                            // 立即刷新，确保日志及时写入
-                            if file.flush().is_err() {
-                                eprintln!("Failed to flush log file");
-                            }
+                            let _ = file.flush();
                         }
                         
-                        // 只有WARN和ERROR级别输出到控制台（避免stdout.log过大）
+                        // 只有WARN和ERROR级别输出到控制台
                         if msg.level <= log::Level::Warn {
                             println!("{}", formatted_msg);
                         }
                     },
-                    Err(_) => {
-                        // 接收器已关闭，退出线程
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
         });
@@ -243,6 +258,26 @@ impl AsyncLogger {
             sender: Some(sender),
             handle: Some(handle),
         }
+    }
+
+    /// 创建/更新软链接，让 trading.log 始终指向当前会话的日志文件
+    fn update_symlink(link_path: &str, target_path: &str) -> std::io::Result<()> {
+        let link = Path::new(link_path);
+        // 删除旧的链接或文件
+        if link.exists() || link.symlink_metadata().is_ok() {
+            fs::remove_file(link)?;
+        }
+        // 创建相对路径的软链接
+        let target = Path::new(target_path);
+        let target_filename = target.file_name().unwrap_or_default();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target_filename, link)?;
+        #[cfg(not(unix))]
+        {
+            // Windows不支持symlink，复制文件名到一个标记文件
+            fs::write(link, target_filename.to_string_lossy().as_bytes())?;
+        }
+        Ok(())
     }
 
     fn format_message(config: &LoggerConfig, msg: &LogMessage) -> String {

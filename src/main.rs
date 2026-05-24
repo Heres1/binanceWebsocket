@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = AsyncLogger::init(logger_config) {
         eprintln!("⚠️ 日志系统初始化失败: {}，使用默认输出", e);
     }
-    println!("配置加载完成 | 日志: {}", config.logging.file_path.as_deref().unwrap_or("stdout"));
+    println!("配置加载完成 | 日志: {} (每次启动新建文件)", config.logging.file_path.as_deref().unwrap_or("stdout"));
     println!("   Binance: {} (测试网: {})", 
         if config.binance.testnet { "测试网" } else { "实盘" },
         config.binance.testnet
