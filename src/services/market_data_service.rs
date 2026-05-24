@@ -581,9 +581,9 @@ impl MarketDataService {
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(0.0);
         
-        let timestamp = data.get("u")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+        // 注意: Binance bookTicker的"u"字段是updateId(序列号)，不是时间戳
+        // 必须使用系统时间作为事件时间戳
+        let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         
         Ok(BookTickerEvent {
             symbol: symbol.to_string(),

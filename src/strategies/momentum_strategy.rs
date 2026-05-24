@@ -237,9 +237,11 @@ impl MomentumStrategy {
         let mut state = self.state.lock().await;
 
         // 数据超时检测：如果持仓中且超过30秒没收到BookTicker，紧急平仓
+        // 注意: 使用当前系统时间与last_data_time比较，而不是用kline的close_time
+        // 因为kline的close_time是K线周期的结束边界（5m线可能是未来时间）
         if state.position == Position::Long && state.last_data_time > 0 && state.entry_price > 0.0 {
-            let kline_time = event.close_time;
-            if kline_time > state.last_data_time && (kline_time - state.last_data_time) > 30000 {
+            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+            if now_ms > state.last_data_time && (now_ms - state.last_data_time) > 30000 {
                 let current_price = event.close;
                 let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
                 log::warn!("⚠️ 数据超时紧急平仓 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}%",
@@ -253,7 +255,7 @@ impl MomentumStrategy {
                 let snap = state.snapshot();
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save());
-                self.emit_signal("SELL", current_price, kline_time).await;
+                self.emit_signal("SELL", current_price, now_ms).await;
                 return;
             }
         }
