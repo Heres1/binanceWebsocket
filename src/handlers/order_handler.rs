@@ -14,6 +14,7 @@ use std::sync::Arc;
 /// - OrderCancelled: 订单取消
 /// - OrderRejected: 订单拒绝
 pub struct OrderHandler {
+    #[allow(dead_code)]
     event_bus: Arc<TokioEventBus>,
 }
 

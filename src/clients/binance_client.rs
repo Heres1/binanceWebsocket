@@ -6,7 +6,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{DomainError, ServiceError};
@@ -193,9 +193,11 @@ impl BinanceClient {
             .as_millis() as u64
     }
 
-    /// 构建带签名的查询字符串
+    /// 构建带签名的查询字符串（使用 BTreeMap 保证参数顺序确定性）
     fn build_signed_query(&self, params: &HashMap<String, String>) -> String {
-        let mut query = params.clone();
+        let mut query: BTreeMap<String, String> = params.iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         query.insert("timestamp".to_string(), self.timestamp().to_string());
         query.insert("recvWindow".to_string(), self.recv_window.to_string());
 

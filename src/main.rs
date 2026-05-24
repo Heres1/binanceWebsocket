@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ==========================================
     // 1. 创建事件总线
     // ==========================================
-    let event_bus = Arc::new(TokioEventBus::new(100));
+    let event_bus = Arc::new(TokioEventBus::new(2000));
     
     // 2. 启动事件分发器
     let ready_notify = Arc::new(Notify::new());

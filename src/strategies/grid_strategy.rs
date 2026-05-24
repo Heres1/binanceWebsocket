@@ -193,8 +193,8 @@ impl GridStrategy {
         }
 
         // 打印接收到的价格（调试用）
-        println!(
-            "💰 价格更新 | {} | {:.2} USDT | 24h涨跌: {:.2}%",
+        log::debug!(
+            "价格更新 | {} | {:.2} USDT | 24h涨跌: {:.2}%",
             event.symbol, event.price, event.price_change_pct_24h
         );
 
@@ -220,9 +220,9 @@ impl GridStrategy {
                 self.config.quantity_per_grid,
             );
 
-            // 打印信号（当前阶段不下单）
-            println!(
-                "📊 [{}] {} 信号 | 价格: {:.2} | 数量: {} | 网格级别: {} | 止盈: {:.2}",
+            // 打印信号
+            log::info!(
+                "[{}] {} 信号 | 价格: {:.2} | 数量: {} | 网格级别: {} | 止盈: {:.2}",
                 signal.strategy_id,
                 signal.signal_type,
                 signal.suggested_price,

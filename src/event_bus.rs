@@ -2,7 +2,7 @@
 //! 
 //! 负责事件的发布、订阅和分发
 
-use crate::events::{DomainEvent, EventMetadata};
+use crate::events::DomainEvent;
 use async_trait::async_trait;
 use std::sync::{Arc, atomic::AtomicBool};
 use tokio::sync::{Notify, broadcast};
@@ -39,7 +39,7 @@ pub trait EventHandler: Send + Sync {
 }
 
 /// 事件类型枚举
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EventType {
     PriceUpdate,
     KlineCompleted,
@@ -136,12 +136,25 @@ impl EventDispatcher {
             notify.notify_one();
         }
         while let Ok(event) = receiver.recv().await {
-            let handlers:Vec<_> = {
-                let guard= self.event_bus.handlers.read();
-                guard.values().cloned().collect()
+            let event_type = extract_event_type(&event);
+            
+            // 只分发给关心此事件类型的 handler（按 event_types 过滤）
+            let handlers: Vec<_> = {
+                let guard = self.event_bus.handlers.read();
+                guard.values()
+                    .filter(|h| {
+                        let types = h.event_types();
+                        types.contains(&EventType::All) || types.contains(&event_type)
+                    })
+                    .cloned()
+                    .collect()
             };
             
-            // 并行处理所有 handler
+            if handlers.is_empty() {
+                continue;
+            }
+            
+            // 并行处理所有匹配的 handler
             let futures: Vec<_> = handlers.iter()
                 .map(|handler| handler.handle(&event))
                 .collect();
@@ -152,7 +165,7 @@ impl EventDispatcher {
             // 处理错误
             for result in results {
                 if let Err(e) = result {
-                    eprintln!("事件处理失败：{}", e);
+                    log::error!("事件处理失败：{}", e);
                 }
             }
         }

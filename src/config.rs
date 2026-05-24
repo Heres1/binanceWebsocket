@@ -48,6 +48,28 @@ pub struct StrategyConfig {
     pub rsi_oversold: f64,             // RSI超卖线
     pub rsi_overbought: f64,           // RSI超买线
     pub volume_ratio_threshold: f64,   // 买卖量比阈值
+    #[serde(default)]
+    pub allow_short: bool,             // 是否允许做空
+    #[serde(default = "default_strategy_type")]
+    pub strategy_type: String,         // 策略类型
+    #[serde(default)]
+    pub short: Option<ShortConfig>,    // 做空配置
+}
+
+fn default_strategy_type() -> String {
+    "TrendMomentum".to_string()
+}
+
+/// 做空配置
+#[derive(Deserialize, Clone, Debug)]
+pub struct ShortConfig {
+    pub take_profit_pct: f64,
+    pub stop_loss_pct: f64,
+    #[serde(default)]
+    pub trailing_stop_pct: f64,
+    pub max_hold_seconds: u64,
+    #[serde(default)]
+    pub min_trend_strength: f64,
 }
 
 /// 风控配置
@@ -67,16 +89,24 @@ pub struct NetworkConfig {
 }
 
 impl AppConfig {
-    /// 从 TOML 文件加载配置
+    /// 从 TOML 文件加载配置，环境变量可覆盖敏感字段
     pub fn load(config_path: &str) -> Result<Self, DomainError> {
         let content = fs::read_to_string(config_path)
             .map_err(|e| InfrastructureError::io_with_operation("读取配置文件", e))?;
         
-        let config: AppConfig = toml::from_str(&content)
+        let mut config: AppConfig = toml::from_str(&content)
             .map_err(|e| InfrastructureError::config_with_context(
                 "解析 TOML 配置",
                 e.to_string()
             ))?;
+        
+        // 环境变量覆盖 API 密钥（优先级高于配置文件）
+        if let Ok(key) = std::env::var("BINANCE_API_KEY") {
+            config.binance.api_key = key;
+        }
+        if let Ok(secret) = std::env::var("BINANCE_SECRET_KEY") {
+            config.binance.secret_key = secret;
+        }
         
         // 验证配置
         config.validate()?;
@@ -173,7 +203,7 @@ impl AppConfig {
         if self.binance.testnet {
             "wss://testnet.binance.vision"
         } else {
-            "wss://stream.binance.com:9443"
+            "wss://stream.binance.com"
         }
     }
 }

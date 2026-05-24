@@ -146,7 +146,7 @@ impl StrategyState {
         
         // 恢复持久化状态
         if let Some(ps) = persisted {
-            println!("📂 恢复持仓状态: {:?} | 入场价: {:.2}", ps.position, ps.entry_price);
+            log::info!("恢复持仓状态: {:?} | 入场价: {:.2}", ps.position, ps.entry_price);
             state.position = ps.position;
             state.entry_price = ps.entry_price;
             state.entry_time = ps.entry_time;
@@ -199,11 +199,11 @@ pub struct MomentumStrategy {
 impl MomentumStrategy {
     /// 创建新的动量策略
     pub fn new(config: StrategyConfig, event_bus: Arc<TokioEventBus>) -> Self {
-        println!("📈 动量策略初始化:");
-        println!("   交易对: {}", config.symbol);
-        println!("   每笔数量: {} BTC", config.quantity_per_trade);
-        println!("   止盈: {}% | 止损: {}%", config.take_profit_pct, config.stop_loss_pct);
-        println!("   冷却: {}秒 | 日限: {}次", config.cooldown_seconds, config.max_daily_trades);
+        log::info!("动量策略初始化:");
+        log::info!("   交易对: {}", config.symbol);
+        log::info!("   每笔数量: {} BTC", config.quantity_per_trade);
+        log::info!("   止盈: {}% | 止损: {}%", config.take_profit_pct, config.stop_loss_pct);
+        log::info!("   冷却: {}秒 | 日限: {}次", config.cooldown_seconds, config.max_daily_trades);
 
         Self {
             config,

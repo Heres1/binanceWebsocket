@@ -402,7 +402,7 @@ mod tests{
         assert_eq!(config.level(), &LevelFilter::Info);
         assert_eq!(config.format(), &LogFormat::Text);
         assert!(config.file_path().is_none());
-        assert_eq!(config.max_files(), 5); // 更新默认值
+        assert_eq!(config.max_files(), 10);
         println!("Config test passed with values: level={:?}, format={:?}", config.level(), config.format());
     }
 

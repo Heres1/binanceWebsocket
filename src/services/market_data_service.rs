@@ -10,7 +10,6 @@ use futures_util::{SinkExt, StreamExt};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use std::convert::TryFrom;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -105,16 +104,16 @@ impl MarketDataService {
     
     /// 启动服务（带自动重连）
     pub async fn start(&self) -> Result<(), DomainError> {
-        println!("启动市场数据服务，订阅: {:?}", self.symbols);
+        log::info!("启动市场数据服务，订阅: {:?}", self.symbols);
         
         loop {
             match self.connect_and_run().await {
                 Ok(_) => {
-                    println!("WebSocket连接正常关闭");
+                    log::info!("WebSocket连接正常关闭");
                     break;
                 }
                 Err(e) => {
-                    println!("WebSocket连接失败: {}，{}秒后重连", e, self.reconnect_interval);
+                    log::warn!("WebSocket连接失败: {}，{}秒后重连", e, self.reconnect_interval);
                     tokio::time::sleep(Duration::from_secs(self.reconnect_interval)).await;
                 }
             }
@@ -206,11 +205,6 @@ impl MarketDataService {
         Ok(request)
     }
     
-    /// 直接连接（无代理）
-    async fn connect_direct(&self, host: &str, port: u16) -> Result<TlsStream<TcpStream>, DomainError> {
-        self.connect_direct_with_tls_host(host, port, host).await
-    }
-    
     /// 直接连接，可指定TLS验证的主机名（用于SSH隧道）
     async fn connect_direct_with_tls_host(&self, connect_host: &str, port: u16, tls_host: &str) -> Result<TlsStream<TcpStream>, DomainError> {
         let tcp = timeout(
@@ -273,7 +267,7 @@ impl MarketDataService {
         })?;
         let proxy_port = proxy_url.port_or_known_default().unwrap_or(8080);
         
-        println!("连接代理服务器: {}:{}", proxy_host, proxy_port);
+        log::info!("连接代理服务器: {}:{}", proxy_host, proxy_port);
         
         // 连接到代理服务器
         let mut tcp = timeout(
@@ -289,7 +283,7 @@ impl MarketDataService {
             target_host, target_port, target_host, target_port
         );
         
-        println!("发送CONNECT请求...");
+        log::info!("发送CONNECT请求...");
         tcp.write_all(connect_req.as_bytes()).await.map_err(|e| {
             DomainError::Service(ServiceError::MarketData(format!("发送CONNECT请求失败: {}", e)))
         })?;
@@ -305,7 +299,7 @@ impl MarketDataService {
         .map_err(|_| DomainError::Service(ServiceError::MarketData("读取代理响应超时".to_string())))?
         .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("读取代理响应失败: {}", e))))?;
         
-        println!("代理响应: {}", response.trim());
+        log::info!("代理响应: {}", response.trim());
         
         if !response.contains("200") {
             return Err(DomainError::Service(ServiceError::MarketData(
@@ -324,7 +318,7 @@ impl MarketDataService {
             }
         }
         
-        println!("CONNECT隧道建立成功");
+        log::info!("CONNECT隧道建立成功");
         
         self.tls_handshake(target_host, tcp).await
     }
@@ -349,7 +343,7 @@ impl MarketDataService {
             write.send(Message::Text(subscribe_msg.to_string())).await.map_err(|e| {
                 DomainError::Service(ServiceError::MarketData(format!("发送订阅消息失败: {}", e)))
             })?;
-            println!("📤 发送订阅消息: {}", subscribe_msg);
+            log::info!("发送订阅消息: {}", subscribe_msg);
         }
         
         // 启动心跳检测

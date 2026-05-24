@@ -124,9 +124,7 @@ impl OrderExecutionService {
             available_balance,
             current_position,
         ).await {
-            println!("风控拦截: {} | {} | 金额: {:.2} | {}",
-                signal.symbol, signal.signal_type, order_amount, alert.message);
-            log::warn!("❌ 风控拦截 | {} | {} | 金额: {:.2} | 原因: {}",
+            log::warn!("风控拦截 | {} | {} | 金额: {:.2} | 原因: {}",
                 signal.symbol, signal.signal_type, order_amount, alert.message);
             
             let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
@@ -159,24 +157,27 @@ impl OrderExecutionService {
         // 5. 记录订单到风控
         self.risk_service.record_order(order_amount).await;
 
-        // 6. 更新本地余额缓存
-        {
-            let mut bal = self.balance.lock().await;
-            if side == "BUY" {
-                bal.available_usdt -= order_amount;
-                bal.btc_free += quantity;
-            } else {
-                bal.available_usdt += order_amount;
-                bal.btc_free -= quantity;
-            }
-        }
-
-        // 7. 发布订单成交事件（市价单立即成交）
+        // 6. 解析实际成交数据
         let fill_price = order_result.price.parse::<f64>()
             .unwrap_or(signal.suggested_price); // 市价单可能返回0，用信号价格备用
         let fill_qty = order_result.executed_qty.parse::<f64>()
             .unwrap_or(quantity);
-        
+        let actual_quote_qty = order_result.cummulative_quote_qty.parse::<f64>()
+            .unwrap_or(order_amount); // 实际花费/收入的 USDT
+
+        // 7. 更新本地余额缓存（使用实际成交金额）
+        {
+            let mut bal = self.balance.lock().await;
+            if side == "BUY" {
+                bal.available_usdt -= actual_quote_qty;
+                bal.btc_free += fill_qty;
+            } else {
+                bal.available_usdt += actual_quote_qty;
+                bal.btc_free -= fill_qty;
+            }
+        }
+
+        // 8. 发布订单成交事件（市价单立即成交）
         let fill_event = DomainEvent::OrderFilled(OrderFilledEvent {
             order_id: order_result.order_id.to_string(),
             fill_id: format!("fill_{}", order_result.order_id),
@@ -191,9 +192,7 @@ impl OrderExecutionService {
         self.event_bus.publish(fill_event).await
             .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
 
-        println!("市价单成交: {} | {} @ {:.2} | 量: {:.6}",
-            order_result.symbol, side, fill_price, fill_qty);
-        log::info!("✅ 市价单成交 | {} | {} | 价: {:.2} | 量: {:.6} | 手续费: {:.4} | order_id: {}",
+        log::info!("市价单成交 | {} | {} | 价: {:.2} | 量: {:.6} | 手续费: {:.4} | order_id: {}",
             order_result.symbol, side, fill_price, fill_qty,
             fill_qty * fill_price * 0.001, order_result.order_id);
 
@@ -210,7 +209,7 @@ impl EventHandler for OrderExecutionService {
                 return Ok(());
             }
             
-            println!("\n📊 订单执行服务收到交易信号");
+            log::info!("订单执行服务收到交易信号");
             
             if let Err(e) = self.execute_signal(signal).await {
                 log::error!("订单执行失败: {}", e);
