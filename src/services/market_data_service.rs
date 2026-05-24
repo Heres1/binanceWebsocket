@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, timeout};
 use tokio_rustls::{TlsConnector, client::TlsStream};
 use rustls::{ClientConfig, OwnedTrustAnchor, RootCertStore};
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{tungstenite::Message, tungstenite::handshake::client::generate_key, tungstenite::http, WebSocketStream};
 use url::Url;
 
 /// 连接模式
@@ -173,18 +173,47 @@ impl MarketDataService {
             self.connect_direct_with_tls_host(connect_host, connect_port, tls_host).await?
         };
         
-        // WebSocket握手
+        // WebSocket握手 - 手动构建请求确保头正确
         log::info!("WebSocket握手中...");
-        let (ws_stream, _) = timeout(
+        let ws_request = self.build_ws_request()?;
+        let (ws_stream, response) = timeout(
             Duration::from_secs(self.connect_timeout),
-            tokio_tungstenite::client_async(&self.ws_url, tls_stream)
+            tokio_tungstenite::client_async(ws_request, tls_stream)
         ).await
         .map_err(|_| DomainError::Service(ServiceError::MarketData("WebSocket握手超时".to_string())))?
         .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("WebSocket握手失败: {}", e))))?;
         
-        println!("WebSocket连接成功: {}", self.ws_url);
+        log::info!("WebSocket连接成功 | 状态码: {}", response.status());
         
         self.handle_connection(ws_stream).await
+    }
+    
+    /// 手动构建 WebSocket 升级请求，避免 tungstenite 自动解析 URL 可能导致的头问题
+    fn build_ws_request(&self) -> Result<http::Request<()>, DomainError> {
+        let url = Url::parse(&self.ws_url).map_err(|e| {
+            DomainError::Service(ServiceError::MarketData(format!("URL解析失败: {}", e)))
+        })?;
+        
+        let host = url.host_str().unwrap_or("stream.binance.com");
+        let path_and_query = if let Some(query) = url.query() {
+            format!("{}?{}", url.path(), query)
+        } else {
+            url.path().to_string()
+        };
+        
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(&path_and_query)
+            .header("Host", host)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", generate_key())
+            .header("Origin", "https://stream.binance.com")
+            .body(())
+            .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("构建请求失败: {}", e))))?;
+        
+        Ok(request)
     }
     
     /// 直接连接（无代理）
