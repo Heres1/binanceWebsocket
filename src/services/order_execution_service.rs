@@ -99,10 +99,9 @@ impl OrderExecutionService {
         &self,
         signal: &TradingSignalEvent,
     ) -> Result<(), DomainError> {
-        println!("\n🚀 开始执行交易信号:");
-        println!("   信号ID: {}", signal.signal_id);
-        println!("   类型: {} | 参考价: {:.2} USDT", signal.signal_type, signal.suggested_price);
-        println!("   数量: {:.6} BTC", signal.suggested_quantity.unwrap_or(0.0));
+        log::info!("执行交易信号: {} | {} @ {:.2} | 数量: {:.6}",
+            signal.signal_type, signal.symbol, signal.suggested_price,
+            signal.suggested_quantity.unwrap_or(0.0));
 
         // 1. 计算订单金额
         let quantity = signal.suggested_quantity.ok_or_else(|| {
@@ -118,13 +117,15 @@ impl OrderExecutionService {
         drop(bal);
 
         // 3. 风控检查
-        println!("   🛡️  执行风控检查 (余额: {:.2} USDT, 持仓: {:.2} USDT)...", available_balance, current_position);
+        log::info!("风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
+            available_balance, current_position, order_amount);
         if let Err(alert) = self.risk_service.pre_trade_check(
             order_amount,
             available_balance,
             current_position,
         ).await {
-            println!("   ❌ 风控拦截: {}", alert.message);
+            println!("风控拦截: {} | {} | 金额: {:.2} | {}",
+                signal.symbol, signal.signal_type, order_amount, alert.message);
             log::warn!("❌ 风控拦截 | {} | {} | 金额: {:.2} | 原因: {}",
                 signal.symbol, signal.signal_type, order_amount, alert.message);
             
@@ -142,11 +143,8 @@ impl OrderExecutionService {
             return Err(ServiceError::Order(format!("风控拦截: {}", alert.message)).into());
         }
         
-        println!("   ✅ 风控检查通过");
-
-        // 4. 调用 API 下单 - 使用市价单快速成交
-        println!("   📤 调用 Binance API 下市价单...");
         
+        // 4. 调用 API 下单 - 使用市价单快速成交
         let side = if signal.signal_type == "BUY" { "BUY" } else { "SELL" };
         
         let order_result = self.client.place_order(
@@ -193,8 +191,8 @@ impl OrderExecutionService {
         self.event_bus.publish(fill_event).await
             .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
 
-        println!("   ✅ 市价单已成交: #{} | 价: {:.2} | 量: {:.6}",
-            order_result.order_id, fill_price, fill_qty);
+        println!("市价单成交: {} | {} @ {:.2} | 量: {:.6}",
+            order_result.symbol, side, fill_price, fill_qty);
         log::info!("✅ 市价单成交 | {} | {} | 价: {:.2} | 量: {:.6} | 手续费: {:.4} | order_id: {}",
             order_result.symbol, side, fill_price, fill_qty,
             fill_qty * fill_price * 0.001, order_result.order_id);

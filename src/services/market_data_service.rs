@@ -104,7 +104,7 @@ impl MarketDataService {
     
     /// 启动服务（带自动重连）
     pub async fn start(&self) -> Result<(), DomainError> {
-        println!("启动市场数据服务，订阅交易对: {:?}", self.symbols);
+        println!("启动市场数据服务，订阅: {:?}", self.symbols);
         
         loop {
             match self.connect_and_run().await {
@@ -113,7 +113,7 @@ impl MarketDataService {
                     break;
                 }
                 Err(e) => {
-                    println!("WebSocket连接失败: {}，{}秒后重连...", e, self.reconnect_interval);
+                    println!("WebSocket连接失败: {}，{}秒后重连", e, self.reconnect_interval);
                     tokio::time::sleep(Duration::from_secs(self.reconnect_interval)).await;
                 }
             }
@@ -124,7 +124,7 @@ impl MarketDataService {
     
     /// 连接WebSocket并运行（支持HTTP代理）
     async fn connect_and_run(&self) -> Result<(), DomainError> {
-        println!("连接Binance WebSocket: {}", self.ws_url);
+        log::info!("WebSocket连接: {}", self.ws_url);
         
         // 解析WebSocket URL
         let ws_url = Url::parse(&self.ws_url).map_err(|e| {
@@ -173,7 +173,7 @@ impl MarketDataService {
         };
         
         // WebSocket握手
-        println!("正在进行WebSocket握手...");
+        log::info!("WebSocket握手中...");
         let (ws_stream, _) = timeout(
             Duration::from_secs(self.connect_timeout),
             tokio_tungstenite::client_async(&self.ws_url, tls_stream)
@@ -181,7 +181,7 @@ impl MarketDataService {
         .map_err(|_| DomainError::Service(ServiceError::MarketData("WebSocket握手超时".to_string())))?
         .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("WebSocket握手失败: {}", e))))?;
         
-        println!("✅ WebSocket连接成功: {}", self.ws_url);
+        println!("WebSocket连接成功: {}", self.ws_url);
         
         self.handle_connection(ws_stream).await
     }
@@ -348,8 +348,6 @@ impl MarketDataService {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            // 打印接收到的原始数据（调试用）
-                            println!("📡 Binance原始数据: {}", text);
                             if let Err(e) = self.handle_message(&text).await {
                                 log::error!("处理消息失败: {}", e);
                             }

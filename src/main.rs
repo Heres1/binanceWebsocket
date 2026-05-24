@@ -11,12 +11,11 @@ use log::LevelFilter;
 use tokio::sync::Notify;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("动量短线交易系统启动");
+    println!("\n动量短线交易系统启动");
     
     // ==========================================
     // 0. 加载配置文件
     // ==========================================
-    println!("\n=== 加载配置文件 ===");
     let config = AppConfig::load("config/default.toml")?;
     
     // 初始化日志系统
@@ -45,13 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     if let Err(e) = AsyncLogger::init(logger_config) {
         eprintln!("⚠️ 日志系统初始化失败: {}，使用默认输出", e);
-    } else {
-        println!("✅ 日志系统已初始化");
-        if let Some(ref path) = config.logging.file_path {
-            println!("   日志文件: {}", path);
-        }
     }
-    println!("✅ 配置加载成功");
+    println!("配置加载完成 | 日志: {}", config.logging.file_path.as_deref().unwrap_or("stdout"));
     println!("   Binance: {} (测试网: {})", 
         if config.binance.testnet { "测试网" } else { "实盘" },
         config.binance.testnet
@@ -70,12 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dispatcher = EventDispatcher::with_ready_notify(event_bus.clone(), ready_notify.clone());
     tokio::spawn(dispatcher.run());
     ready_notify.notified().await;
-    println!("✅ 事件分发器已就绪");
     
     // ==========================================
     // 3. 创建 Binance REST API 客户端
     // ==========================================
-    println!("\n=== 初始化 Binance API 客户端 ===");
     let base_url = if config.binance.testnet {
         "https://testnet.binance.vision".to_string()
     } else if std::env::var("USE_SSH_TUNNEL").is_ok() {
@@ -89,27 +81,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.binance.secret_key.clone(),
         base_url,
     );
-    println!("✅ Binance API 客户端已创建");
+    println!("Binance API 客户端已创建");
     
     // ==========================================
     // 3.5 验证 API 连通性
     // ==========================================
-    println!("\n=== 验证 Binance REST API 连通性 ===");
     match binance_client.get_account().await {
         Ok(account) => {
-            println!("✅ API 连接成功！账户信息:");
-            for balance in &account.balances {
-                let free: f64 = balance.free.parse().unwrap_or(0.0);
-                let locked: f64 = balance.locked.parse().unwrap_or(0.0);
-                if free > 0.0 || locked > 0.0 {
-                    println!("   {} | 可用: {} | 冻结: {}", 
-                        balance.asset, balance.free, balance.locked);
-                }
-            }
+            let assets: Vec<String> = account.balances.iter()
+                .filter(|b| b.free.parse::<f64>().unwrap_or(0.0) > 0.0 || b.locked.parse::<f64>().unwrap_or(0.0) > 0.0)
+                .map(|b| format!("{}:{}", b.asset, b.free))
+                .collect();
+            println!("API 连接成功 | 账户资产: {}", assets.join(", "));
         }
         Err(e) => {
-            println!("❌ API 连接失败: {}", e);
-            println!("   请检查: 1) API密钥是否正确  2) IP白名单是否包含当前出口IP  3) 网络是否可达 api.binance.com");
+            println!("API 连接失败: {} | 请检查密钥/IP白名单/网络", e);
             return Ok(());
         }
     }
@@ -117,21 +103,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ==========================================
     // 4. 创建风控服务
     // ==========================================
-    println!("\n=== 初始化风控服务 ===");
     let risk_service = RiskMonitorService::new(
         config.risk.clone(),
         event_bus.clone(),
     );
     event_bus.subscribe(Arc::new(risk_service.clone()));
-    println!("✅ 风控服务已注册");
-    println!("   最大持仓: {} USDT", config.risk.max_position_usdt);
-    println!("   单笔限额: {} USDT", config.risk.max_single_order_usdt);
-    println!("   日亏损限额: {} USDT", config.risk.max_daily_loss_usdt);
     
     // ==========================================
     // 5. 创建订单执行服务
     // ==========================================
-    println!("\n=== 初始化订单执行服务 ===");
     let order_execution = Arc::new(OrderExecutionService::new(
         binance_client.clone(),
         risk_service.clone(),
@@ -141,14 +121,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 启动时同步真实账户余额
     order_execution.sync_balance().await?;
     event_bus.subscribe(order_execution.clone());
-    println!("✅ 订单执行服务已注册（市价单模式）");
     
     // ==========================================
     // 6. 注册订单处理器
     // ==========================================
     let order_handler = Arc::new(OrderHandler::new(event_bus.clone()));
     event_bus.subscribe(order_handler);
-    println!("✅ 订单处理器已注册");
     
     // ==========================================
     // 7. 注册动量短线策略
@@ -157,16 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_bus.clone(),
     ));
     event_bus.subscribe(momentum_strategy);
-    println!("✅ 动量短线策略已注册");
-    println!("   止盈: {}% | 止损: {}% | 最大持仓: {}s",
-        config.strategy.take_profit_pct, config.strategy.stop_loss_pct, config.strategy.max_hold_seconds);
-    println!("   RSI超卖: {} | RSI超买: {} | 量比阈值: {}",
-        config.strategy.rsi_oversold, config.strategy.rsi_overbought, config.strategy.volume_ratio_threshold);
 
     // ==========================================
     // 8. 启动市场数据服务（持续运行）
     // ==========================================
-    println!("\n=== 启动动量交易监听 ===");
     
     // 根据配置设置连接模式
     let connection_mode = match config.network.connection_mode.as_str() {
@@ -182,12 +154,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![config.strategy.symbol.clone()]
     ).with_connection_mode(connection_mode);
     
-    println!("🚀 动量短线交易系统已启动");
-    println!("   交易对: {}", config.strategy.symbol);
-    println!("   每笔交易: {} BTC", config.strategy.quantity_per_trade);
-    println!("   日最大交易: {} 次 | 冷却: {}s", config.strategy.max_daily_trades, config.strategy.cooldown_seconds);
-    println!("   连接模式: {:?}", connection_mode);
-    println!("   按 Ctrl+C 停止程序");
+    println!("\n=========================================");
+    println!("  动量短线交易系统已启动");
+    println!("  交易对: {} | 每笔: {} BTC", config.strategy.symbol, config.strategy.quantity_per_trade);
+    println!("  止盈: {}% | 止损: {}% | 持仓上限: {}s",
+        config.strategy.take_profit_pct, config.strategy.stop_loss_pct, config.strategy.max_hold_seconds);
+    println!("  连接: {:?} | 冷却: {}s | 日限: {}次",
+        connection_mode, config.strategy.cooldown_seconds, config.strategy.max_daily_trades);
     println!("=========================================\n");
     
     // 持续运行，直到用户按 Ctrl+C

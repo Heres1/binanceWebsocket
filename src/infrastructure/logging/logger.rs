@@ -225,8 +225,10 @@ impl AsyncLogger {
                             }
                         }
                         
-                        // 同时输出到控制台（方便实时监控）
-                        println!("{}", formatted_msg);
+                        // 只有WARN和ERROR级别输出到控制台（避免stdout.log过大）
+                        if msg.level <= log::Level::Warn {
+                            println!("{}", formatted_msg);
+                        }
                     },
                     Err(_) => {
                         // 接收器已关闭，退出线程

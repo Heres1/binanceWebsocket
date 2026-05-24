@@ -230,7 +230,7 @@ impl MomentumStrategy {
             if kline_time > state.last_data_time && (kline_time - state.last_data_time) > 30000 {
                 let current_price = event.close;
                 let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
-                println!("\n⚠️ 数据超时紧急平仓 | {} | 盈亏: {:.3}% | 价: {:.2}",
+                println!("\n紧急平仓 | {} | 盈亏: {:.3}% | 价: {:.2} | 原因: 数据超时",
                     self.config.symbol, pnl_pct, current_price);
                 log::warn!("⚠️ 数据超时紧急平仓 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}%",
                     self.config.symbol, state.entry_price, current_price, pnl_pct);
@@ -342,8 +342,8 @@ impl MomentumStrategy {
                     "RSI超买"
                 };
 
-                println!("\n🔴 平仓信号 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {}",
-                    self.config.symbol, state.entry_price, current_price, pnl_pct, reason);
+                println!("\n平仓信号 | {} | 入场:{:.2} | 当前:{:.2} | 盈亏:{:.3}% | 原因:{} | 持仓:{}s",
+                    self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
                 log::info!("🔴 平仓 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {} | 持仓: {}s",
                     self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
 
@@ -398,11 +398,9 @@ impl MomentumStrategy {
             if trend_up && rsi_recovering && buy_dominant && bid_support {
                 let entry_price = state.best_ask; // 买入用ask
 
-                println!("\n🟢 做多信号 | {} @ {:.2} USDT", self.config.symbol, entry_price);
-                println!("   趋势: EMA7={:.2} > EMA21={:.2}", ema_fast_5m, ema_slow_5m);
-                println!("   RSI: {:.1} (超卖回升)", rsi);
-                println!("   量比: {:.2} (买方主导)", vol_ratio);
-                println!("   盘口: 买{:.4} / 卖{:.4}", state.best_bid_qty, state.best_ask_qty);
+                println!("\n做多信号 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 盘口:{:.4}/{:.4}",
+                    self.config.symbol, entry_price, rsi, vol_ratio,
+                    ema_fast_5m, ema_slow_5m, state.best_bid_qty, state.best_ask_qty);
                 log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 盘口:{:.4}/{:.4}",
                     self.config.symbol, entry_price, rsi, vol_ratio,
                     ema_fast_5m, ema_slow_5m, state.best_bid_qty, state.best_ask_qty);

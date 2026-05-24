@@ -336,8 +336,8 @@ impl BinanceClient {
         let order: OrderResponse = serde_json::from_value(response)
             .map_err(|e| ServiceError::Order(format!("解析订单响应失败: {}", e)))?;
 
-        println!(
-            "✅ 订单已提交: {} {} {} @ {} (数量: {})",
+        log::info!(
+            "订单已提交: {} {} {} @ {} (数量: {})",
             order.symbol, order.side, order.order_type, order.price, order.orig_qty
         );
 
@@ -370,7 +370,7 @@ impl BinanceClient {
         let cancel_response: CancelOrderResponse = serde_json::from_value(response)
             .map_err(|e| ServiceError::Order(format!("解析撤单响应失败: {}", e)))?;
 
-        println!("✅ 订单已撤销: {} #{}", cancel_response.symbol, cancel_response.order_id);
+        log::info!("订单已撤销: {} #{}", cancel_response.symbol, cancel_response.order_id);
 
         Ok(cancel_response)
     }
@@ -412,9 +412,7 @@ impl BinanceClient {
         let account: AccountInfo = serde_json::from_value(response)
             .map_err(|e| ServiceError::Account(format!("解析账户信息失败: {}", e)))?;
 
-        println!("✅ 账户信息获取成功");
-        println!("   可交易: {}", account.can_trade);
-        println!("   余额资产数: {}", account.balances.len());
+        log::info!("账户信息获取成功 | 可交易: {} | 资产数: {}", account.can_trade, account.balances.len());
 
         Ok(account)
     }
@@ -535,7 +533,7 @@ impl BinanceClient {
             .map_err(|e| ServiceError::Order(format!("测试下单失败: {}", e)))?;
 
         if response.status().is_success() {
-            println!("✅ 测试下单成功（参数验证通过）");
+            log::info!("测试下单成功（参数验证通过）");
             Ok(())
         } else {
             let text = response.text().await.unwrap_or_default();
