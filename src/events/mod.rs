@@ -56,6 +56,10 @@ pub enum DomainEvent {
     KlineCompleted(KlineCompletedEvent),
     /// 订单簿更新
     OrderBookUpdate(OrderBookUpdateEvent),
+    /// 聚合成交
+    AggTrade(AggTradeEvent),
+    /// 最优买卖价
+    BookTicker(BookTickerEvent),
     
     // ========== 交易事件 ==========
     /// 订单提交

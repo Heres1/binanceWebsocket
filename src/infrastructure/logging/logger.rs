@@ -163,6 +163,15 @@ impl AsyncLogger {
             let mut rotator: Option<LogRotator> = None;
             
             if let Some(ref file_path) = config_clone.file_path {
+                // 自动创建日志目录
+                if let Some(parent) = Path::new(file_path).parent() {
+                    if !parent.exists() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!("Failed to create log directory {:?}: {}", parent, e);
+                        }
+                    }
+                }
+                
                 // 尝试打开日志文件
                 match OpenOptions::new().create(true).append(true).open(file_path) {
                     Ok(file) => {
@@ -204,7 +213,7 @@ impl AsyncLogger {
                             }
                         }
                         
-                        // 写入日志
+                        // 写入日志文件
                         if let Some(ref mut file) = current_file {
                             if writeln!(file, "{}", formatted_msg).is_err() {
                                 eprintln!("Failed to write to log file");
@@ -214,9 +223,10 @@ impl AsyncLogger {
                             if file.flush().is_err() {
                                 eprintln!("Failed to flush log file");
                             }
-                        } else {
-                            println!("{}", formatted_msg);
                         }
+                        
+                        // 同时输出到控制台（方便实时监控）
+                        println!("{}", formatted_msg);
                     },
                     Err(_) => {
                         // 接收器已关闭，退出线程

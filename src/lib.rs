@@ -7,3 +7,7 @@ pub mod command_bus;
 pub mod error;
 pub mod services;
 pub mod strategies;
+pub mod config;
+pub mod clients;
+pub mod risk;
+pub mod backtest;

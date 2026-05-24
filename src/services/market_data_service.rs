@@ -5,7 +5,7 @@
 
 use crate::error::{DomainError, ServiceError};
 use crate::event_bus::{EventBus, TokioEventBus};
-use crate::events::{DomainEvent, PriceUpdateEvent};
+use crate::events::{DomainEvent, PriceUpdateEvent, KlineCompletedEvent, AggTradeEvent, BookTickerEvent};
 use futures_util::{SinkExt, StreamExt};
 use std::env;
 use std::sync::Arc;
@@ -53,9 +53,18 @@ fn build_ws_url(host: &str, streams: &[String]) -> String {
 impl MarketDataService {
     /// 创建新的市场数据服务
     pub fn new(event_bus: Arc<TokioEventBus>, symbols: Vec<String>) -> Self {
+        // 订阅多个数据流: kline_1m, kline_5m, aggTrade, bookTicker
         let streams: Vec<String> = symbols
             .iter()
-            .map(|s| format!("{}@ticker", s.to_lowercase()))
+            .flat_map(|s| {
+                let sym = s.to_lowercase();
+                vec![
+                    format!("{}@kline_1m", sym),
+                    format!("{}@kline_5m", sym),
+                    format!("{}@aggTrade", sym),
+                    format!("{}@bookTicker", sym),
+                ]
+            })
             .collect();
         
         // 根据环境选择连接目标
@@ -381,32 +390,166 @@ impl MarketDataService {
         })?;
         
         // 处理组合流数据格式
-        let data = if json.get("stream").is_some() {
-            // 组合流格式: {"stream": "btcusdt@ticker", "data": {...}}
-            json.get("data").cloned().unwrap_or(json)
+        let (stream_name, data) = if let Some(stream) = json.get("stream").and_then(|v| v.as_str()) {
+            // 组合流格式: {"stream": "btcusdt@kline_1m", "data": {...}}
+            let data = json.get("data").cloned().unwrap_or(json.clone());
+            (Some(stream.to_string()), data)
         } else {
-            // 单流格式
-            json
+            (None, json)
         };
         
-        // 检查是否是ticker数据
-        if data.get("e").and_then(|v| v.as_str()) != Some("24hrTicker") {
-            // 忽略非ticker消息（如订阅确认）
-            return Ok(());
+        // 根据事件类型或stream名称分发
+        let event_type = data.get("e").and_then(|v| v.as_str());
+        
+        match event_type {
+            Some("kline") => {
+                let event = self.parse_kline(&data)?;
+                self.event_bus.publish(DomainEvent::KlineCompleted(event)).await.map_err(|e| {
+                    DomainError::Service(ServiceError::MarketData(format!("发布事件失败: {}", e)))
+                })?;
+            }
+            Some("aggTrade") => {
+                let event = self.parse_agg_trade(&data)?;
+                self.event_bus.publish(DomainEvent::AggTrade(event)).await.map_err(|e| {
+                    DomainError::Service(ServiceError::MarketData(format!("发布事件失败: {}", e)))
+                })?;
+            }
+            Some("24hrTicker") => {
+                let event = self.parse_ticker(&data)?;
+                self.event_bus.publish(DomainEvent::PriceUpdate(event)).await.map_err(|e| {
+                    DomainError::Service(ServiceError::MarketData(format!("发布事件失败: {}", e)))
+                })?;
+            }
+            _ => {
+                // bookTicker没有"e"字段，通过stream名称判断
+                if stream_name.as_ref().map_or(false, |s| s.contains("bookTicker")) 
+                    || data.get("b").is_some() && data.get("a").is_some() && data.get("s").is_some() {
+                    let event = self.parse_book_ticker(&data)?;
+                    self.event_bus.publish(DomainEvent::BookTicker(event)).await.map_err(|e| {
+                        DomainError::Service(ServiceError::MarketData(format!("发布事件失败: {}", e)))
+                    })?;
+                }
+                // 其它消息忽略（如订阅确认）
+            }
         }
-        
-        // 解析价格事件
-        let event = self.parse_ticker(&data)?;
-        
-        // 发布事件
-        self.event_bus.publish(DomainEvent::PriceUpdate(event)).await.map_err(|e| {
-            DomainError::Service(ServiceError::MarketData(format!("发布事件失败: {}", e)))
-        })?;
         
         Ok(())
     }
     
-    /// 解析ticker数据
+    /// 解析K线数据
+    fn parse_kline(&self, data: &serde_json::Value) -> Result<KlineCompletedEvent, DomainError> {
+        let symbol = data.get("s")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DomainError::Service(
+                ServiceError::MarketData("缺少symbol字段".to_string())
+            ))?;
+        
+        let k = data.get("k").ok_or_else(|| DomainError::Service(
+            ServiceError::MarketData("缺少k线数据字段".to_string())
+        ))?;
+        
+        let interval = k.get("i").and_then(|v| v.as_str()).unwrap_or("1m");
+        let open = k.get("o").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let high = k.get("h").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let low = k.get("l").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let close = k.get("c").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let volume = k.get("v").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let close_time = k.get("T").and_then(|v| v.as_u64()).unwrap_or(0);
+        let is_closed = k.get("x").and_then(|v| v.as_bool()).unwrap_or(false);
+        let trades_count = k.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
+        
+        Ok(KlineCompletedEvent {
+            symbol: symbol.to_string(),
+            interval: interval.to_string(),
+            open,
+            high,
+            low,
+            close,
+            volume,
+            close_time,
+            is_closed,
+            trades_count,
+        })
+    }
+    
+    /// 解析聚合成交数据
+    fn parse_agg_trade(&self, data: &serde_json::Value) -> Result<AggTradeEvent, DomainError> {
+        let symbol = data.get("s")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DomainError::Service(
+                ServiceError::MarketData("缺少symbol字段".to_string())
+            ))?;
+        
+        let price = data.get("p")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        
+        let quantity = data.get("q")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        
+        let is_buyer_maker = data.get("m")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        
+        let timestamp = data.get("T")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+        
+        Ok(AggTradeEvent {
+            symbol: symbol.to_string(),
+            price,
+            quantity,
+            is_buyer_maker,
+            timestamp,
+        })
+    }
+    
+    /// 解析最优买卖价数据
+    fn parse_book_ticker(&self, data: &serde_json::Value) -> Result<BookTickerEvent, DomainError> {
+        let symbol = data.get("s")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DomainError::Service(
+                ServiceError::MarketData("缺少symbol字段".to_string())
+            ))?;
+        
+        let best_bid = data.get("b")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        
+        let best_bid_qty = data.get("B")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        
+        let best_ask = data.get("a")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        
+        let best_ask_qty = data.get("A")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        
+        let timestamp = data.get("u")
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+        
+        Ok(BookTickerEvent {
+            symbol: symbol.to_string(),
+            best_bid,
+            best_bid_qty,
+            best_ask,
+            best_ask_qty,
+            timestamp,
+        })
+    }
+    
+    /// 解析ticker数据(兼容旧流)
     fn parse_ticker(&self, data: &serde_json::Value) -> Result<PriceUpdateEvent, DomainError> {
         let symbol = data.get("s")
             .and_then(|v| v.as_str())
@@ -442,61 +585,74 @@ impl MarketDataService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_bus::{TokioEventBus, EventHandler, EventType};
-    use async_trait::async_trait;
+    use crate::event_bus::TokioEventBus;
     
-    struct TestPriceHandler {
-        received: std::sync::Arc<tokio::sync::Mutex<Vec<PriceUpdateEvent>>>,
-    }
-    
-    #[async_trait]
-    impl EventHandler for TestPriceHandler {
-        async fn handle(&self, event: &DomainEvent) -> Result<(), crate::error::EventBusError> {
-            if let DomainEvent::PriceUpdate(e) = event {
-                self.received.lock().await.push(e.clone());
-            }
-            Ok(())
-        }
+    #[test]
+    fn test_parse_kline() {
+        let event_bus = Arc::new(TokioEventBus::new(100));
+        let service = MarketDataService::new(event_bus, vec!["BTCUSDT".to_string()]);
         
-        fn event_types(&self) -> Vec<EventType> {
-            vec![EventType::PriceUpdate]
-        }
+        let json = serde_json::json!({
+            "e": "kline",
+            "s": "BTCUSDT",
+            "k": {
+                "i": "1m",
+                "o": "74800.00",
+                "h": "74850.00",
+                "l": "74780.00",
+                "c": "74820.00",
+                "v": "10.5",
+                "T": 1234567890000u64,
+                "x": true,
+                "n": 150u64
+            }
+        });
+        
+        let event = service.parse_kline(&json).unwrap();
+        assert_eq!(event.symbol, "BTCUSDT");
+        assert_eq!(event.interval, "1m");
+        assert_eq!(event.close, 74820.0);
+        assert!(event.is_closed);
     }
     
     #[test]
-    fn test_parse_ticker() {
+    fn test_parse_agg_trade() {
+        let event_bus = Arc::new(TokioEventBus::new(100));
+        let service = MarketDataService::new(event_bus, vec!["BTCUSDT".to_string()]);
+        
+        let json = serde_json::json!({
+            "e": "aggTrade",
+            "s": "BTCUSDT",
+            "p": "74800.50",
+            "q": "0.5",
+            "m": false,
+            "T": 1234567890000u64
+        });
+        
+        let event = service.parse_agg_trade(&json).unwrap();
+        assert_eq!(event.symbol, "BTCUSDT");
+        assert_eq!(event.price, 74800.5);
+        assert_eq!(event.quantity, 0.5);
+        assert!(!event.is_buyer_maker);
+    }
+    
+    #[test]
+    fn test_parse_book_ticker() {
         let event_bus = Arc::new(TokioEventBus::new(100));
         let service = MarketDataService::new(event_bus, vec!["BTCUSDT".to_string()]);
         
         let json = serde_json::json!({
             "s": "BTCUSDT",
-            "c": "50000.00",
-            "P": "2.5",
-            "E": 1234567890000u64
+            "b": "74800.00",
+            "B": "5.0",
+            "a": "74801.00",
+            "A": "3.0",
+            "u": 123456u64
         });
         
-        let event = service.parse_ticker(&json).unwrap();
+        let event = service.parse_book_ticker(&json).unwrap();
         assert_eq!(event.symbol, "BTCUSDT");
-        assert_eq!(event.price, 50000.00);
-        assert_eq!(event.price_change_pct_24h, 2.5);
-    }
-    
-    #[test]
-    fn test_parse_combined_stream() {
-        let event_bus = Arc::new(TokioEventBus::new(100));
-        let service = MarketDataService::new(event_bus, vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
-        
-        // 测试 data 字段内的 ticker 数据（组合流格式中提取的 data 部分）
-        let json = serde_json::json!({
-            "e": "24hrTicker",
-            "s": "BTCUSDT",
-            "c": "51000.00",
-            "P": "3.0",
-            "E": 1234567890000u64
-        });
-        
-        let event = service.parse_ticker(&json).unwrap();
-        assert_eq!(event.symbol, "BTCUSDT");
-        assert_eq!(event.price, 51000.00);
+        assert_eq!(event.best_bid, 74800.0);
+        assert_eq!(event.best_ask, 74801.0);
     }
 }

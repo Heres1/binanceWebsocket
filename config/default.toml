@@ -1,0 +1,79 @@
+# Binance 量化交易系统配置文件
+
+# ⚠️ 注意：请勿将包含真实 API 密钥的配置文件提交到 Git
+# 应该复制此文件为 config.toml 并填入你的真实密钥
+
+[logging]
+# 日志级别: trace, debug, info, warn, error
+level = "info"
+# 日志格式: text, json
+format = "text"
+# 日志文件路径 (自动创建目录)
+file_path = "logs/trading.log"
+# 日志轮转大小 (MB)
+rotate_size_mb = 50
+# 最大备份文件数
+max_files = 10
+
+[binance]
+# 实盘 API 密钥 (从 https://www.binance.com/cn/my/settings/api-management 获取)
+api_key = "qs3H1Ph6hbsFXKBWmv3G2gJaXw2X88V3HGjFQ9AJMIUK2UwwtOCpoRZvjlOojTim"
+secret_key = "fbkSDz4UoLkaS8SlkY5qLW2Knn9g9R0naNK3ToUDcKQ0nbr3SSZyIFCwK8y2ztER"
+# true=使用测试网, false=使用实盘
+testnet = false
+
+[strategy]
+# 交易对
+symbol = "BTCUSDT"
+# 每笔交易数量 (BTC) - 约 $10/笔
+quantity_per_trade = 0.00013
+# 做多止盈百分比 (波段交易)
+take_profit_pct = 2.0
+# 做多止损百分比
+stop_loss_pct = 0.8
+# 做多最大持仓时间(秒) - 8小时
+max_hold_seconds = 28800
+# 交易冷却时间(秒) - 10分钟
+cooldown_seconds = 600
+# 日最大交易次数
+max_daily_trades = 15
+# 日最大亏损百分比
+max_daily_loss_pct = 3.0
+# RSI超卖线
+rsi_oversold = 30.0
+# RSI超买线 (100=禁用RSI出场，让利润奔跑)
+rsi_overbought = 100.0
+# 买卖量比阈值 (买方量>卖方量*1.2才入场)
+volume_ratio_threshold = 1.2
+# 是否允许做空
+allow_short = true
+# 策略类型: TrendMomentum, EmaCrossover, RsiBounce, Breakout, CompositeScore
+strategy_type = "Breakout"
+
+[strategy.short]
+# 做空止盈百分比 (下跌快而短，目标小)
+take_profit_pct = 0.5
+# 做空止损百分比 (反弹猛，止损紧)
+stop_loss_pct = 0.5
+# 做空追踪止损 (0=不启用)
+trailing_stop_pct = 0.0
+# 做空最大持仓时间(秒) - 4小时
+max_hold_seconds = 14400
+# 做空最小趋势强度 (0=不要求)
+min_trend_strength = 0.0
+
+[risk]
+# 最大持仓金额 (USDT) - 小资金测试
+max_position_usdt = 200.0
+# 单笔最大金额 (USDT)
+max_single_order_usdt = 20.0
+# 日亏损上限 (USDT)
+max_daily_loss_usdt = 30.0
+# 最小下单间隔 (秒)
+min_order_interval_secs = 10
+
+[network]
+# 网络连接模式: auto, direct, proxy, ssh_tunnel
+connection_mode = "ssh_tunnel"
+# 代理 URL (仅在 proxy 模式下需要)
+# proxy_url = "http://127.0.0.1:7890"

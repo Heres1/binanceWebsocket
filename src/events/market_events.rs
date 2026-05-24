@@ -36,6 +36,42 @@ pub struct KlineCompletedEvent {
     pub volume: f64,
     /// 收盘时间（毫秒）
     pub close_time: u64,
+    /// K线是否已收盘
+    pub is_closed: bool,
+    /// 成交笔数
+    pub trades_count: u64,
+}
+
+/// 聚合成交事件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggTradeEvent {
+    /// 交易对符号
+    pub symbol: String,
+    /// 成交价格
+    pub price: f64,
+    /// 成交数量
+    pub quantity: f64,
+    /// 是否是卖方maker（true=卖单成交，false=买单成交）
+    pub is_buyer_maker: bool,
+    /// 时间戳（毫秒）
+    pub timestamp: u64,
+}
+
+/// 最优买卖价事件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BookTickerEvent {
+    /// 交易对符号
+    pub symbol: String,
+    /// 买一价
+    pub best_bid: f64,
+    /// 买一量
+    pub best_bid_qty: f64,
+    /// 卖一价
+    pub best_ask: f64,
+    /// 卖一量
+    pub best_ask_qty: f64,
+    /// 时间戳（毫秒）
+    pub timestamp: u64,
 }
 
 /// 订单簿更新事件
@@ -84,10 +120,13 @@ mod tests {
             close: 3020.0,
             volume: 10000.0,
             close_time: 1234567890000,
+            is_closed: true,
+            trades_count: 500,
         };
         
         assert_eq!(event.symbol, "ETHUSDT");
         assert_eq!(event.interval, "1h");
         assert_eq!(event.close, 3020.0);
+        assert!(event.is_closed);
     }
 }
