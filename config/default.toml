@@ -27,40 +27,36 @@ testnet = false
 symbol = "BTCUSDT"
 # 每笔交易数量 (BTC) - 约 $10/笔
 quantity_per_trade = 0.00013
-# 做多止盈百分比 (优化后: 快速获利了结)
-take_profit_pct = 0.30
-# 做多止损百分比 (优化后: 紧止损控制风险)
-stop_loss_pct = 0.40
-# 做多最大持仓时间(秒) - 10分钟 (优化后: 超短线)
-max_hold_seconds = 600
-# 交易冷却时间(秒) - 1分钟 (配合超短线)
-cooldown_seconds = 60
-# 日最大交易次数 (超短线需更多交易机会)
+# 硬止盈上限 (必须 > trailing_trigger 否则追踪止损是死代码)
+take_profit_pct = 2.0
+# 初始止损百分比
+stop_loss_pct = 1.5
+# 最大持仓时间(秒) - 12小时
+max_hold_seconds = 43200
+# 交易冷却时间(秒) - 10分钟
+cooldown_seconds = 600
+# 日最大交易次数
 max_daily_trades = 50
 # 日最大亏损百分比
 max_daily_loss_pct = 3.0
-# RSI超卖线 (优化后: 25更灵敏)
-rsi_oversold = 25.0
-# RSI超买线 (优化后: 60天花板防止RSI过高入场)
-rsi_overbought = 60.0
-# 买卖量比阈值 (优化后: 要求更强买盘信号)
-volume_ratio_threshold = 2.0
+# RSI超卖线 (40=比50更严格，减少偻信号)
+rsi_oversold = 40.0
+# RSI超买线 (禁用RSI退出)
+rsi_overbought = 100.0
+# 买卖量比阈值 (0.6=宽松，让更多信号通过)
+volume_ratio_threshold = 0.6
+# 保本止损触发 (浮盈达此值后SL上移到入场价，必须 < trailing_trigger)
+breakeven_trigger_pct = 0.5
+# 追踪止损触发 (浮盈达此值后启用追踪，必须 < take_profit)
+trailing_trigger_pct = 1.5
+# 追踪止损回撤距离 (从最高/最低点回撤此百分比平仓)
+trailing_distance_pct = 0.5
 # 是否允许做空
 allow_short = true
-# 策略类型: TrendMomentum, EmaCrossover, RsiBounce, Breakout, CompositeScore
+# 策略类型
 strategy_type = "Breakout"
 
-[strategy.short]
-# 做空止盈百分比 (下跌快而短，目标小)
-take_profit_pct = 0.5
-# 做空止损百分比 (反弹猛，止损紧)
-stop_loss_pct = 0.5
-# 做空追踪止损 (0=不启用)
-trailing_stop_pct = 0.0
-# 做空最大持仓时间(秒) - 4小时
-max_hold_seconds = 14400
-# 做空最小趋势强度 (0=不要求)
-min_trend_strength = 0.0
+# 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 
 [risk]
 # 最大持仓金额 (USDT) - 小资金测试

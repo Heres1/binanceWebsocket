@@ -25,6 +25,8 @@ enum Position {
     None,
     /// 持有多头（已买入BTC）
     Long,
+    /// 持有空头（已做空）
+    Short,
 }
 
 /// 可持久化的策略状态
@@ -106,15 +108,24 @@ struct StrategyState {
     entry_price: f64,
     entry_time: u64,
 
+    // 追踪止损状态
+    highest_since_entry: f64,   // 入场后最高价
+    trailing_active: bool,      // 追踪止损是否激活
+    breakeven_active: bool,     // 保本止损是否激活
+    lowest_since_entry: f64,    // 入场后最低价（做空用）
+
+    // 突破入场状态
+    recent_highs: Vec<f64>,
+    recent_lows: Vec<f64>,
+
     // 冷却与统计
     last_trade_time: u64,
     daily_trades: u32,
     daily_pnl: f64,
     last_day: u32, // 用于日重置
 
-    // RSI状态追踪（检测回升/回落）
+    // RSI状态追踪（检测回升）
     rsi_was_oversold: bool, // RSI曾经低于超卖线
-    rsi_was_overbought: bool, // RSI曾经高于超买线
     rsi_oversold_bars: usize, // 超卖标志已持续的K线数（过期机制）
 
     // 预热计数
@@ -142,12 +153,17 @@ impl StrategyState {
             position: Position::None,
             entry_price: 0.0,
             entry_time: 0,
+            highest_since_entry: 0.0,
+            trailing_active: false,
+            breakeven_active: false,
+            lowest_since_entry: f64::MAX,
+            recent_highs: Vec::with_capacity(20),
+            recent_lows: Vec::with_capacity(20),
             last_trade_time: 0,
             daily_trades: 0,
             daily_pnl: 0.0,
             last_day: 0,
             rsi_was_oversold: false,
-            rsi_was_overbought: false,
             rsi_oversold_bars: 0,
             kline_1m_count: 0,
             kline_5m_count: 0,
@@ -155,10 +171,11 @@ impl StrategyState {
         
         // 恢复持久化状态（含合法性校验）
         if let Some(ps) = persisted {
-            if ps.position == Position::Long && ps.entry_price <= 0.0 {
-                log::error!("恢复状态异常: 持仓中但entry_price={:.8}，丢弃该状态", ps.entry_price);
-            } else if ps.position == Position::Long && ps.entry_time == 0 {
-                log::error!("恢复状态异常: 持仓中但entry_time=0，丢弃该状态");
+            let has_position = ps.position == Position::Long || ps.position == Position::Short;
+            if has_position && ps.entry_price <= 0.0 {
+                log::error!("恢复状态异常: {:?}持仓中但entry_price={:.8}，丢弃该状态", ps.position, ps.entry_price);
+            } else if has_position && ps.entry_time == 0 {
+                log::error!("恢复状态异常: {:?}持仓中但entry_time=0，丢弃该状态", ps.position);
             } else {
                 log::info!("恢复持仓状态: {:?} | 入场价: {:.2}", ps.position, ps.entry_price);
                 state.position = ps.position;
@@ -241,23 +258,28 @@ impl MomentumStrategy {
         // 数据超时检测：如果持仓中且超过30秒没收到BookTicker，紧急平仓
         // 注意: 使用当前系统时间与last_data_time比较，而不是用kline的close_time
         // 因为kline的close_time是K线周期的结束边界（5m线可能是未来时间）
-        if state.position == Position::Long && state.last_data_time > 0 && state.entry_price > 0.0 {
+        if (state.position == Position::Long || state.position == Position::Short)
+            && state.last_data_time > 0 && state.entry_price > 0.0
+        {
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             if now_ms > state.last_data_time && (now_ms - state.last_data_time) > 30000 {
                 let current_price = event.close;
-                let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
-                log::warn!("⚠️ 数据超时紧急平仓 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}%",
-                    self.config.symbol, state.entry_price, current_price, pnl_pct);
+                let pnl_pct = if state.position == Position::Long {
+                    (current_price - state.entry_price) / state.entry_price * 100.0
+                } else {
+                    (state.entry_price - current_price) / state.entry_price * 100.0
+                };
+                let signal_type = if state.position == Position::Long { "SELL" } else { "COVER" };
+                log::warn!("⚠️ 数据超时紧急平仓 | {} | {:?} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}%",
+                    self.config.symbol, state.position, state.entry_price, current_price, pnl_pct);
                 
                 state.position = Position::None;
                 state.daily_pnl += pnl_pct;
-                state.daily_trades += 1;
                 state.rsi_was_oversold = false;
-                state.rsi_was_overbought = false;
                 let snap = state.snapshot();
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save());
-                self.emit_signal("SELL", current_price, now_ms).await;
+                self.emit_signal(signal_type, current_price, now_ms).await;
                 return;
             }
         }
@@ -283,8 +305,15 @@ impl MomentumStrategy {
                             state.rsi_oversold_bars = 0;
                         }
                     }
-                    if rsi > self.config.rsi_overbought {
-                        state.rsi_was_overbought = true;
+
+                    // 更新最近20根K线最高/最低价
+                    state.recent_highs.push(event.high);
+                    if state.recent_highs.len() > 20 {
+                        state.recent_highs.remove(0);
+                    }
+                    state.recent_lows.push(event.low);
+                    if state.recent_lows.len() > 20 {
+                        state.recent_lows.remove(0);
                     }
                 }
             }
@@ -351,22 +380,39 @@ impl MomentumStrategy {
 
         let now_ms = event.timestamp;
 
-        // 检查出场条件（持仓时）
+        // 检查出场条件（阶梯式保护机制）
         if state.position == Position::Long && state.entry_price > 0.0 {
-            let current_price = state.best_bid; // 卖出用bid
-            let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
+            let current_price = state.best_bid;
             let hold_secs = (now_ms - state.entry_time) / 1000;
             let rsi = state.rsi_1m.value().unwrap_or(50.0);
 
-            let should_exit = pnl_pct >= self.config.take_profit_pct   // 止盈
-                || pnl_pct <= -self.config.stop_loss_pct               // 止损
-                || hold_secs >= self.config.max_hold_seconds            // 时间止损
-                || rsi > self.config.rsi_overbought;                   // RSI超买平仓
+            state.highest_since_entry = state.highest_since_entry.max(current_price);
+            let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
+            let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
+
+            let dynamic_sl = if highest_pnl_pct >= self.config.trailing_trigger_pct {
+                state.trailing_active = true;
+                state.highest_since_entry * (1.0 - self.config.trailing_distance_pct / 100.0)
+            } else if highest_pnl_pct >= self.config.breakeven_trigger_pct {
+                state.breakeven_active = true;
+                state.entry_price
+            } else {
+                state.entry_price * (1.0 - self.config.stop_loss_pct / 100.0)
+            };
+
+            let should_exit = current_price <= dynamic_sl
+                || pnl_pct >= self.config.take_profit_pct
+                || hold_secs >= self.config.max_hold_seconds
+                || rsi > self.config.rsi_overbought;
 
             if should_exit {
                 let reason = if pnl_pct >= self.config.take_profit_pct {
-                    "止盈"
-                } else if pnl_pct <= -self.config.stop_loss_pct {
+                    "硬止盈"
+                } else if state.trailing_active && current_price <= dynamic_sl {
+                    "追踪止损"
+                } else if state.breakeven_active && current_price <= dynamic_sl {
+                    "保本止损"
+                } else if current_price <= dynamic_sl {
                     "止损"
                 } else if hold_secs >= self.config.max_hold_seconds {
                     "时间止损"
@@ -374,19 +420,67 @@ impl MomentumStrategy {
                     "RSI超买"
                 };
 
-                log::info!("🔴 平仓 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {} | 持仓: {}s",
+                log::info!("🔴 平多 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {} | 持仓: {}s",
                     self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
 
                 state.position = Position::None;
                 state.daily_pnl += pnl_pct;
                 state.last_trade_time = now_ms;
-                state.daily_trades += 1;
                 state.rsi_was_oversold = false;
-                state.rsi_was_overbought = false;
                 let snap = state.snapshot();
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save());
                 self.emit_signal("SELL", current_price, now_ms).await;
+                return;
+            }
+        }
+
+        // 做空出场检查
+        if state.position == Position::Short && state.entry_price > 0.0 {
+            let current_price = state.best_ask; // 平空用ask
+            let hold_secs = (now_ms - state.entry_time) / 1000;
+
+            state.lowest_since_entry = state.lowest_since_entry.min(current_price);
+            let pnl_pct = (state.entry_price - current_price) / state.entry_price * 100.0;
+            let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
+
+            let dynamic_sl = if lowest_pnl_pct >= self.config.trailing_trigger_pct {
+                state.trailing_active = true;
+                state.lowest_since_entry * (1.0 + self.config.trailing_distance_pct / 100.0)
+            } else if lowest_pnl_pct >= self.config.breakeven_trigger_pct {
+                state.breakeven_active = true;
+                state.entry_price
+            } else {
+                state.entry_price * (1.0 + self.config.stop_loss_pct / 100.0)
+            };
+
+            let should_exit = current_price >= dynamic_sl
+                || pnl_pct >= self.config.take_profit_pct
+                || hold_secs >= self.config.max_hold_seconds;
+
+            if should_exit {
+                let reason = if pnl_pct >= self.config.take_profit_pct {
+                    "空止盈"
+                } else if state.trailing_active && current_price >= dynamic_sl {
+                    "空追踪止损"
+                } else if state.breakeven_active && current_price >= dynamic_sl {
+                    "空保本止损"
+                } else if current_price >= dynamic_sl {
+                    "空止损"
+                } else {
+                    "空超时"
+                };
+
+                log::info!("🔴 平空 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {} | 持仓: {}s",
+                    self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
+
+                state.position = Position::None;
+                state.daily_pnl += pnl_pct;
+                state.last_trade_time = now_ms;
+                let snap = state.snapshot();
+                drop(state);
+                tokio::task::spawn_blocking(move || snap.save());
+                self.emit_signal("COVER", current_price, now_ms).await;
                 return;
             }
         }
@@ -428,16 +522,33 @@ impl MomentumStrategy {
             // 条件4: 盘口有买盘支撑
             let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
 
-            if trend_up && rsi_recovering && buy_dominant && bid_support {
-                let entry_price = state.best_ask; // 买入用ask
+            // 突破入场条件：价格突破最近N根K线最高价
+            let breakout_signal = if state.recent_highs.len() >= 10 {
+                let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
+                    .iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let breakout_pct = (state.best_ask - lookback_high) / lookback_high * 100.0;
+                breakout_pct > 0.05 && vol_ratio > self.config.volume_ratio_threshold
+            } else {
+                false
+            };
 
-                log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 盘口:{:.4}/{:.4}",
+            // RSI反弹入场 或 突破入场
+            let entry_signal = (trend_up && rsi_recovering && buy_dominant && bid_support)
+                || (breakout_signal && trend_up);
+
+            if entry_signal {
+                let entry_price = state.best_ask;
+
+                log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2}",
                     self.config.symbol, entry_price, rsi, vol_ratio,
-                    ema_fast_5m, ema_slow_5m, state.best_bid_qty, state.best_ask_qty);
+                    ema_fast_5m, ema_slow_5m);
 
                 state.position = Position::Long;
                 state.entry_price = entry_price;
                 state.entry_time = now_ms;
+                state.highest_since_entry = entry_price;
+                state.trailing_active = false;
+                state.breakeven_active = false;
                 state.rsi_was_oversold = false;
                 state.rsi_oversold_bars = 0;
                 state.last_trade_time = now_ms;
@@ -446,6 +557,46 @@ impl MomentumStrategy {
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save());
                 self.emit_signal("BUY", entry_price, now_ms).await;
+            } else if self.config.allow_short {
+                // === 做空入场条件 ===
+                let trend_down = ema_fast_5m < ema_slow_5m;
+                let breakdown_signal = if state.recent_lows.len() >= 10 {
+                    let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
+                        .iter().copied().fold(f64::INFINITY, f64::min);
+                    let breakdown_pct = (lookback_low - state.best_bid) / lookback_low * 100.0;
+                    breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.volume_ratio_threshold)
+                } else {
+                    false
+                };
+
+                let rsi_overbought_short = rsi > 70.0;
+                let sell_pressure = vol_ratio < (1.0 / self.config.volume_ratio_threshold);
+
+                let short_signal = (breakdown_signal && trend_down)
+                    || (trend_down && rsi_overbought_short && sell_pressure);
+
+                if short_signal {
+                    let entry_price = state.best_bid; // 做空用bid
+
+                    log::info!("🟡 做空 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2}",
+                        self.config.symbol, entry_price, rsi, vol_ratio,
+                        ema_fast_5m, ema_slow_5m);
+
+                    state.position = Position::Short;
+                    state.entry_price = entry_price;
+                    state.entry_time = now_ms;
+                    state.lowest_since_entry = entry_price;
+                    state.trailing_active = false;
+                    state.breakeven_active = false;
+                    state.rsi_was_oversold = false;
+                    state.rsi_oversold_bars = 0;
+                    state.last_trade_time = now_ms;
+                    state.daily_trades += 1;
+                    let snap = state.snapshot();
+                    drop(state);
+                    tokio::task::spawn_blocking(move || snap.save());
+                    self.emit_signal("SHORT", entry_price, now_ms).await;
+                }
             }
         }
     }
@@ -460,15 +611,15 @@ impl MomentumStrategy {
             strength: 1.0,
             suggested_price: price,
             suggested_quantity: Some(self.config.quantity_per_trade),
-            stop_loss_price: if signal_type == "BUY" {
-                Some(price * (1.0 - self.config.stop_loss_pct / 100.0))
-            } else {
-                None
+            stop_loss_price: match signal_type {
+                "BUY" => Some(price * (1.0 - self.config.stop_loss_pct / 100.0)),
+                "SHORT" => Some(price * (1.0 + self.config.stop_loss_pct / 100.0)),
+                _ => None,
             },
-            take_profit_price: if signal_type == "BUY" {
-                Some(price * (1.0 + self.config.take_profit_pct / 100.0))
-            } else {
-                None
+            take_profit_price: match signal_type {
+                "BUY" => Some(price * (1.0 + self.config.take_profit_pct / 100.0)),
+                "SHORT" => Some(price * (1.0 - self.config.take_profit_pct / 100.0)),
+                _ => None,
             },
             timestamp,
         };

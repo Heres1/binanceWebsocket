@@ -115,7 +115,7 @@ async fn main() {
         symbol: args.symbol.clone(),
         initial_capital: args.capital,
         strategy: strategy_config,
-        commission_rate: 0.001, // 0.1% Binance现货手续费
+        commission_rate: 0.00075, // 0.075% Binance现货手续费(BNB抵扣)
     };
 
     let engine = BacktestEngine::new(backtest_config, data_dir);
@@ -231,83 +231,114 @@ fn run_optimization(engine: &BacktestEngine, base: &StrategyConfig) {
         Err(e) => { eprintln!("加载5m数据失败: {}", e); return; }
     };
 
-    // 参数网格
-    let tp_values = [0.15, 0.2, 0.3, 0.4, 0.5];
-    let sl_values = [0.15, 0.2, 0.3, 0.4];
-    let hold_values: [u64; 4] = [180, 300, 600, 900];
-    let cd_values: [u64; 3] = [30, 60, 120];
-    let rsi_os_values = [25.0, 30.0, 35.0, 40.0];
-    let rsi_ob_values = [60.0, 65.0, 70.0, 75.0];
-    let vr_values = [1.2, 1.3, 1.5, 2.0];
+    // 参数网格（必须满足: breakeven < trailing_trigger < TP）
+    let tp_values = [2.0, 3.0, 5.0];              // 宽硬止盈（让追踪止损发挥作用）
+    let sl_values = [0.8, 1.0, 1.5];              // 初始止损
+    let breakeven_values = [0.3, 0.5, 0.8];       // 保本触发
+    let trailing_trigger_values = [0.8, 1.0, 1.5]; // 追踪触发
+    let trailing_distance_values = [0.3, 0.5, 0.8]; // 追踪距离
+    let hold_values: [u64; 4] = [14400, 28800, 43200, 86400]; // 4h/8h/12h/24h
+    let rsi_ob_values = [100.0];                  // 禁用RSI退出
+    let vr_values = [0.6, 0.8, 1.0];             // 量比阈值
+    // 入场参数
+    let rsi_os_values = [40.0, 50.0, 60.0];       // RSI超卖线
+    let cd_values: [u64; 3] = [120, 300, 600];    // 冷却时间
 
-    let total = tp_values.len() * sl_values.len() * hold_values.len() * cd_values.len()
-        * rsi_os_values.len() * rsi_ob_values.len() * vr_values.len();
+    let total = tp_values.len() * sl_values.len() * breakeven_values.len()
+        * trailing_trigger_values.len() * trailing_distance_values.len()
+        * hold_values.len() * rsi_ob_values.len() * vr_values.len()
+        * rsi_os_values.len() * cd_values.len();
     println!("   总组合数: {} | 数据已缓存到内存", total);
+    println!("   约束: breakeven < trailing_trigger < TP");
 
     struct Result {
-        tp: f64, sl: f64, hold: u64, cd: u64, rsi_os: f64, rsi_ob: f64, vr: f64,
+        tp: f64, sl: f64, breakeven: f64, trailing_trigger: f64, trailing_distance: f64,
+        hold: u64, rsi_ob: f64, vr: f64, rsi_os: f64, cd: u64,
         return_pct: f64, win_rate: f64, trades: usize, sharpe: f64, max_dd: f64,
     }
 
     let mut results: Vec<Result> = Vec::new();
     let mut count = 0;
+    let mut positive_count = 0;
 
     for &tp in &tp_values {
-        for &sl in &sl_values {
-            for &hold in &hold_values {
-                for &cd in &cd_values {
+      for &sl in &sl_values {
+        for &breakeven in &breakeven_values {
+          for &trailing_trigger in &trailing_trigger_values {
+            for &trailing_distance in &trailing_distance_values {
+              for &hold in &hold_values {
+                for &rsi_ob in &rsi_ob_values {
+                  for &vr in &vr_values {
                     for &rsi_os in &rsi_os_values {
-                        for &rsi_ob in &rsi_ob_values {
-                            for &vr in &vr_values {
-                                count += 1;
-                                if count % 500 == 0 {
-                                    println!("   进度: {}/{} ({:.1}%)", count, total, count as f64/total as f64*100.0);
-                                }
+                      for &cd in &cd_values {
+                        count += 1;
+                        if count % 5000 == 0 {
+                            println!("   进度: {}/{} ({:.1}%) | 正收益: {}", count, total, count as f64/total as f64*100.0, positive_count);
+                        }
 
-                                let mut strategy = base.clone();
-                                strategy.take_profit_pct = tp;
-                                strategy.stop_loss_pct = sl;
-                                strategy.max_hold_seconds = hold;
-                                strategy.cooldown_seconds = cd;
-                                strategy.rsi_oversold = rsi_os;
-                                strategy.rsi_overbought = rsi_ob;
-                                strategy.volume_ratio_threshold = vr;
+                        // 约束: breakeven < trailing_trigger < TP
+                        if breakeven >= trailing_trigger {
+                            continue;
+                        }
+                        if trailing_trigger >= tp {
+                            continue;
+                        }
 
-                                if let Ok(report) = BacktestEngine::run_backtest_on_data(
-                                    &klines_1m, &klines_5m, &strategy, 200.0, 0.001,
-                                ) {
-                                    if report.total_trades >= 5 {
-                                        results.push(Result {
-                                            tp, sl, hold, cd, rsi_os, rsi_ob, vr,
-                                            return_pct: report.total_return_pct,
-                                            win_rate: report.win_rate,
-                                            trades: report.total_trades,
-                                            sharpe: report.sharpe_ratio,
-                                            max_dd: report.max_drawdown_pct,
-                                        });
-                                    }
+                        let mut strategy = base.clone();
+                        strategy.take_profit_pct = tp;
+                        strategy.stop_loss_pct = sl;
+                        strategy.breakeven_trigger_pct = breakeven;
+                        strategy.trailing_trigger_pct = trailing_trigger;
+                        strategy.trailing_distance_pct = trailing_distance;
+                        strategy.max_hold_seconds = hold;
+                        strategy.rsi_overbought = rsi_ob;
+                        strategy.volume_ratio_threshold = vr;
+                        strategy.rsi_oversold = rsi_os;
+                        strategy.cooldown_seconds = cd;
+
+                        if let Ok(report) = BacktestEngine::run_backtest_on_data(
+                            &klines_1m, &klines_5m, &strategy, 200.0, 0.00075,
+                        ) {
+                            if report.total_trades >= 5 {
+                                if report.total_return_pct > 0.0 {
+                                    positive_count += 1;
                                 }
+                                results.push(Result {
+                                    tp, sl, breakeven, trailing_trigger, trailing_distance,
+                                    hold, rsi_ob, vr, rsi_os, cd,
+                                    return_pct: report.total_return_pct,
+                                    win_rate: report.win_rate,
+                                    trades: report.total_trades,
+                                    sharpe: report.sharpe_ratio,
+                                    max_dd: report.max_drawdown_pct,
+                                });
                             }
                         }
+                      }
                     }
+                  }
                 }
+              }
             }
+          }
         }
+      }
     }
 
-    println!("\n✅ 优化完成: 有效组合 {}/{}", results.len(), total);
+    println!("\n✅ 优化完成: 有效组合 {}/{} | 🟢 正收益组合: {}", results.len(), total, positive_count);
 
     // 按收益率排序
     results.sort_by(|a, b| b.return_pct.partial_cmp(&a.return_pct).unwrap());
 
     println!("\n🏆 TOP 10 最优策略配置:");
-    println!("   {:<4} {:<6} {:<6} {:<6} {:<5} {:<6} {:<6} {:<5} {:<8} {:<7} {:<6} {:<8} {:<7}",
-        "#", "TP%", "SL%", "Hold", "CD", "RSI_L", "RSI_H", "VR", "Return%", "Win%", "Trades", "Sharpe", "MaxDD%");
-    println!("   {}", "-".repeat(95));
+    println!("   {:<3} {:<5} {:<5} {:<4} {:<5} {:<5} {:<5} {:<5} {:<4} {:<5} {:<4} {:<8} {:<6} {:<6} {:<6} {:<6}",
+        "#", "TP%", "SL%", "BE%", "TrT%", "TrD%", "Hold", "RSI_H", "VR", "RSI_L", "CD", "Return%", "Win%", "Trades", "Sharpe", "MaxDD");
+    println!("   {}", "-".repeat(110));
 
     for (i, r) in results.iter().take(10).enumerate() {
-        println!("   {:<4} {:<6.2} {:<6.2} {:<6} {:<5} {:<6.0} {:<6.0} {:<5.1} {:<8.3} {:<7.1} {:<6} {:<8.2} {:<7.2}",
-            i+1, r.tp, r.sl, r.hold, r.cd, r.rsi_os, r.rsi_ob, r.vr,
+        println!("   {:<3} {:<5.1} {:<5.2} {:<4.1} {:<5.1} {:<5.1} {:<5} {:<5.0} {:<4.1} {:<5.0} {:<4} {:<8.3} {:<6.1} {:<6} {:<6.2} {:<6.2}",
+            i+1, r.tp, r.sl, r.breakeven, r.trailing_trigger, r.trailing_distance,
+            r.hold, r.rsi_ob, r.vr, r.rsi_os, r.cd,
             r.return_pct, r.win_rate, r.trades, r.sharpe, r.max_dd);
     }
 
@@ -316,21 +347,27 @@ fn run_optimization(engine: &BacktestEngine, base: &StrategyConfig) {
         println!("\n🌟 最优策略配置:");
         println!("   take_profit_pct = {:.2}", best.tp);
         println!("   stop_loss_pct = {:.2}", best.sl);
+        println!("   breakeven_trigger_pct = {:.2}", best.breakeven);
+        println!("   trailing_trigger_pct = {:.2}", best.trailing_trigger);
+        println!("   trailing_distance_pct = {:.2}", best.trailing_distance);
         println!("   max_hold_seconds = {}", best.hold);
-        println!("   cooldown_seconds = {}", best.cd);
-        println!("   rsi_oversold = {:.0}", best.rsi_os);
         println!("   rsi_overbought = {:.0}", best.rsi_ob);
         println!("   volume_ratio_threshold = {:.1}", best.vr);
+        println!("   rsi_oversold = {:.0}", best.rsi_os);
+        println!("   cooldown_seconds = {}", best.cd);
 
         // 运行最优配置的完整报告
         let mut best_strategy = base.clone();
         best_strategy.take_profit_pct = best.tp;
         best_strategy.stop_loss_pct = best.sl;
+        best_strategy.breakeven_trigger_pct = best.breakeven;
+        best_strategy.trailing_trigger_pct = best.trailing_trigger;
+        best_strategy.trailing_distance_pct = best.trailing_distance;
         best_strategy.max_hold_seconds = best.hold;
-        best_strategy.cooldown_seconds = best.cd;
-        best_strategy.rsi_oversold = best.rsi_os;
         best_strategy.rsi_overbought = best.rsi_ob;
         best_strategy.volume_ratio_threshold = best.vr;
+        best_strategy.rsi_oversold = best.rsi_os;
+        best_strategy.cooldown_seconds = best.cd;
 
         if let Ok(report) = engine.run_with_config(&best_strategy) {
             report.print_summary();
@@ -398,7 +435,7 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
     struct OptResult {
         strategy_name: &'static str,
         strategy_type: StrategyType,
-        tp: f64, sl: f64, trailing: f64, hold: u64, cd: u64, vr: f64, allow_short: bool, rsi_ob: f64,
+        tp: f64, sl: f64, trailing: f64, hold: u64, cd: u64, vr: f64, rsi_ob: f64,
         short_tp: f64, short_sl: f64, short_trailing: f64, short_hold: u64, short_strength: f64,
         return_pct: f64, win_rate: f64, trades: usize, sharpe: f64, max_dd: f64,
         profit_loss_ratio: f64,
@@ -464,7 +501,7 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
                                         results.push(OptResult {
                                             strategy_name,
                                             strategy_type,
-                                            tp, sl, trailing, hold, cd, vr, allow_short, rsi_ob,
+                                            tp, sl, trailing, hold, cd, vr, rsi_ob,
                                             short_tp, short_sl, short_trailing, short_hold, short_strength,
                                             return_pct: report.total_return_pct,
                                             win_rate: report.win_rate,

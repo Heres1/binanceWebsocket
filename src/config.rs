@@ -39,8 +39,8 @@ pub struct BinanceConfig {
 pub struct StrategyConfig {
     pub symbol: String,
     pub quantity_per_trade: f64,       // 每笔交易数量(BTC)
-    pub take_profit_pct: f64,          // 止盈百分比
-    pub stop_loss_pct: f64,            // 止损百分比
+    pub take_profit_pct: f64,          // 硬止盈百分比（上限）
+    pub stop_loss_pct: f64,            // 初始止损百分比
     pub max_hold_seconds: u64,         // 最大持仓时间(秒)
     pub cooldown_seconds: u64,         // 交易冷却时间(秒)
     pub max_daily_trades: u32,         // 日最大交易次数
@@ -48,6 +48,12 @@ pub struct StrategyConfig {
     pub rsi_oversold: f64,             // RSI超卖线
     pub rsi_overbought: f64,           // RSI超买线
     pub volume_ratio_threshold: f64,   // 买卖量比阈值
+    #[serde(default = "default_breakeven_trigger")]
+    pub breakeven_trigger_pct: f64,    // 触发保本止损的浮盈百分比
+    #[serde(default = "default_trailing_trigger")]
+    pub trailing_trigger_pct: f64,     // 触发追踪止损的浮盈百分比
+    #[serde(default = "default_trailing_distance")]
+    pub trailing_distance_pct: f64,    // 追踪止损回撤距离百分比
     #[serde(default)]
     pub allow_short: bool,             // 是否允许做空
     #[serde(default = "default_strategy_type")]
@@ -58,6 +64,18 @@ pub struct StrategyConfig {
 
 fn default_strategy_type() -> String {
     "TrendMomentum".to_string()
+}
+
+fn default_breakeven_trigger() -> f64 {
+    0.3
+}
+
+fn default_trailing_trigger() -> f64 {
+    0.5
+}
+
+fn default_trailing_distance() -> f64 {
+    0.3
 }
 
 /// 做空配置
@@ -149,6 +167,34 @@ impl AppConfig {
             return Err(DomainError::Infrastructure(
                 InfrastructureError::config_with_context(
                     "止盈止损",
+                    "必须大于0".to_string()
+                )
+            ));
+        }
+
+        // 参数层级约束: breakeven < trailing_trigger < take_profit
+        if self.strategy.breakeven_trigger_pct >= self.strategy.trailing_trigger_pct {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "参数层级错误",
+                    format!("breakeven_trigger({:.2}%) 必须 < trailing_trigger({:.2}%)",
+                        self.strategy.breakeven_trigger_pct, self.strategy.trailing_trigger_pct)
+                )
+            ));
+        }
+        if self.strategy.trailing_trigger_pct >= self.strategy.take_profit_pct {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "参数层级错误",
+                    format!("trailing_trigger({:.2}%) 必须 < take_profit({:.2}%)，否则追踪止损永远不会触发",
+                        self.strategy.trailing_trigger_pct, self.strategy.take_profit_pct)
+                )
+            ));
+        }
+        if self.strategy.volume_ratio_threshold <= 0.0 {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "量比阈值",
                     "必须大于0".to_string()
                 )
             ));
@@ -249,8 +295,8 @@ mod tests {
             [strategy]
             symbol = "BTCUSDT"
             quantity_per_trade = 0.00013
-            take_profit_pct = 0.4
-            stop_loss_pct = 0.25
+            take_profit_pct = 2.0
+            stop_loss_pct = 1.5
             max_hold_seconds = 300
             cooldown_seconds = 60
             max_daily_trades = 15
@@ -258,6 +304,9 @@ mod tests {
             rsi_oversold = 35.0
             rsi_overbought = 65.0
             volume_ratio_threshold = 1.5
+            breakeven_trigger_pct = 0.5
+            trailing_trigger_pct = 1.5
+            trailing_distance_pct = 0.5
             
             [risk]
             max_position_usdt = 1000.0

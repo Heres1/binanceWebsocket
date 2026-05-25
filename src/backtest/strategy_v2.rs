@@ -266,10 +266,8 @@ pub fn run_backtest_v2(
                 if kline.high > state.highest_since_entry {
                     state.highest_since_entry = kline.high;
                 }
-            } else {
-                if kline.low < state.lowest_since_entry {
-                    state.lowest_since_entry = kline.low;
-                }
+            } else if kline.low < state.lowest_since_entry {
+                state.lowest_since_entry = kline.low;
             }
 
             let exit_result = check_exit_v2(kline, &state, config, timestamp);
