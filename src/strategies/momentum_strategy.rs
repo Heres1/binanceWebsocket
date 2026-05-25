@@ -115,6 +115,7 @@ struct StrategyState {
     // RSI状态追踪（检测回升/回落）
     rsi_was_oversold: bool, // RSI曾经低于超卖线
     rsi_was_overbought: bool, // RSI曾经高于超买线
+    rsi_oversold_bars: usize, // 超卖标志已持续的K线数（过期机制）
 
     // 预热计数
     kline_1m_count: usize,
@@ -147,6 +148,7 @@ impl StrategyState {
             last_day: 0,
             rsi_was_oversold: false,
             rsi_was_overbought: false,
+            rsi_oversold_bars: 0,
             kline_1m_count: 0,
             kline_5m_count: 0,
         };
@@ -272,6 +274,14 @@ impl MomentumStrategy {
                     // 追踪RSI状态
                     if rsi < self.config.rsi_oversold {
                         state.rsi_was_oversold = true;
+                        state.rsi_oversold_bars = 0;
+                    } else if state.rsi_was_oversold {
+                        state.rsi_oversold_bars += 1;
+                        // 超卖信号过期：30根1m K线（30分钟）内未入场则重置
+                        if state.rsi_oversold_bars > 30 {
+                            state.rsi_was_oversold = false;
+                            state.rsi_oversold_bars = 0;
+                        }
                     }
                     if rsi > self.config.rsi_overbought {
                         state.rsi_was_overbought = true;
@@ -407,8 +417,10 @@ impl MomentumStrategy {
             // 条件1: 5分钟趋势向上
             let trend_up = ema_fast_5m > ema_slow_5m;
 
-            // 条件2: RSI从超卖回升
-            let rsi_recovering = state.rsi_was_oversold && rsi > (self.config.rsi_oversold + 5.0);
+            // 条件2: RSI从超卖回升（加天花板：RSI超过overbought时不入场）
+            let rsi_recovering = state.rsi_was_oversold
+                && rsi > (self.config.rsi_oversold + 5.0)
+                && rsi < self.config.rsi_overbought;
 
             // 条件3: 买方成交量主导
             let buy_dominant = vol_ratio > self.config.volume_ratio_threshold;
@@ -427,6 +439,7 @@ impl MomentumStrategy {
                 state.entry_price = entry_price;
                 state.entry_time = now_ms;
                 state.rsi_was_oversold = false;
+                state.rsi_oversold_bars = 0;
                 state.last_trade_time = now_ms;
                 state.daily_trades += 1;
                 let snap = state.snapshot();

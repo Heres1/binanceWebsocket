@@ -27,24 +27,24 @@ testnet = false
 symbol = "BTCUSDT"
 # 每笔交易数量 (BTC) - 约 $10/笔
 quantity_per_trade = 0.00013
-# 做多止盈百分比 (波段交易)
-take_profit_pct = 2.0
-# 做多止损百分比
-stop_loss_pct = 0.8
-# 做多最大持仓时间(秒) - 8小时
-max_hold_seconds = 28800
-# 交易冷却时间(秒) - 10分钟
-cooldown_seconds = 600
-# 日最大交易次数
-max_daily_trades = 15
+# 做多止盈百分比 (优化后: 快速获利了结)
+take_profit_pct = 0.30
+# 做多止损百分比 (优化后: 紧止损控制风险)
+stop_loss_pct = 0.40
+# 做多最大持仓时间(秒) - 10分钟 (优化后: 超短线)
+max_hold_seconds = 600
+# 交易冷却时间(秒) - 1分钟 (配合超短线)
+cooldown_seconds = 60
+# 日最大交易次数 (超短线需更多交易机会)
+max_daily_trades = 50
 # 日最大亏损百分比
 max_daily_loss_pct = 3.0
-# RSI超卖线
-rsi_oversold = 30.0
-# RSI超买线 (100=禁用RSI出场，让利润奔跑)
-rsi_overbought = 100.0
-# 买卖量比阈值 (买方量>卖方量*1.2才入场)
-volume_ratio_threshold = 1.2
+# RSI超卖线 (优化后: 25更灵敏)
+rsi_oversold = 25.0
+# RSI超买线 (优化后: 60天花板防止RSI过高入场)
+rsi_overbought = 60.0
+# 买卖量比阈值 (优化后: 要求更强买盘信号)
+volume_ratio_threshold = 2.0
 # 是否允许做空
 allow_short = true
 # 策略类型: TrendMomentum, EmaCrossover, RsiBounce, Breakout, CompositeScore

@@ -297,8 +297,9 @@ impl BacktestReport {
                     t.id, t.entry_price, t.exit_price, t.pnl_pct, t.pnl_usdt, t.hold_seconds, t.exit_reason);
             }
 
-            if self.trades.len() > 20 {
-                println!("   ... 省略 {} 笔 ...", self.trades.len() - 25);
+            if self.trades.len() > 25 {
+                let omitted = self.trades.len().saturating_sub(25);
+                println!("   ... 省略 {} 笔 ...", omitted);
                 for t in &self.trades[self.trades.len()-5..] {
                     println!("   {:<4} {:<12.2} {:<12.2} {:<10.3} {:<10.4} {:<8} {:<8}",
                         t.id, t.entry_price, t.exit_price, t.pnl_pct, t.pnl_usdt, t.hold_seconds, t.exit_reason);

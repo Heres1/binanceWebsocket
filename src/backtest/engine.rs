@@ -61,6 +61,7 @@ struct EngineState {
 
     // RSI状态
     rsi_was_oversold: bool,
+    rsi_oversold_bars: usize, // 超卖标志已持续的K线数（过期机制）
 
     // 预热
     kline_1m_count: usize,
@@ -88,6 +89,7 @@ impl EngineState {
             daily_pnl: 0.0,
             last_day: 0,
             rsi_was_oversold: false,
+            rsi_oversold_bars: 0,
             kline_1m_count: 0,
             kline_5m_count: 0,
         }
@@ -165,6 +167,14 @@ impl BacktestEngine {
 
                 if rsi < self.config.strategy.rsi_oversold {
                     state.rsi_was_oversold = true;
+                    state.rsi_oversold_bars = 0;
+                } else if state.rsi_was_oversold {
+                    state.rsi_oversold_bars += 1;
+                    // 超卖信号过期：30根1m K线（30分钟）内未入场则重置
+                    if state.rsi_oversold_bars > 30 {
+                        state.rsi_was_oversold = false;
+                        state.rsi_oversold_bars = 0;
+                    }
                 }
 
                 // 用K线收盘价模拟盘口（K线模式近似）
@@ -261,7 +271,10 @@ impl BacktestEngine {
                 let vol_ratio = state.volume_ratio.ratio();
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
-                let rsi_recovering = state.rsi_was_oversold && rsi > (self.config.strategy.rsi_oversold + 5.0);
+                // RSI天花板：RSI超过overbought时不入场（反弹已走完）
+                let rsi_recovering = state.rsi_was_oversold
+                    && rsi > (self.config.strategy.rsi_oversold + 5.0)
+                    && rsi < self.config.strategy.rsi_overbought;
                 let buy_dominant = vol_ratio > self.config.strategy.volume_ratio_threshold;
                 let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
 
@@ -270,6 +283,7 @@ impl BacktestEngine {
                     state.entry_price = kline.close;
                     state.entry_time = timestamp;
                     state.rsi_was_oversold = false;
+                    state.rsi_oversold_bars = 0;
                     state.last_trade_time = timestamp;
                     state.daily_trades += 1;
                 }
@@ -343,6 +357,13 @@ impl BacktestEngine {
                             let rsi = state.rsi_1m.update(kline.close);
                             if rsi < self.config.strategy.rsi_oversold {
                                 state.rsi_was_oversold = true;
+                                state.rsi_oversold_bars = 0;
+                            } else if state.rsi_was_oversold {
+                                state.rsi_oversold_bars += 1;
+                                if state.rsi_oversold_bars > 30 {
+                                    state.rsi_was_oversold = false;
+                                    state.rsi_oversold_bars = 0;
+                                }
                             }
                         }
                         "5m" => {
@@ -448,7 +469,9 @@ impl BacktestEngine {
                         let vol_ratio = state.volume_ratio.ratio();
 
                         let trend_up = ema_fast_5m > ema_slow_5m;
-                        let rsi_recovering = state.rsi_was_oversold && rsi > (self.config.strategy.rsi_oversold + 5.0);
+                        let rsi_recovering = state.rsi_was_oversold
+                            && rsi > (self.config.strategy.rsi_oversold + 5.0)
+                            && rsi < self.config.strategy.rsi_overbought;
                         let buy_dominant = vol_ratio > self.config.strategy.volume_ratio_threshold;
                         let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
 
@@ -457,6 +480,7 @@ impl BacktestEngine {
                             state.entry_price = state.best_ask;
                             state.entry_time = *timestamp;
                             state.rsi_was_oversold = false;
+                            state.rsi_oversold_bars = 0;
                             state.last_trade_time = *timestamp;
                             state.daily_trades += 1;
                         }
@@ -524,6 +548,13 @@ impl BacktestEngine {
                 let rsi = state.rsi_1m.update(kline.close);
                 if rsi < strategy.rsi_oversold {
                     state.rsi_was_oversold = true;
+                    state.rsi_oversold_bars = 0;
+                } else if state.rsi_was_oversold {
+                    state.rsi_oversold_bars += 1;
+                    if state.rsi_oversold_bars > 30 {
+                        state.rsi_was_oversold = false;
+                        state.rsi_oversold_bars = 0;
+                    }
                 }
                 state.best_bid = kline.close;
                 state.best_ask = kline.close;
@@ -591,7 +622,9 @@ impl BacktestEngine {
                 let vol_ratio = state.volume_ratio.ratio();
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
-                let rsi_recovering = state.rsi_was_oversold && rsi > (strategy.rsi_oversold + 5.0);
+                let rsi_recovering = state.rsi_was_oversold
+                    && rsi > (strategy.rsi_oversold + 5.0)
+                    && rsi < strategy.rsi_overbought;
                 let buy_dominant = vol_ratio > strategy.volume_ratio_threshold;
                 let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
 
@@ -600,6 +633,7 @@ impl BacktestEngine {
                     state.entry_price = kline.close;
                     state.entry_time = timestamp;
                     state.rsi_was_oversold = false;
+                    state.rsi_oversold_bars = 0;
                     state.last_trade_time = timestamp;
                     state.daily_trades += 1;
                 }

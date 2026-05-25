@@ -20,7 +20,14 @@
 - [mod.rs](file://src/events/mod.rs)
 - [mod.rs](file://src/commands/mod.rs)
 - [mod.rs](file://src/backtest/mod.rs)
+- [logger.rs](file://src/infrastructure/logging/logger.rs)
 </cite>
+
+## 更新摘要
+**变更内容**
+- 更新Binance客户端日志优化部分，反映账户信息获取和订单提交响应日志级别从INFO降级到DEBUG的变更
+- 新增日志系统配置和输出行为说明
+- 更新故障排除指南中的日志相关部分
 
 ## 目录
 1. [简介](#简介)
@@ -44,6 +51,7 @@
 - **多策略支持**：内置网格策略和动量策略，支持扩展
 - **风控体系**：完整的风险监控和控制机制
 - **订单执行**：与Binance API深度集成的订单执行服务
+- **智能日志系统**：可配置的日志级别和输出行为
 
 ## 项目结构
 
@@ -61,6 +69,7 @@ COMMAND_BUS[src/command_bus.rs]
 CLIENTS[src/clients/]
 SERVICES[src/services/]
 HANDLERS[src/handlers/]
+LOGGING[src/infrastructure/logging/]
 end
 subgraph "领域层"
 STRATEGIES[src/strategies/]
@@ -81,6 +90,7 @@ SERVICES --> CLIENTS
 STRATEGIES --> EVENTS
 HANDLERS --> EVENTS
 RISK --> EVENTS
+LOGGING --> MAIN
 ```
 
 **图表来源**
@@ -208,6 +218,7 @@ subgraph "应用层 (Layer 3)"
 EVENT_BUS[src/event_bus.rs<br/>事件总线]
 COMMAND_BUS[src/command_bus.rs<br/>命令总线]
 ORDER_HANDLER[src/handlers/order_handler.rs<br/>订单处理器]
+LOGGING[src/infrastructure/logging/<br/>日志系统]
 end
 subgraph "领域层 (Layer 2)"
 GRID_STRATEGY[src/strategies/grid_strategy.rs<br/>网格策略]
@@ -221,7 +232,7 @@ WEBSOCKET[tokio-tungstenite<br/>WebSocket]
 TLS[tokio-rustls<br/>TLS加密]
 REQWEST[reqwest<br/>HTTP客户端]
 LOG[log/env_logger<br/>日志系统]
-end
+END
 MAIN --> EVENT_BUS
 MAIN --> COMMAND_BUS
 MAIN --> GRID_STRATEGY
@@ -239,6 +250,7 @@ BINANCE_CLIENT --> TLS
 GRID_STRATEGY --> WEBSOCKET
 MOMENTUM_STRATEGY --> WEBSOCKET
 BINANCE_CLIENT --> WEBSOCKET
+LOGGING --> MAIN
 ```
 
 **图表来源**
@@ -301,9 +313,91 @@ BinanceClient --> AccountInfo : returns
 3. **签名计算**：对拼接的查询字符串进行HMAC-SHA256哈希
 4. **请求发送**：在请求头中包含API密钥和签名
 
+#### 日志优化
+
+**更新** 系统进行了日志优化，将高频的日志输出从INFO级别降级到DEBUG级别，以减少日志噪音并提高系统性能。
+
+**优化内容**：
+- 账户信息获取响应日志：从`log::info!`降级到`log::debug!`
+- 订单提交响应日志：从`log::info!`降级到`log::debug!`
+- 订单撤销日志：保持`log::info!`级别不变
+- 测试下单日志：保持`log::info!`级别不变
+
+**日志级别说明**：
+- **DEBUG**：详细的调试信息，包含API响应和账户信息
+- **INFO**：重要的业务信息，如订单撤销和测试下单结果
+- **WARN**：警告信息，如网络重试
+- **ERROR**：错误信息，如API调用失败
+
 **章节来源**
 - [binance_client.rs:182-214](file://src/clients/binance_client.rs#L182-L214)
 - [binance_client.rs:216-273](file://src/clients/binance_client.rs#L216-L273)
+- [binance_client.rs:386-392](file://src/clients/binance_client.rs#L386-L392)
+- [binance_client.rs:420](file://src/clients/binance_client.rs#L420)
+- [binance_client.rs:462](file://src/clients/binance_client.rs#L462)
+- [binance_client.rs:583](file://src/clients/binance_client.rs#L583)
+
+### 日志系统
+
+系统采用异步日志记录器，支持多种日志级别和输出格式。
+
+```mermaid
+classDiagram
+class LoggerConfig {
+-level : LevelFilter
+-format : LogFormat
+-file_path : Option~String~
+-rotate_size : Option~u64~
+-max_files : usize
+-buffer_size : Option~usize~
++new(level, format, file_path, rotate_size, max_files) LoggerConfig
++default() LoggerConfig
++level() &LevelFilter
++format() &LogFormat
++file_path() &Option~String~
++rotate_size() &Option~u64~
++max_files() usize
++buffer_size() usize
+}
+class AsyncLogger {
+-config : LoggerConfig
+-sender : Option~mpsc : : Sender~
+-handle : Option~thread : : JoinHandle~
++new(config) AsyncLogger
++init(config) Result
++enabled(metadata) bool
++log(record) void
++flush() void
+}
+class LogFormat {
+<<enumeration>>
+Json
+Text
+}
+LoggerConfig --> LogFormat : uses
+AsyncLogger --> LoggerConfig : uses
+```
+
+**图表来源**
+- [logger.rs:17-79](file://src/infrastructure/logging/logger.rs#L17-L79)
+- [logger.rs:161-261](file://src/infrastructure/logging/logger.rs#L161-L261)
+
+#### 日志级别和输出行为
+
+**日志级别配置**：
+- **默认级别**：Info（可通过配置文件修改）
+- **支持级别**：Trace、Debug、Info、Warn、Error
+- **配置选项**：在`config/default.toml`中设置
+
+**输出行为**：
+- **文件输出**：所有级别的日志都会写入文件
+- **控制台输出**：只有Warn和Error级别的日志会输出到控制台
+- **日志轮转**：支持按大小轮转和历史文件清理
+
+**章节来源**
+- [logger.rs:50-79](file://src/infrastructure/logging/logger.rs#L50-L79)
+- [logger.rs:246-249](file://src/infrastructure/logging/logger.rs#L246-L249)
+- [logger.rs:321-328](file://src/infrastructure/logging/logger.rs#L321-L328)
 
 ### 市场数据服务
 
@@ -513,6 +607,7 @@ end
 subgraph "日志监控"
 LOG[log: 0.4<br/>日志框架]
 ENV_LOGGER[env_logger<br/>环境日志]
+ASYNC_LOGGER[async_logger<br/>异步日志]
 end
 TOKIO --> TUNGSTENITE
 REQWEST --> SERDE
@@ -522,6 +617,7 @@ HMAC --> SHA2
 TOKIO --> FUTURES
 CHRONO --> UUID
 DASHMAP --> TOKIO
+LOG --> ASYNC_LOGGER
 ```
 
 **图表来源**
@@ -551,6 +647,16 @@ DASHMAP --> TOKIO
 - **连接池**：复用HTTP连接，减少连接建立开销
 - **指数退避**：网络异常时采用指数退避策略，避免雪崩效应
 - **心跳检测**：定期发送ping消息，及时发现连接异常
+
+### 日志性能优化
+
+**更新** 系统通过日志级别优化减少了不必要的日志输出，提升了系统性能。
+
+**优化措施**：
+- 将高频的API响应和账户信息日志从INFO降级到DEBUG
+- 保持重要的业务日志（订单撤销、测试下单）为INFO级别
+- 异步日志记录器减少I/O阻塞
+- 文件轮转机制避免日志文件过大影响性能
 
 ## 故障排除指南
 
@@ -601,9 +707,26 @@ DASHMAP --> TOKIO
 - 优化事件处理器性能
 - 调整事件过滤策略
 
+#### 日志相关问题
+
+**症状**：日志输出过多或过少
+
+**排查步骤**：
+1. 检查配置文件中的日志级别设置
+2. 验证日志文件路径和权限
+3. 查看日志轮转配置
+4. 检查控制台输出行为
+
+**解决方案**：
+- 修改config/default.toml中的logging.level
+- 确保日志目录存在且有写权限
+- 调整rotate_size_mb和max_files参数
+- 使用`tail -f logs/trading_YYYY-MM-DD_HHMMSS.log`查看实时日志
+
 **章节来源**
 - [main.rs:88-101](file://src/main.rs#L88-L101)
 - [market_data_service.rs:112-133](file://src/services/market_data_service.rs#L112-L133)
+- [logger.rs:246-249](file://src/infrastructure/logging/logger.rs#L246-L249)
 
 ## 结论
 
@@ -618,11 +741,19 @@ Binance客户端是一个设计精良的事件驱动量化交易系统，具有�
 - 现代异步编程模型，高性能并发处理
 - 完整的错误处理和监控机制
 - 丰富的测试覆盖和文档支持
+- 智能日志系统，支持灵活的日志级别配置
 
 **功能优势**：
 - 多种交易策略支持
 - 完善的风险控制体系
 - 与Binance API深度集成
+- 日志优化提升了系统性能和可观测性
+
+**日志优化优势**：
+- 通过将高频日志从INFO降级到DEBUG，显著减少了日志噪音
+- 保持重要业务日志的可见性，便于问题诊断
+- 支持动态调整日志级别，适应不同环境需求
+- 异步日志记录器确保日志写入不影响系统性能
 
 该系统为量化交易提供了坚实的技术基础，可以根据具体需求进行扩展和定制。
 
@@ -637,6 +768,8 @@ Binance客户端是一个设计精良的事件驱动量化交易系统，具有�
 | 日志 | level | 日志级别 | info |
 | 日志 | format | 日志格式 | text |
 | 日志 | file_path | 日志文件路径 | logs/trading.log |
+| 日志 | rotate_size_mb | 日志轮转大小(MB) | 50 |
+| 日志 | max_files | 最大备份文件数 | 10 |
 | Binance | api_key | API密钥 | 未设置 |
 | Binance | secret_key | 密钥 | 未设置 |
 | Binance | testnet | 是否使用测试网 | false |
@@ -646,6 +779,18 @@ Binance客户端是一个设计精良的事件驱动量化交易系统，具有�
 | 策略 | stop_loss_pct | 止损百分比 | 0.8 |
 | 风控 | max_position_usdt | 最大持仓金额 | 200.0 |
 | 网络 | connection_mode | 连接模式 | ssh_tunnel |
+
+### 日志级别说明
+
+系统支持以下日志级别，按严重程度递增：
+
+| 级别 | 用途 | 控制台输出 | 文件输出 |
+|------|------|------------|----------|
+| Trace | 详细调试信息 | 否 | 是 |
+| Debug | 调试信息 | 否 | 是 |
+| Info | 重要业务信息 | 否 | 是 |
+| Warn | 警告信息 | 是 | 是 |
+| Error | 错误信息 | 是 | 是 |
 
 ### 开发指南
 
@@ -669,3 +814,11 @@ Binance客户端是一个设计精良的事件驱动量化交易系统，具有�
 2. **实现API方法**：添加所需的API调用方法
 3. **错误处理**：实现适当的错误处理逻辑
 4. **测试验证**：编写测试确保API调用正常工作
+
+#### 日志优化实践
+
+1. **识别高频日志**：分析系统性能瓶颈，识别频繁的日志输出
+2. **调整日志级别**：将非关键信息从INFO降级到DEBUG
+3. **保持关键日志**：确保重要的业务状态变化仍为INFO级别
+4. **测试验证**：在不同日志级别下测试系统功能
+5. **文档更新**：更新相关文档说明日志行为变化
