@@ -84,7 +84,7 @@ impl OrderExecutionService {
                         _ => {}
                     }
                 }
-                log::info!("账户余额同步 | USDT: {:.2} | BTC: {:.6}",
+                log::info!("账户余额初始化 | USDT: {:.2} | BTC: {:.6}",
                     bal.available_usdt, bal.btc_free);
                 Ok(())
             }
@@ -138,10 +138,6 @@ impl OrderExecutionService {
         &self,
         signal: &TradingSignalEvent,
     ) -> Result<(), DomainError> {
-        log::info!("执行交易信号: {} | {} @ {:.2} | 数量: {:.6}",
-            signal.signal_type, signal.symbol, signal.suggested_price,
-            signal.suggested_quantity.unwrap_or(0.0));
-
         // 1. 计算订单金额
         let quantity = signal.suggested_quantity.ok_or_else(|| {
             ServiceError::Order("交易信号缺少数量".to_string())
@@ -156,7 +152,7 @@ impl OrderExecutionService {
         drop(bal);
 
         // 3. 风控检查
-        log::info!("风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
+        log::debug!("风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
             available_balance, current_position, order_amount);
         if let Err(alert) = self.risk_service.pre_trade_check(
             order_amount,
@@ -197,12 +193,16 @@ impl OrderExecutionService {
         self.risk_service.record_order(order_amount).await;
 
         // 6. 解析实际成交数据
-        let fill_price = order_result.price.parse::<f64>()
-            .unwrap_or(signal.suggested_price); // 市价单可能返回0，用信号价格备用
         let fill_qty = order_result.executed_qty.parse::<f64>()
             .unwrap_or(quantity);
         let actual_quote_qty = order_result.cummulative_quote_qty.parse::<f64>()
             .unwrap_or(order_amount); // 实际花费/收入的 USDT
+        // 市价单实际成交均价 = 总成交额 / 总成交量
+        let fill_price = if fill_qty > 0.0 {
+            actual_quote_qty / fill_qty
+        } else {
+            signal.suggested_price
+        };
 
         // 从API返回的fills中获取实际手续费
         let (commission, commission_asset) = if let Some(ref fills) = order_result.fills {
@@ -250,8 +250,8 @@ impl OrderExecutionService {
         self.event_bus.publish(fill_event).await
             .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
 
-        log::info!("市价单成交 | {} | {} | 价: {:.2} | 量: {:.6} | 手续费: {:.6} {} | order_id: {}",
-            order_result.symbol, side, fill_price, fill_qty,
+        log::info!("✅ 成交 | {} {} | 均价: {:.2} | 量: {:.6} | 手续费: {:.6} {} | ID: {}",
+            side, order_result.symbol, fill_price, fill_qty,
             commission, commission_asset, order_result.order_id);
 
         Ok(())
@@ -267,7 +267,9 @@ impl EventHandler for OrderExecutionService {
                 return Ok(());
             }
             
-            log::info!("订单执行服务收到交易信号");
+            log::info!("→ 执行信号: {} | {} @ {:.2} | 数量: {:.6}",
+            signal.signal_type, signal.symbol, signal.suggested_price,
+            signal.suggested_quantity.unwrap_or(0.0));
             
             if let Err(e) = self.execute_signal(signal).await {
                 log::error!("订单执行失败: {}", e);

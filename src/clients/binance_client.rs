@@ -383,8 +383,8 @@ impl BinanceClient {
         let order: OrderResponse = serde_json::from_value(response)
             .map_err(|e| ServiceError::Order(format!("解析订单响应失败: {}", e)))?;
 
-        log::info!(
-            "订单已提交: {} {} {} @ {} (数量: {})",
+        log::debug!(
+            "API响应: {} {} {} @ {} (数量: {})",
             order.symbol, order.side, order.order_type, order.price, order.orig_qty
         );
 
@@ -459,7 +459,7 @@ impl BinanceClient {
         let account: AccountInfo = serde_json::from_value(response)
             .map_err(|e| ServiceError::Account(format!("解析账户信息失败: {}", e)))?;
 
-        log::info!("账户信息获取成功 | 可交易: {} | 资产数: {}", account.can_trade, account.balances.len());
+        log::debug!("账户信息获取成功 | 可交易: {} | 资产数: {}", account.can_trade, account.balances.len());
 
         Ok(account)
     }

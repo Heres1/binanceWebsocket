@@ -26,7 +26,7 @@ impl OrderHandler {
 
     /// 处理订单提交事件
     async fn handle_order_submitted(&self, event: &crate::events::OrderSubmittedEvent) {
-        log::info!(
+        log::debug!(
             "订单已提交: order_id={}, symbol={}, side={}, price={:?}, qty={}",
             event.order_id, event.symbol, event.side, event.price, event.quantity
         );
@@ -35,7 +35,7 @@ impl OrderHandler {
 
     /// 处理订单成交事件
     async fn handle_order_filled(&self, event: &crate::events::OrderFilledEvent) {
-        log::info!(
+        log::debug!(
             "订单已成交: order_id={}, fill_id={}, price={}, qty={}, commission={} {}",
             event.order_id,
             event.fill_id,
@@ -49,7 +49,7 @@ impl OrderHandler {
 
     /// 处理订单取消事件
     async fn handle_order_cancelled(&self, event: &crate::events::OrderCancelledEvent) {
-        log::info!(
+        log::debug!(
             "订单已取消: order_id={}, symbol={}, reason={}",
             event.order_id, event.symbol, event.reason
         );
@@ -108,7 +108,7 @@ impl OrderCommandHandler {
         }
         
         // TODO: 调用Binance API下单
-        log::info!(
+        log::debug!(
             "处理下单命令: symbol={}, side={:?}, order_type={:?}, price={:?}, qty={}",
             cmd.symbol, cmd.side, cmd.order_type, cmd.price, cmd.quantity
         );

@@ -94,7 +94,7 @@ impl EventHandler for RiskMonitorService {
             
             // 监听订单成交
             DomainEvent::OrderFilled(fill_event) => {
-                log::info!(
+                log::debug!(
                     "风控监控: 订单成交 #{} - 价格: {}, 数量: {}",
                     fill_event.order_id,
                     fill_event.fill_price,

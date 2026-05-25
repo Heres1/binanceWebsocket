@@ -276,7 +276,7 @@ impl RiskRules {
         state.last_order_time = Some(Utc::now());
         state.daily_order_count += 1;
         
-        log::info!("风控记录: 订单金额 {:.2} USDT，今日第 {} 单", 
+        log::debug!("风控记录: 订单金额 {:.2} USDT，今日第 {} 单", 
             amount, state.daily_order_count);
     }
 
@@ -285,7 +285,7 @@ impl RiskRules {
         let mut state = self.state.lock().await;
         state.daily_loss_usdt += loss;
         
-        log::info!("风控更新: 今日亏损 {:.2} USDT / 限制 {:.2} USDT",
+        log::debug!("风控更新: 今日亏损 {:.2} USDT / 限制 {:.2} USDT",
             state.daily_loss_usdt, self.config.max_daily_loss_usdt);
     }
 

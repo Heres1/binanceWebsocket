@@ -311,18 +311,9 @@ impl AsyncLogger {
                 json_str
             },
             LogFormat::Text => {
-                let mut text = format!("[{}] {} [{}] - {}", 
-                                      timestamp, msg.level, std::thread::current().name().unwrap_or("<unnamed>"), msg.args);
-                                        
-                if let Some(ref module) = msg.module_path {
-                    text.push_str(&format!(" (module: {})", module));
-                }
-                                        
-                if let Some(ref file) = msg.file {
-                    text.push_str(&format!(" @ {}:{}", file, msg.line.unwrap_or(0)));
-                }
-                                        
-                text
+                // 精简格式：[MM-DD HH:MM:SS] LEVEL - 消息
+                let short_timestamp = Local::now().format("%m-%d %H:%M:%S").to_string();
+                format!("[{}] {} - {}", short_timestamp, msg.level, msg.args)
             }
         }
     }
