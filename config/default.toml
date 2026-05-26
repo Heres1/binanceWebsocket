@@ -30,27 +30,27 @@ quantity_per_trade = 0.00013
 # 硬止盈上限 (必须 > trailing_trigger 否则追踪止损是死代码)
 take_profit_pct = 2.0
 # 初始止损百分比
-stop_loss_pct = 1.5
+stop_loss_pct = 1.0
 # 最大持仓时间(秒) - 12小时
 max_hold_seconds = 43200
-# 交易冷却时间(秒) - 10分钟
-cooldown_seconds = 600
+# 交易冷却时间(秒) - 5分钟（优化器推荐，比10分钟更快恢复）
+cooldown_seconds = 300
 # 日最大交易次数
 max_daily_trades = 50
 # 日最大亏损百分比
 max_daily_loss_pct = 3.0
-# RSI超卖线 (40=比50更严格，减少偻信号)
-rsi_oversold = 40.0
+# RSI超卖线 (50=更宽松，配合VR=1.0过滤)
+rsi_oversold = 50.0
 # RSI超买线 (禁用RSI退出)
 rsi_overbought = 100.0
-# 买卖量比阈值 (0.6=宽松，让更多信号通过)
-volume_ratio_threshold = 0.6
+# 买卖量比阈值 (1.0=中性，买量>=卖量才入场；配合RSI<65突破过滤)
+volume_ratio_threshold = 1.0
 # 保本止损触发 (浮盈达此值后SL上移到入场价，必须 < trailing_trigger)
-breakeven_trigger_pct = 0.5
+breakeven_trigger_pct = 0.8
 # 追踪止损触发 (浮盈达此值后启用追踪，必须 < take_profit)
-trailing_trigger_pct = 1.5
+trailing_trigger_pct = 1.0
 # 追踪止损回撤距离 (从最高/最低点回撤此百分比平仓)
-trailing_distance_pct = 0.5
+trailing_distance_pct = 0.8
 # 是否允许做空
 allow_short = true
 # 策略类型

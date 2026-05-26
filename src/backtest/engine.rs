@@ -386,7 +386,8 @@ impl BacktestEngine {
                     let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
                         .iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
-                    breakout_pct > 0.05 && vol_ratio > self.config.strategy.volume_ratio_threshold
+                    // RSI < 65: 防止在RSI高位追高
+                    breakout_pct > 0.05 && vol_ratio > self.config.strategy.volume_ratio_threshold && rsi < 65.0
                 } else {
                     false
                 };
@@ -413,7 +414,8 @@ impl BacktestEngine {
                         let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                             .iter().copied().fold(f64::INFINITY, f64::min);
                         let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
-                        breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold)
+                        // RSI > 35: 防止RSI极度超卖时做空击穿（与做多突破rsi<65对称）
+                        breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 35.0
                     } else {
                         false
                     };
@@ -716,7 +718,8 @@ impl BacktestEngine {
                             let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
                                 .iter().copied().fold(f64::NEG_INFINITY, f64::max);
                             let breakout_pct = (state.best_ask - lookback_high) / lookback_high * 100.0;
-                            breakout_pct > 0.05 && vol_ratio > self.config.strategy.volume_ratio_threshold
+                            // RSI < 65: 防止在RSI高位追高
+                            breakout_pct > 0.05 && vol_ratio > self.config.strategy.volume_ratio_threshold && rsi < 65.0
                         } else {
                             false
                         };
@@ -742,7 +745,8 @@ impl BacktestEngine {
                                 let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                                     .iter().copied().fold(f64::INFINITY, f64::min);
                                 let breakdown_pct = (lookback_low - state.best_bid) / lookback_low * 100.0;
-                                breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold)
+                                // RSI > 35: 防止RSI极度超卖时做空击穿
+                                breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 35.0
                             } else {
                                 false
                             };
@@ -1043,8 +1047,8 @@ impl BacktestEngine {
                     let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
                         .iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
-                    // 突破幅度要超过0.05%（过滤微小波动）且量比确认
-                    breakout_pct > 0.05 && vol_ratio > strategy.volume_ratio_threshold
+                    // RSI < 65: 防止在RSI高位追高
+                    breakout_pct > 0.05 && vol_ratio > strategy.volume_ratio_threshold && rsi < 65.0
                 } else {
                     false
                 };
@@ -1072,7 +1076,8 @@ impl BacktestEngine {
                             .iter().copied().fold(f64::INFINITY, f64::min);
                         let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
                         // 做空需要卖压强: vol_ratio < 1/threshold 意味着sell_vol/buy_vol > threshold
-                        breakdown_pct > 0.05 && vol_ratio < (1.0 / strategy.volume_ratio_threshold)
+                    // RSI > 35: 防止RSI极度超卖时做空击穿
+                    breakdown_pct > 0.05 && vol_ratio < (1.0 / strategy.volume_ratio_threshold) && rsi > 35.0
                     } else {
                         false
                     };

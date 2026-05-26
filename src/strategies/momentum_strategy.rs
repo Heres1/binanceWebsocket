@@ -213,6 +213,11 @@ impl StrategyState {
     fn check_daily_reset(&mut self, timestamp_ms: u64) {
         let day = (timestamp_ms / 86400000) as u32;
         if day != self.last_day {
+            // 输出昨日摘要
+            if self.last_day > 0 {
+                log::info!("📅 日摘要 | 交易:{}笔 | 日盈亏:{:+.3}%",
+                    self.daily_trades, self.daily_pnl);
+            }
             self.last_day = day;
             self.daily_trades = 0;
             self.daily_pnl = 0.0;
@@ -263,6 +268,8 @@ impl MomentumStrategy {
         {
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             if now_ms > state.last_data_time && (now_ms - state.last_data_time) > 30000 {
+                // 紧急平仓前先做日重置，防止跨天边界的日盈亏统计错乱
+                state.check_daily_reset(event.close_time);
                 let current_price = event.close;
                 let pnl_pct = if state.position == Position::Long {
                     (current_price - state.entry_price) / state.entry_price * 100.0
@@ -391,9 +398,19 @@ impl MomentumStrategy {
             let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
             let dynamic_sl = if highest_pnl_pct >= self.config.trailing_trigger_pct {
+                if !state.trailing_active {
+                    log::info!("📌 追踪激活 | {} | 最高: {:.2} | 追踪止损: {:.2} | 当前浮盈: {:.2}%",
+                        self.config.symbol, state.highest_since_entry,
+                        state.highest_since_entry * (1.0 - self.config.trailing_distance_pct / 100.0),
+                        highest_pnl_pct);
+                }
                 state.trailing_active = true;
                 state.highest_since_entry * (1.0 - self.config.trailing_distance_pct / 100.0)
             } else if highest_pnl_pct >= self.config.breakeven_trigger_pct {
+                if !state.breakeven_active {
+                    log::info!("📌 保本激活 | {} | 止损上移至: {:.2} | 当前浮盈: {:.2}%",
+                        self.config.symbol, state.entry_price, highest_pnl_pct);
+                }
                 state.breakeven_active = true;
                 state.entry_price
             } else {
@@ -420,8 +437,9 @@ impl MomentumStrategy {
                     "RSI超买"
                 };
 
-                log::info!("🔴 平多 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {} | 持仓: {}s",
-                    self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
+                log::info!("🔴 平多 | {} | 入场: {:.2} | 出场: {:.2} | 盈亏: {:+.3}% | 最高浮盈: {:.2}% | 原因: {} | 持仓: {}s | 日累计: {:+.3}%",
+                    self.config.symbol, state.entry_price, current_price, pnl_pct,
+                    highest_pnl_pct, reason, hold_secs, state.daily_pnl + pnl_pct);
 
                 state.position = Position::None;
                 state.daily_pnl += pnl_pct;
@@ -445,9 +463,19 @@ impl MomentumStrategy {
             let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
 
             let dynamic_sl = if lowest_pnl_pct >= self.config.trailing_trigger_pct {
+                if !state.trailing_active {
+                    log::info!("📌 空追踪激活 | {} | 最低: {:.2} | 追踪止损: {:.2} | 当前浮盈: {:.2}%",
+                        self.config.symbol, state.lowest_since_entry,
+                        state.lowest_since_entry * (1.0 + self.config.trailing_distance_pct / 100.0),
+                        lowest_pnl_pct);
+                }
                 state.trailing_active = true;
                 state.lowest_since_entry * (1.0 + self.config.trailing_distance_pct / 100.0)
             } else if lowest_pnl_pct >= self.config.breakeven_trigger_pct {
+                if !state.breakeven_active {
+                    log::info!("📌 空保本激活 | {} | 止损下移至: {:.2} | 当前浮盈: {:.2}%",
+                        self.config.symbol, state.entry_price, lowest_pnl_pct);
+                }
                 state.breakeven_active = true;
                 state.entry_price
             } else {
@@ -471,8 +499,9 @@ impl MomentumStrategy {
                     "空超时"
                 };
 
-                log::info!("🔴 平空 | {} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}% | 原因: {} | 持仓: {}s",
-                    self.config.symbol, state.entry_price, current_price, pnl_pct, reason, hold_secs);
+                log::info!("🔴 平空 | {} | 入场: {:.2} | 出场: {:.2} | 盈亏: {:+.3}% | 最高浮盈: {:.2}% | 原因: {} | 持仓: {}s | 日累计: {:+.3}%",
+                    self.config.symbol, state.entry_price, current_price, pnl_pct,
+                    lowest_pnl_pct, reason, hold_secs, state.daily_pnl + pnl_pct);
 
                 state.position = Position::None;
                 state.daily_pnl += pnl_pct;
@@ -527,7 +556,8 @@ impl MomentumStrategy {
                 let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
                     .iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let breakout_pct = (state.best_ask - lookback_high) / lookback_high * 100.0;
-                breakout_pct > 0.05 && vol_ratio > self.config.volume_ratio_threshold
+                // RSI < 65: 防止在RSI高位追高（RSI>=65时的突破信号可靠性差）
+                breakout_pct > 0.05 && vol_ratio > self.config.volume_ratio_threshold && rsi < 65.0
             } else {
                 false
             };
@@ -538,10 +568,14 @@ impl MomentumStrategy {
 
             if entry_signal {
                 let entry_price = state.best_ask;
+                // 优先判断RSI反弹路径：两种条件同时满足时RSI反弹更具体
+                let entry_path = if trend_up && rsi_recovering && buy_dominant && bid_support { "RSI反弹" } else { "突破" };
+                let sl_price = entry_price * (1.0 - self.config.stop_loss_pct / 100.0);
+                let tp_price = entry_price * (1.0 + self.config.take_profit_pct / 100.0);
 
-                log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2}",
+                log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 路径:{} | SL:{:.2} | TP:{:.2}",
                     self.config.symbol, entry_price, rsi, vol_ratio,
-                    ema_fast_5m, ema_slow_5m);
+                    ema_fast_5m, ema_slow_5m, entry_path, sl_price, tp_price);
 
                 state.position = Position::Long;
                 state.entry_price = entry_price;
@@ -564,7 +598,8 @@ impl MomentumStrategy {
                     let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                         .iter().copied().fold(f64::INFINITY, f64::min);
                     let breakdown_pct = (lookback_low - state.best_bid) / lookback_low * 100.0;
-                    breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.volume_ratio_threshold)
+                    // RSI > 35: 防止RSI已处于极度超卖时做空击穿（与做多突破rsi<65对称）
+                    breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.volume_ratio_threshold) && rsi > 35.0
                 } else {
                     false
                 };
@@ -577,10 +612,13 @@ impl MomentumStrategy {
 
                 if short_signal {
                     let entry_price = state.best_bid; // 做空用bid
+                    let short_path = if breakdown_signal && trend_down { "击穿" } else { "RSI超买" };
+                    let sl_price = entry_price * (1.0 + self.config.stop_loss_pct / 100.0);
+                    let tp_price = entry_price * (1.0 - self.config.take_profit_pct / 100.0);
 
-                    log::info!("🟡 做空 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2}",
+                    log::info!("🟡 做空 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 路径:{} | SL:{:.2} | TP:{:.2}",
                         self.config.symbol, entry_price, rsi, vol_ratio,
-                        ema_fast_5m, ema_slow_5m);
+                        ema_fast_5m, ema_slow_5m, short_path, sl_price, tp_price);
 
                     state.position = Position::Short;
                     state.entry_price = entry_price;
