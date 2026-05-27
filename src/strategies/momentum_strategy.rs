@@ -235,7 +235,7 @@ pub struct MomentumStrategy {
 impl MomentumStrategy {
     /// 创建新的动量策略
     pub fn new(config: StrategyConfig, event_bus: Arc<TokioEventBus>) -> Self {
-        log::info!("动量策略初始化:");
+        log::info!("动量策略 v{} ({}) 初始化:", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
         log::info!("   交易对: {}", config.symbol);
         log::info!("   每笔数量: {} BTC", config.quantity_per_trade);
         log::info!("   止盈: {}% | 止损: {}%", config.take_profit_pct, config.stop_loss_pct);
