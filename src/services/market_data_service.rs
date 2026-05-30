@@ -113,8 +113,10 @@ impl MarketDataService {
             let connect_start = std::time::Instant::now();
             match self.connect_and_run().await {
                 Ok(_) => {
-                    log::info!("WebSocket连接正常关闭");
-                    break;
+                    // 收到Close帧或流结束，也需要重连（Binance会定期断连）
+                    log::warn!("WebSocket连接关闭，{}秒后重连", self.reconnect_interval);
+                    retry_interval = self.reconnect_interval;
+                    tokio::time::sleep(Duration::from_secs(self.reconnect_interval)).await;
                 }
                 Err(e) => {
                     // 如果运行超过30秒，说明曾成功连接过，重置退避间隔
@@ -128,8 +130,6 @@ impl MarketDataService {
                 }
             }
         }
-        
-        Ok(())
     }
     
     /// 连接WebSocket并运行
