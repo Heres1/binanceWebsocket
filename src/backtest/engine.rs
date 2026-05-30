@@ -415,7 +415,7 @@ impl BacktestEngine {
                             .iter().copied().fold(f64::INFINITY, f64::min);
                         let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
                         // RSI > 35: 防止RSI极度超卖时做空击穿（与做多突破rsi<65对称）
-                        breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 35.0
+                        breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 40.0
                     } else {
                         false
                     };
@@ -746,7 +746,7 @@ impl BacktestEngine {
                                     .iter().copied().fold(f64::INFINITY, f64::min);
                                 let breakdown_pct = (lookback_low - state.best_bid) / lookback_low * 100.0;
                                 // RSI > 35: 防止RSI极度超卖时做空击穿
-                                breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 35.0
+                                breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 40.0
                             } else {
                                 false
                             };
@@ -1077,7 +1077,7 @@ impl BacktestEngine {
                         let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
                         // 做空需要卖压强: vol_ratio < 1/threshold 意味着sell_vol/buy_vol > threshold
                     // RSI > 35: 防止RSI极度超卖时做空击穿
-                    breakdown_pct > 0.05 && vol_ratio < (1.0 / strategy.volume_ratio_threshold) && rsi > 35.0
+                    breakdown_pct > 0.05 && vol_ratio < (1.0 / strategy.volume_ratio_threshold) && rsi > 40.0
                     } else {
                         false
                     };

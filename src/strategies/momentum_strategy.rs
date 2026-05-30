@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use super::indicators::{EMA, RSI, VolumeRatio};
 
-const STATE_FILE: &str = "data/strategy_state.json";
+
 
 /// 持仓状态
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,19 +42,19 @@ struct PersistentState {
 }
 
 impl PersistentState {
-    fn save(&self) {
-        if let Some(parent) = std::path::Path::new(STATE_FILE).parent() {
+    fn save(&self, state_file: &str) {
+        if let Some(parent) = std::path::Path::new(state_file).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {
                 // 原子写入：先写临时文件，再rename，防止并发写入损坏
-                let temp_file = format!("{}.tmp", STATE_FILE);
+                let temp_file = format!("{}.tmp", state_file);
                 if let Err(e) = std::fs::write(&temp_file, &json) {
                     log::error!("保存策略状态失败(写临时文件): {}", e);
                     return;
                 }
-                if let Err(e) = std::fs::rename(&temp_file, STATE_FILE) {
+                if let Err(e) = std::fs::rename(&temp_file, state_file) {
                     log::error!("保存策略状态失败(rename): {}", e);
                     let _ = std::fs::remove_file(&temp_file);
                 }
@@ -63,12 +63,12 @@ impl PersistentState {
         }
     }
     
-    fn load() -> Option<Self> {
-        match std::fs::read_to_string(STATE_FILE) {
+    fn load(state_file: &str) -> Option<Self> {
+        match std::fs::read_to_string(state_file) {
             Ok(json) => {
                 match serde_json::from_str(&json) {
                     Ok(state) => {
-                        log::info!("✅ 恢复策略状态成功");
+                        log::info!("✅ 恢复策略状态成功 ({})", state_file);
                         Some(state)
                     }
                     Err(e) => {
@@ -134,9 +134,9 @@ struct StrategyState {
 }
 
 impl StrategyState {
-    fn new() -> Self {
+    fn new(state_file: &str) -> Self {
         // 尝试从文件恢复持仓状态
-        let persisted = PersistentState::load();
+        let persisted = PersistentState::load(state_file);
         
         let mut state = Self {
             ema_fast_1m: EMA::new(7),
@@ -230,21 +230,23 @@ pub struct MomentumStrategy {
     config: StrategyConfig,
     event_bus: Arc<TokioEventBus>,
     state: Arc<Mutex<StrategyState>>,
+    state_file: String,
 }
 
 impl MomentumStrategy {
     /// 创建新的动量策略
     pub fn new(config: StrategyConfig, event_bus: Arc<TokioEventBus>) -> Self {
+        let state_file = format!("data/strategy_state_{}.json", config.symbol.to_lowercase());
+        let direction = if config.allow_short { "多空" } else { "做多" };
         log::info!("动量策略 v{} ({}) 初始化:", env!("CARGO_PKG_VERSION"), env!("GIT_HASH"));
-        log::info!("   交易对: {}", config.symbol);
-        log::info!("   每笔数量: {} BTC", config.quantity_per_trade);
-        log::info!("   止盈: {}% | 止损: {}%", config.take_profit_pct, config.stop_loss_pct);
-        log::info!("   冷却: {}秒 | 日限: {}次", config.cooldown_seconds, config.max_daily_trades);
+        log::info!("   交易对: {}({}) | 每笔: {}", config.symbol, direction, config.quantity_per_trade);
+        log::info!("   止盈: {}% | 止损: {}% | 冷却: {}秒", config.take_profit_pct, config.stop_loss_pct, config.cooldown_seconds);
 
         Self {
+            state: Arc::new(Mutex::new(StrategyState::new(&state_file))),
+            state_file,
             config,
             event_bus,
-            state: Arc::new(Mutex::new(StrategyState::new())),
         }
     }
 
@@ -277,15 +279,17 @@ impl MomentumStrategy {
                     (state.entry_price - current_price) / state.entry_price * 100.0
                 };
                 let signal_type = if state.position == Position::Long { "SELL" } else { "COVER" };
-                log::warn!("⚠️ 数据超时紧急平仓 | {} | {:?} | 入场: {:.2} | 当前: {:.2} | 盈亏: {:.3}%",
-                    self.config.symbol, state.position, state.entry_price, current_price, pnl_pct);
+                let net_pnl_pct = pnl_pct - self.config.round_trip_fee_pct;
+                log::warn!("⚠️ 数据超时紧急平仓 | {} | {:?} | 入场: {:.2} | 当前: {:.2} | 净盈亏: {:.3}%",
+                    self.config.symbol, state.position, state.entry_price, current_price, net_pnl_pct);
                 
                 state.position = Position::None;
-                state.daily_pnl += pnl_pct;
+                state.daily_pnl += net_pnl_pct;
                 state.rsi_was_oversold = false;
                 let snap = state.snapshot();
+                let path = self.state_file.clone();
                 drop(state);
-                tokio::task::spawn_blocking(move || snap.save());
+                tokio::task::spawn_blocking(move || snap.save(&path));
                 self.emit_signal(signal_type, current_price, now_ms).await;
                 return;
             }
@@ -408,11 +412,13 @@ impl MomentumStrategy {
                 state.highest_since_entry * (1.0 - self.config.trailing_distance_pct / 100.0)
             } else if highest_pnl_pct >= self.config.breakeven_trigger_pct {
                 if !state.breakeven_active {
-                    log::info!("📌 保本激活 | {} | 止损上移至: {:.2} | 当前浮盈: {:.2}%",
-                        self.config.symbol, state.entry_price, highest_pnl_pct);
+                    let be_price = state.entry_price * (1.0 + self.config.round_trip_fee_pct / 100.0);
+                    log::info!("📌 保本激活 | {} | 止损上移至: {:.2}(含费) | 当前浮盈: {:.2}%",
+                        self.config.symbol, be_price, highest_pnl_pct);
                 }
                 state.breakeven_active = true;
-                state.entry_price
+                // 费后保本：SL = 入场价 + 手续费，确保出场后真正不亏
+                state.entry_price * (1.0 + self.config.round_trip_fee_pct / 100.0)
             } else {
                 state.entry_price * (1.0 - self.config.stop_loss_pct / 100.0)
             };
@@ -437,17 +443,19 @@ impl MomentumStrategy {
                     "RSI超买"
                 };
 
-                log::info!("🔴 平多 | {} | 入场: {:.2} | 出场: {:.2} | 盈亏: {:+.3}% | 最高浮盈: {:.2}% | 原因: {} | 持仓: {}s | 日累计: {:+.3}%",
+                let net_pnl_pct = pnl_pct - self.config.round_trip_fee_pct;
+                log::info!("🔴 平多 | {} | 入场: {:.2} | 出场: {:.2} | 毛盈亏: {:+.3}% | 净盈亏: {:+.3}% | 最高浮盈: {:.2}% | 原因: {} | 持仓: {}s | 日累计: {:+.3}%",
                     self.config.symbol, state.entry_price, current_price, pnl_pct,
-                    highest_pnl_pct, reason, hold_secs, state.daily_pnl + pnl_pct);
+                    net_pnl_pct, highest_pnl_pct, reason, hold_secs, state.daily_pnl + net_pnl_pct);
 
                 state.position = Position::None;
-                state.daily_pnl += pnl_pct;
+                state.daily_pnl += net_pnl_pct;
                 state.last_trade_time = now_ms;
                 state.rsi_was_oversold = false;
                 let snap = state.snapshot();
+                let path = self.state_file.clone();
                 drop(state);
-                tokio::task::spawn_blocking(move || snap.save());
+                tokio::task::spawn_blocking(move || snap.save(&path));
                 self.emit_signal("SELL", current_price, now_ms).await;
                 return;
             }
@@ -473,11 +481,13 @@ impl MomentumStrategy {
                 state.lowest_since_entry * (1.0 + self.config.trailing_distance_pct / 100.0)
             } else if lowest_pnl_pct >= self.config.breakeven_trigger_pct {
                 if !state.breakeven_active {
-                    log::info!("📌 空保本激活 | {} | 止损下移至: {:.2} | 当前浮盈: {:.2}%",
-                        self.config.symbol, state.entry_price, lowest_pnl_pct);
+                    let be_price = state.entry_price * (1.0 - self.config.round_trip_fee_pct / 100.0);
+                    log::info!("📌 空保本激活 | {} | 止损下移至: {:.2}(含费) | 当前浮盈: {:.2}%",
+                        self.config.symbol, be_price, lowest_pnl_pct);
                 }
                 state.breakeven_active = true;
-                state.entry_price
+                // 费后保本：SL = 入场价 - 手续费，做空需价格低于此才真正保本
+                state.entry_price * (1.0 - self.config.round_trip_fee_pct / 100.0)
             } else {
                 state.entry_price * (1.0 + self.config.stop_loss_pct / 100.0)
             };
@@ -499,16 +509,18 @@ impl MomentumStrategy {
                     "空超时"
                 };
 
-                log::info!("🔴 平空 | {} | 入场: {:.2} | 出场: {:.2} | 盈亏: {:+.3}% | 最高浮盈: {:.2}% | 原因: {} | 持仓: {}s | 日累计: {:+.3}%",
+                let net_pnl_pct = pnl_pct - self.config.round_trip_fee_pct;
+                log::info!("🔴 平空 | {} | 入场: {:.2} | 出场: {:.2} | 毛盈亏: {:+.3}% | 净盈亏: {:+.3}% | 最高浮盈: {:.2}% | 原因: {} | 持仓: {}s | 日累计: {:+.3}%",
                     self.config.symbol, state.entry_price, current_price, pnl_pct,
-                    lowest_pnl_pct, reason, hold_secs, state.daily_pnl + pnl_pct);
+                    net_pnl_pct, lowest_pnl_pct, reason, hold_secs, state.daily_pnl + net_pnl_pct);
 
                 state.position = Position::None;
-                state.daily_pnl += pnl_pct;
+                state.daily_pnl += net_pnl_pct;
                 state.last_trade_time = now_ms;
                 let snap = state.snapshot();
+                let path = self.state_file.clone();
                 drop(state);
-                tokio::task::spawn_blocking(move || snap.save());
+                tokio::task::spawn_blocking(move || snap.save(&path));
                 self.emit_signal("COVER", current_price, now_ms).await;
                 return;
             }
@@ -588,8 +600,9 @@ impl MomentumStrategy {
                 state.last_trade_time = now_ms;
                 state.daily_trades += 1;
                 let snap = state.snapshot();
+                let path = self.state_file.clone();
                 drop(state);
-                tokio::task::spawn_blocking(move || snap.save());
+                tokio::task::spawn_blocking(move || snap.save(&path));
                 self.emit_signal("BUY", entry_price, now_ms).await;
             } else if self.config.allow_short {
                 // === 做空入场条件 ===
@@ -598,8 +611,8 @@ impl MomentumStrategy {
                     let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                         .iter().copied().fold(f64::INFINITY, f64::min);
                     let breakdown_pct = (lookback_low - state.best_bid) / lookback_low * 100.0;
-                    // RSI > 35: 防止RSI已处于极度超卖时做空击穿（与做多突破rsi<65对称）
-                    breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.volume_ratio_threshold) && rsi > 35.0
+                    // RSI > 40: 防止RSI已处于极度超卖时做空击穿（下跌动能已耗尽）
+                    breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.volume_ratio_threshold) && rsi > 40.0
                 } else {
                     false
                 };
@@ -631,8 +644,9 @@ impl MomentumStrategy {
                     state.last_trade_time = now_ms;
                     state.daily_trades += 1;
                     let snap = state.snapshot();
+                    let path = self.state_file.clone();
                     drop(state);
-                    tokio::task::spawn_blocking(move || snap.save());
+                    tokio::task::spawn_blocking(move || snap.save(&path));
                     self.emit_signal("SHORT", entry_price, now_ms).await;
                 }
             }

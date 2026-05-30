@@ -115,7 +115,7 @@ async fn main() {
         symbol: args.symbol.clone(),
         initial_capital: args.capital,
         strategy: strategy_config,
-        commission_rate: 0.00075, // 0.075% Binance现货手续费(BNB抵扣)
+        commission_rate: 0.0005, // 0.05%/侧 = 0.1%往返 (BUY免费+SELL 0.1%)
     };
 
     let engine = BacktestEngine::new(backtest_config, data_dir);

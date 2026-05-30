@@ -22,6 +22,10 @@ pub struct AccountBalance {
     pub locked_usdt: f64,
     pub btc_free: f64,
     pub btc_locked: f64,
+    pub eth_free: f64,
+    pub eth_locked: f64,
+    pub sol_free: f64,
+    pub sol_locked: f64,
 }
 
 impl AccountBalance {
@@ -31,10 +35,14 @@ impl AccountBalance {
             locked_usdt: 0.0,
             btc_free: 0.0,
             btc_locked: 0.0,
+            eth_free: 0.0,
+            eth_locked: 0.0,
+            sol_free: 0.0,
+            sol_locked: 0.0,
         }
     }
     
-    /// 当前持仓价值估算 (BTC数量 * 当前价)
+    /// 当前总持仓价值估算 (基于信号价格的粗略估算)
     pub fn position_value(&self, btc_price: f64) -> f64 {
         (self.btc_free + self.btc_locked) * btc_price
     }
@@ -45,7 +53,7 @@ pub struct OrderExecutionService {
     client: BinanceClient,
     risk_service: RiskMonitorService,
     event_bus: Arc<TokioEventBus>,
-    symbol: String,
+    symbols: Vec<String>,
     balance: Arc<Mutex<AccountBalance>>,
 }
 
@@ -55,13 +63,13 @@ impl OrderExecutionService {
         client: BinanceClient,
         risk_service: RiskMonitorService,
         event_bus: Arc<TokioEventBus>,
-        symbol: String,
+        symbols: Vec<String>,
     ) -> Self {
         Self {
             client,
             risk_service,
             event_bus,
-            symbol,
+            symbols,
             balance: Arc::new(Mutex::new(AccountBalance::new())),
         }
     }
@@ -81,11 +89,19 @@ impl OrderExecutionService {
                             bal.btc_free = b.free.parse().unwrap_or(0.0);
                             bal.btc_locked = b.locked.parse().unwrap_or(0.0);
                         }
+                        "ETH" => {
+                            bal.eth_free = b.free.parse().unwrap_or(0.0);
+                            bal.eth_locked = b.locked.parse().unwrap_or(0.0);
+                        }
+                        "SOL" => {
+                            bal.sol_free = b.free.parse().unwrap_or(0.0);
+                            bal.sol_locked = b.locked.parse().unwrap_or(0.0);
+                        }
                         _ => {}
                     }
                 }
-                log::info!("账户余额初始化 | USDT: {:.2} | BTC: {:.6}",
-                    bal.available_usdt, bal.btc_free);
+                log::info!("账户余额初始化 | USDT: {:.2} | BTC: {:.6} | ETH: {:.4} | SOL: {:.2}",
+                    bal.available_usdt, bal.btc_free, bal.eth_free, bal.sol_free);
                 Ok(())
             }
             Err(e) => {
@@ -118,6 +134,14 @@ impl OrderExecutionService {
                                 "BTC" => {
                                     bal.btc_free = b.free.parse().unwrap_or(0.0);
                                     bal.btc_locked = b.locked.parse().unwrap_or(0.0);
+                                }
+                                "ETH" => {
+                                    bal.eth_free = b.free.parse().unwrap_or(0.0);
+                                    bal.eth_locked = b.locked.parse().unwrap_or(0.0);
+                                }
+                                "SOL" => {
+                                    bal.sol_free = b.free.parse().unwrap_or(0.0);
+                                    bal.sol_locked = b.locked.parse().unwrap_or(0.0);
                                 }
                                 _ => {}
                             }
@@ -218,15 +242,25 @@ impl OrderExecutionService {
             (fill_qty * fill_price * 0.001, "USDT".to_string())
         };
 
-        // 7. 更新本地余额缓存（使用实际成交金额，保护不变为负数）
+        // 7. 更新本地余额缓存（使用实际成交金额，按品种更新对应资产）
         {
             let mut bal = self.balance.lock().await;
             if side == "BUY" {
                 bal.available_usdt -= actual_quote_qty;
-                bal.btc_free += fill_qty;
+                match signal.symbol.as_str() {
+                    "BTCUSDT" => bal.btc_free += fill_qty,
+                    "ETHUSDT" => bal.eth_free += fill_qty,
+                    "SOLUSDT" => bal.sol_free += fill_qty,
+                    _ => {}
+                }
             } else {
                 bal.available_usdt += actual_quote_qty;
-                bal.btc_free = (bal.btc_free - fill_qty).max(0.0);
+                match signal.symbol.as_str() {
+                    "BTCUSDT" => bal.btc_free = (bal.btc_free - fill_qty).max(0.0),
+                    "ETHUSDT" => bal.eth_free = (bal.eth_free - fill_qty).max(0.0),
+                    "SOLUSDT" => bal.sol_free = (bal.sol_free - fill_qty).max(0.0),
+                    _ => {}
+                }
             }
             // 安全下限保护
             if bal.available_usdt < 0.0 {
@@ -262,8 +296,8 @@ impl OrderExecutionService {
 impl EventHandler for OrderExecutionService {
     async fn handle(&self, event: &DomainEvent) -> Result<(), EventBusError> {
         if let DomainEvent::TradingSignal(signal) = event {
-            // 只处理当前交易对的信号
-            if signal.symbol != self.symbol {
+            // 只处理已配置交易对的信号
+            if !self.symbols.contains(&signal.symbol) {
                 return Ok(());
             }
             
@@ -294,7 +328,7 @@ impl Clone for OrderExecutionService {
             client: self.client.clone(),
             risk_service: self.risk_service.clone(),
             event_bus: self.event_bus.clone(),
-            symbol: self.symbol.clone(),
+            symbols: self.symbols.clone(),
             balance: self.balance.clone(),
         }
     }

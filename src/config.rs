@@ -14,6 +14,17 @@ pub struct AppConfig {
     pub strategy: StrategyConfig,
     pub risk: RiskConfig,
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub trading_pairs: Vec<TradingPairConfig>,
+}
+
+/// 交易对配置（多品种支持）
+#[derive(Deserialize, Clone, Debug)]
+pub struct TradingPairConfig {
+    pub symbol: String,
+    pub quantity_per_trade: f64,
+    #[serde(default)]
+    pub allow_short: bool,
 }
 
 /// 日志配置
@@ -54,6 +65,8 @@ pub struct StrategyConfig {
     pub trailing_trigger_pct: f64,     // 触发追踪止损的浮盈百分比
     #[serde(default = "default_trailing_distance")]
     pub trailing_distance_pct: f64,    // 追踪止损回撤距离百分比
+    #[serde(default = "default_round_trip_fee")]
+    pub round_trip_fee_pct: f64,       // 往返手续费百分比(默认0.1%)
     #[serde(default)]
     pub allow_short: bool,             // 是否允许做空
     #[serde(default = "default_strategy_type")]
@@ -76,6 +89,10 @@ fn default_trailing_trigger() -> f64 {
 
 fn default_trailing_distance() -> f64 {
     0.3
+}
+
+fn default_round_trip_fee() -> f64 {
+    0.1
 }
 
 /// 做空配置

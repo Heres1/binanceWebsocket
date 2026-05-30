@@ -29,12 +29,12 @@ symbol = "BTCUSDT"
 quantity_per_trade = 0.00013
 # 硬止盈上限 (必须 > trailing_trigger 否则追踪止损是死代码)
 take_profit_pct = 2.0
-# 初始止损百分比
-stop_loss_pct = 1.0
-# 最大持仓时间(秒) - 12小时
-max_hold_seconds = 43200
-# 交易冷却时间(秒) - 5分钟（优化器推荐，比10分钟更快恢复）
-cooldown_seconds = 300
+# 初始止损百分比 (放宽止损给趋势呼吸空间，减少噪音扫损)
+stop_loss_pct = 1.5
+# 最大持仓时间(秒) - 8小时（缩短持仓减少超时亏损）
+max_hold_seconds = 28800
+# 交易冷却时间(秒) - 10分钟（加长冷却减少连续错误）
+cooldown_seconds = 600
 # 日最大交易次数
 max_daily_trades = 50
 # 日最大亏损百分比
@@ -43,14 +43,16 @@ max_daily_loss_pct = 3.0
 rsi_oversold = 50.0
 # RSI超买线 (禁用RSI退出)
 rsi_overbought = 100.0
-# 买卖量比阈值 (1.0=中性，买量>=卖量才入场；配合RSI<65突破过滤)
-volume_ratio_threshold = 1.0
+# 买卖量比阈值 (0.6=降低门槛捕获更多机会)
+volume_ratio_threshold = 0.6
 # 保本止损触发 (浮盈达此值后SL上移到入场价，必须 < trailing_trigger)
 breakeven_trigger_pct = 0.8
 # 追踪止损触发 (浮盈达此值后启用追踪，必须 < take_profit)
 trailing_trigger_pct = 1.0
-# 追踪止损回撤距离 (从最高/最低点回撤此百分比平仓)
-trailing_distance_pct = 0.8
+# 追踪止损回撤距离 (从最高/最低点回撤此百分比平仓，收紧以0.5%锁住更多利润)
+trailing_distance_pct = 0.5
+# 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
+round_trip_fee_pct = 0.1
 # 是否允许做空
 allow_short = true
 # 策略类型
@@ -58,13 +60,29 @@ strategy_type = "Breakout"
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 
+# 多品种交易对配置
+[[trading_pairs]]
+symbol = "BTCUSDT"
+quantity_per_trade = 0.0007   # ~$50 @ $73000
+allow_short = true
+
+[[trading_pairs]]
+symbol = "ETHUSDT"
+quantity_per_trade = 0.02     # ~$50 @ $2500
+allow_short = false           # 不持有ETH，只做多
+
+[[trading_pairs]]
+symbol = "SOLUSDT"
+quantity_per_trade = 0.3      # ~$50 @ $165
+allow_short = false           # 不持有SOL，只做多
+
 [risk]
-# 最大持仓金额 (USDT) - 小资金测试
-max_position_usdt = 200.0
+# 最大持仓金额 (USDT) - 3品种并发
+max_position_usdt = 500.0
 # 单笔最大金额 (USDT)
-max_single_order_usdt = 20.0
+max_single_order_usdt = 80.0
 # 日亏损上限 (USDT)
-max_daily_loss_usdt = 30.0
+max_daily_loss_usdt = 50.0
 # 最小下单间隔 (秒)
 min_order_interval_secs = 10
 
