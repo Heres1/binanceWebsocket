@@ -73,6 +73,12 @@ pub struct StrategyConfig {
     pub strategy_type: String,         // 策略类型
     #[serde(default)]
     pub short: Option<ShortConfig>,    // 做空配置
+    #[serde(default = "default_stale_exit_seconds")]
+    pub stale_exit_seconds: u64,       // 僵尸仓位早退时间(秒) - 浮盈不足时提前退出
+    #[serde(default = "default_stale_pnl_threshold")]
+    pub stale_pnl_threshold_pct: f64,  // 僵尸判定门槛% - 浮盈低于此值视为僵尸
+    #[serde(default = "default_min_trend_strength")]
+    pub min_trend_strength_pct: f64,   // EMA趋势强度最低门槛%
 }
 
 fn default_strategy_type() -> String {
@@ -93,6 +99,18 @@ fn default_trailing_distance() -> f64 {
 
 fn default_round_trip_fee() -> f64 {
     0.1
+}
+
+fn default_stale_exit_seconds() -> u64 {
+    14400  // 4小时
+}
+
+fn default_stale_pnl_threshold() -> f64 {
+    0.3  // 浮盈不足0.3%视为僵尸
+}
+
+fn default_min_trend_strength() -> f64 {
+    0.0  // 默认0不过滤，向后兼容
 }
 
 /// 做空配置

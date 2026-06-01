@@ -169,46 +169,78 @@ impl OrderExecutionService {
         
         let order_amount = quantity * signal.suggested_price;
 
-        // 2. 获取真实账户余额
-        let bal = self.balance.lock().await;
-        let available_balance = bal.available_usdt;
-        let current_position = bal.position_value(signal.suggested_price);
-        drop(bal);
+        // 2. 判断是否为平仓操作（SELL/COVER不需要USDT，只需持有资产）
+        let is_exit = signal.signal_type == "SELL" || signal.signal_type == "COVER";
 
-        // 3. 风控检查
-        log::debug!("风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
-            available_balance, current_position, order_amount);
-        if let Err(alert) = self.risk_service.pre_trade_check(
-            order_amount,
-            available_balance,
-            current_position,
-        ).await {
-            log::warn!("风控拦截 | {} | {} | 金额: {:.2} | 原因: {}",
-                signal.symbol, signal.signal_type, order_amount, alert.message);
-            
-            let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
-                order_id: Some(signal.signal_id.clone()),
-                symbol: signal.symbol.clone(),
-                reason: format!("风控拦截: {}", alert.message),
-                error_code: None,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
-            });
-            
-            self.event_bus.publish(reject_event).await
-                .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
-            
-            return Err(ServiceError::Order(format!("风控拦截: {}", alert.message)).into());
+        // 3. 仅对开仓操作做风控检查（平仓操作跳过，确保能及时止损/止盈）
+        if !is_exit {
+            let bal = self.balance.lock().await;
+            let available_balance = bal.available_usdt;
+            let current_position = bal.position_value(signal.suggested_price);
+            drop(bal);
+
+            log::debug!("风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
+                available_balance, current_position, order_amount);
+            if let Err(alert) = self.risk_service.pre_trade_check(
+                order_amount,
+                available_balance,
+                current_position,
+            ).await {
+                log::warn!("风控拦截 | {} | {} | 金额: {:.2} | 原因: {}",
+                    signal.symbol, signal.signal_type, order_amount, alert.message);
+                
+                let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
+                    order_id: Some(signal.signal_id.clone()),
+                    symbol: signal.symbol.clone(),
+                    reason: format!("风控拦截: {}", alert.message),
+                    error_code: None,
+                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                });
+                
+                self.event_bus.publish(reject_event).await
+                    .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
+                
+                return Err(ServiceError::Order(format!("风控拦截: {}", alert.message)).into());
+            }
         }
+
+        // 4. 对平仓操作，使用实际持有量（扣除手续费后的真实余额）
+        let actual_quantity = if is_exit {
+            let bal = self.balance.lock().await;
+            let asset_free = match signal.symbol.as_str() {
+                "BTCUSDT" => bal.btc_free,
+                "ETHUSDT" => bal.eth_free,
+                "SOLUSDT" => bal.sol_free,
+                _ => quantity,
+            };
+            drop(bal);
+            // 使用 min(信号数量, 实际持有量)，避免超出余额
+            let q = quantity.min(asset_free);
+            if q < quantity * 0.5 {
+                // 如果实际持有量不到信号数量的一半，说明余额异常
+                log::error!("平仓异常 | {} | 信号量: {:.6} | 实际持有: {:.6}，跳过",
+                    signal.symbol, quantity, asset_free);
+                return Err(ServiceError::Order(format!(
+                    "持有量不足: 需要 {:.6}，实际 {:.6}", quantity, asset_free
+                )).into());
+            }
+            if q < quantity {
+                log::info!("平仓量调整 | {} | {:.6} -> {:.6} (扣除手续费)",
+                    signal.symbol, quantity, q);
+            }
+            q
+        } else {
+            quantity
+        };
         
-        
-        // 4. 调用 API 下单 - 使用市价单快速成交
+        // 5. 调用 API 下单 - 使用市价单快速成交
         let side = if signal.signal_type == "BUY" { "BUY" } else { "SELL" };
         
         let order_result = self.client.place_order(
             &signal.symbol,
             side,
             "MARKET",  // 市价单快速成交
-            quantity,
+            actual_quantity,
             None,       // 市价单不需要价格
             None,       // 市价单不需要TIF
         ).await?;
@@ -308,8 +340,18 @@ impl EventHandler for OrderExecutionService {
             if let Err(e) = self.execute_signal(signal).await {
                 log::error!("订单执行失败: {}", e);
                 
-                // 发布失败事件（可选）
-                // ...
+                // 对平仓失败发布OrderRejected事件，通知策略回滚状态
+                let is_exit = signal.signal_type == "SELL" || signal.signal_type == "COVER";
+                if is_exit {
+                    let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
+                        order_id: Some(signal.signal_id.clone()),
+                        symbol: signal.symbol.clone(),
+                        reason: format!("平仓失败: {}", e),
+                        error_code: None,
+                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                    });
+                    let _ = self.event_bus.publish(reject_event).await;
+                }
             }
         }
         

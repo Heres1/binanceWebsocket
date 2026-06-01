@@ -8,6 +8,7 @@ use crate::error::EventBusError;
 use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
 use crate::events::{
     AggTradeEvent, BookTickerEvent, DomainEvent, KlineCompletedEvent, TradingSignalEvent,
+    OrderRejectedEvent,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -426,7 +427,10 @@ impl MomentumStrategy {
             let should_exit = current_price <= dynamic_sl
                 || pnl_pct >= self.config.take_profit_pct
                 || hold_secs >= self.config.max_hold_seconds
-                || rsi > self.config.rsi_overbought;
+                || rsi > self.config.rsi_overbought
+                || (hold_secs >= self.config.stale_exit_seconds
+                    && pnl_pct < self.config.stale_pnl_threshold_pct
+                    && !state.trailing_active);
 
             if should_exit {
                 let reason = if pnl_pct >= self.config.take_profit_pct {
@@ -437,6 +441,10 @@ impl MomentumStrategy {
                     "保本止损"
                 } else if current_price <= dynamic_sl {
                     "止损"
+                } else if hold_secs >= self.config.stale_exit_seconds
+                    && pnl_pct < self.config.stale_pnl_threshold_pct
+                    && !state.trailing_active {
+                    "僵尸早退"
                 } else if hold_secs >= self.config.max_hold_seconds {
                     "时间止损"
                 } else {
@@ -494,7 +502,10 @@ impl MomentumStrategy {
 
             let should_exit = current_price >= dynamic_sl
                 || pnl_pct >= self.config.take_profit_pct
-                || hold_secs >= self.config.max_hold_seconds;
+                || hold_secs >= self.config.max_hold_seconds
+                || (hold_secs >= self.config.stale_exit_seconds
+                    && pnl_pct < self.config.stale_pnl_threshold_pct
+                    && !state.trailing_active);
 
             if should_exit {
                 let reason = if pnl_pct >= self.config.take_profit_pct {
@@ -505,6 +516,10 @@ impl MomentumStrategy {
                     "空保本止损"
                 } else if current_price >= dynamic_sl {
                     "空止损"
+                } else if hold_secs >= self.config.stale_exit_seconds
+                    && pnl_pct < self.config.stale_pnl_threshold_pct
+                    && !state.trailing_active {
+                    "空僵尸早退"
                 } else {
                     "空超时"
                 };
@@ -549,8 +564,12 @@ impl MomentumStrategy {
             let rsi = state.rsi_1m.value().unwrap_or(50.0);
             let vol_ratio = state.volume_ratio.ratio();
 
-            // 条件1: 5分钟趋势向上
+            // 条件1: 5分钟趋势向上 + 趋势强度过滤
             let trend_up = ema_fast_5m > ema_slow_5m;
+            let trend_strength = if ema_slow_5m > 0.0 {
+                (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
+            } else { 0.0 };
+            let trend_strong_enough = trend_strength >= self.config.min_trend_strength_pct;
 
             // 条件2: RSI从超卖回升（加天花板：RSI超过overbought时不入场）
             let rsi_recovering = state.rsi_was_oversold
@@ -575,8 +594,8 @@ impl MomentumStrategy {
             };
 
             // RSI反弹入场 或 突破入场
-            let entry_signal = (trend_up && rsi_recovering && buy_dominant && bid_support)
-                || (breakout_signal && trend_up);
+            let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
+                || (breakout_signal && trend_up && trend_strong_enough);
 
             if entry_signal {
                 let entry_price = state.best_ask;
@@ -607,6 +626,10 @@ impl MomentumStrategy {
             } else if self.config.allow_short {
                 // === 做空入场条件 ===
                 let trend_down = ema_fast_5m < ema_slow_5m;
+                let short_trend_strength = if ema_slow_5m > 0.0 {
+                    (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
+                } else { 0.0 };
+                let short_trend_strong = short_trend_strength >= self.config.min_trend_strength_pct;
                 let breakdown_signal = if state.recent_lows.len() >= 10 {
                     let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                         .iter().copied().fold(f64::INFINITY, f64::min);
@@ -620,8 +643,8 @@ impl MomentumStrategy {
                 let rsi_overbought_short = rsi > 70.0;
                 let sell_pressure = vol_ratio < (1.0 / self.config.volume_ratio_threshold);
 
-                let short_signal = (breakdown_signal && trend_down)
-                    || (trend_down && rsi_overbought_short && sell_pressure);
+                let short_signal = (breakdown_signal && trend_down && short_trend_strong)
+                    || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
 
                 if short_signal {
                     let entry_price = state.best_bid; // 做空用bid
@@ -680,6 +703,41 @@ impl MomentumStrategy {
             log::error!("发布交易信号失败: {}", e);
         }
     }
+
+    /// 处理订单拒绝事件（平仓失败时回滚策略状态）
+    async fn on_order_rejected(&self, event: &OrderRejectedEvent) {
+        // 只处理本品种的拒绝事件
+        if event.symbol != self.config.symbol {
+            return;
+        }
+
+        // 检查是否是平仓失败（order_id含“sell”或“cover”）
+        let order_id = event.order_id.as_deref().unwrap_or("");
+        let is_exit_failure = order_id.contains("_sell_") || order_id.contains("_cover_");
+        
+        if !is_exit_failure {
+            return;
+        }
+
+        // 回滚策略状态：重新设置为持仓中
+        let mut state = self.state.lock().await;
+        if state.position == Position::None && state.entry_price > 0.0 {
+            // 根据order_id推断原始持仓方向
+            let original_position = if order_id.contains("_sell_") {
+                Position::Long
+            } else {
+                Position::Short
+            };
+            log::warn!("⚠️ 平仓失败回滚 | {} | 恢复{:?}持仓 | 入场价: {:.2} | 原因: {}",
+                self.config.symbol, original_position, state.entry_price, event.reason);
+            state.position = original_position;
+            // 保存回滚后的状态
+            let snap = state.snapshot();
+            let path = self.state_file.clone();
+            drop(state);
+            tokio::task::spawn_blocking(move || snap.save(&path));
+        }
+    }
 }
 
 #[async_trait]
@@ -689,6 +747,7 @@ impl EventHandler for MomentumStrategy {
             DomainEvent::KlineCompleted(e) => self.on_kline(e).await,
             DomainEvent::AggTrade(e) => self.on_agg_trade(e).await,
             DomainEvent::BookTicker(e) => self.on_book_ticker(e).await,
+            DomainEvent::OrderRejected(e) => self.on_order_rejected(e).await,
             _ => {}
         }
         Ok(())
@@ -699,6 +758,7 @@ impl EventHandler for MomentumStrategy {
             EventType::KlineCompleted,
             EventType::AggTrade,
             EventType::BookTicker,
+            EventType::OrderRejected,
         ]
     }
 }

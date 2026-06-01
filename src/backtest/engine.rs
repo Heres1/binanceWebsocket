@@ -249,8 +249,12 @@ impl BacktestEngine {
                 let tp_hit = kline.high >= tp_price;
                 let timeout = hold_secs >= self.config.strategy.max_hold_seconds;
                 let rsi_exit = rsi > self.config.strategy.rsi_overbought;
+                let current_pnl = (kline.close - state.entry_price) / state.entry_price * 100.0;
+                let stale_exit = hold_secs >= self.config.strategy.stale_exit_seconds
+                    && current_pnl < self.config.strategy.stale_pnl_threshold_pct
+                    && !state.trailing_active;
 
-                let should_exit = sl_hit || tp_hit || timeout || rsi_exit;
+                let should_exit = sl_hit || tp_hit || timeout || rsi_exit || stale_exit;
 
                 if should_exit {
                     // 确定出场价和原因（SL优先于TP，保守估计）
@@ -267,6 +271,8 @@ impl BacktestEngine {
                             else if state.breakeven_active { "保本止损" }
                             else { "止损" };
                         (dynamic_sl, r)
+                    } else if stale_exit {
+                        (kline.close, "僵尸早退")
                     } else if timeout {
                         (kline.close, "超时")
                     } else {
@@ -321,8 +327,12 @@ impl BacktestEngine {
                 let sl_hit = kline.high >= dynamic_sl;
                 let tp_hit = kline.low <= tp_price;
                 let timeout = hold_secs >= self.config.strategy.max_hold_seconds;
+                let current_pnl = (state.entry_price - kline.close) / state.entry_price * 100.0;
+                let stale_exit = hold_secs >= self.config.strategy.stale_exit_seconds
+                    && current_pnl < self.config.strategy.stale_pnl_threshold_pct
+                    && !state.trailing_active;
 
-                let should_exit = sl_hit || tp_hit || timeout;
+                let should_exit = sl_hit || tp_hit || timeout || stale_exit;
 
                 if should_exit {
                     let (exit_price, reason) = if sl_hit && !tp_hit {
@@ -334,6 +344,8 @@ impl BacktestEngine {
                         (tp_price, "空止盈")
                     } else if sl_hit && tp_hit {
                         (dynamic_sl, "空止损")
+                    } else if stale_exit {
+                        (kline.close, "空僵尸早退")
                     } else {
                         (kline.close, "空超时")
                     };
@@ -374,6 +386,10 @@ impl BacktestEngine {
                 let vol_ratio = state.volume_ratio.ratio();
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
+                let trend_strength = if ema_slow_5m > 0.0 {
+                    (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
+                } else { 0.0 };
+                let trend_strong_enough = trend_strength >= self.config.strategy.min_trend_strength_pct;
                 // RSI天花板：RSI超过overbought时不入场（反弹已走完）
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (self.config.strategy.rsi_oversold + 5.0)
@@ -393,8 +409,8 @@ impl BacktestEngine {
                 };
 
                 // RSI反弹入场 或 突破入场
-                let entry_signal = (trend_up && rsi_recovering && buy_dominant && bid_support)
-                    || (breakout_signal && trend_up);
+                let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
+                    || (breakout_signal && trend_up && trend_strong_enough);
 
                 if entry_signal {
                     state.position = Position::Long;
@@ -410,6 +426,10 @@ impl BacktestEngine {
                 } else if self.config.strategy.allow_short {
                     // 做空入场
                     let trend_down = ema_fast_5m < ema_slow_5m;
+                    let short_trend_strength = if ema_slow_5m > 0.0 {
+                        (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
+                    } else { 0.0 };
+                    let short_trend_strong = short_trend_strength >= self.config.strategy.min_trend_strength_pct;
                     let breakdown_signal = if state.recent_lows.len() >= 10 {
                         let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                             .iter().copied().fold(f64::INFINITY, f64::min);
@@ -423,8 +443,8 @@ impl BacktestEngine {
                     let rsi_overbought_short = rsi > 70.0;
                     let sell_pressure = vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
 
-                    let short_signal = (breakdown_signal && trend_down)
-                        || (trend_down && rsi_overbought_short && sell_pressure);
+                    let short_signal = (breakdown_signal && trend_down && short_trend_strong)
+                        || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
 
                     if short_signal {
                         state.position = Position::Short;
@@ -707,6 +727,10 @@ impl BacktestEngine {
                         let vol_ratio = state.volume_ratio.ratio();
 
                         let trend_up = ema_fast_5m > ema_slow_5m;
+                        let trend_strength = if ema_slow_5m > 0.0 {
+                            (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
+                        } else { 0.0 };
+                        let trend_strong_enough = trend_strength >= self.config.strategy.min_trend_strength_pct;
                         let rsi_recovering = state.rsi_was_oversold
                             && rsi > (self.config.strategy.rsi_oversold + 5.0)
                             && rsi < self.config.strategy.rsi_overbought;
@@ -724,8 +748,8 @@ impl BacktestEngine {
                             false
                         };
 
-                        let entry_signal = (trend_up && rsi_recovering && buy_dominant && bid_support)
-                            || (breakout_signal && trend_up);
+                        let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
+                            || (breakout_signal && trend_up && trend_strong_enough);
 
                         if entry_signal {
                             state.position = Position::Long;
@@ -741,6 +765,10 @@ impl BacktestEngine {
                         } else if self.config.strategy.allow_short {
                             // 做空入场
                             let trend_down = ema_fast_5m < ema_slow_5m;
+                            let short_trend_strength = if ema_slow_5m > 0.0 {
+                                (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
+                            } else { 0.0 };
+                            let short_trend_strong = short_trend_strength >= self.config.strategy.min_trend_strength_pct;
                             let breakdown_signal = if state.recent_lows.len() >= 10 {
                                 let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                                     .iter().copied().fold(f64::INFINITY, f64::min);
@@ -754,8 +782,8 @@ impl BacktestEngine {
                             let rsi_overbought_short = rsi > 70.0;
                             let sell_pressure = vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
 
-                            let short_signal = (breakdown_signal && trend_down)
-                                || (trend_down && rsi_overbought_short && sell_pressure);
+                            let short_signal = (breakdown_signal && trend_down && short_trend_strong)
+                                || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
 
                             if short_signal {
                                 state.position = Position::Short;
@@ -1036,6 +1064,10 @@ impl BacktestEngine {
                 let vol_ratio = state.volume_ratio.ratio();
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
+                let trend_strength = if ema_slow_5m > 0.0 {
+                    (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
+                } else { 0.0 };
+                let trend_strong_enough = trend_strength >= strategy.min_trend_strength_pct;
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (strategy.rsi_oversold + 5.0)
                     && rsi < strategy.rsi_overbought;
@@ -1054,8 +1086,8 @@ impl BacktestEngine {
                 };
 
                 // RSI反弹入场 或 突破入场
-                let entry_signal = (trend_up && rsi_recovering && buy_dominant && bid_support)
-                    || (breakout_signal && trend_up);
+                let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
+                    || (breakout_signal && trend_up && trend_strong_enough);
 
                 if entry_signal {
                     state.position = Position::Long;
@@ -1071,6 +1103,10 @@ impl BacktestEngine {
                 } else if strategy.allow_short {
                     // 做空入场: 价格突破最近N根K线最低价 + 下跌趋势
                     let trend_down = ema_fast_5m < ema_slow_5m;
+                    let short_trend_strength = if ema_slow_5m > 0.0 {
+                        (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
+                    } else { 0.0 };
+                    let short_trend_strong = short_trend_strength >= strategy.min_trend_strength_pct;
                     let breakdown_signal = if state.recent_lows.len() >= 10 {
                         let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                             .iter().copied().fold(f64::INFINITY, f64::min);
@@ -1086,8 +1122,8 @@ impl BacktestEngine {
                     let rsi_overbought_short = rsi > 70.0;
                     let sell_pressure = vol_ratio < (1.0 / strategy.volume_ratio_threshold);
 
-                    let short_signal = (breakdown_signal && trend_down)
-                        || (trend_down && rsi_overbought_short && sell_pressure);
+                    let short_signal = (breakdown_signal && trend_down && short_trend_strong)
+                        || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
 
                     if short_signal {
                         state.position = Position::Short;

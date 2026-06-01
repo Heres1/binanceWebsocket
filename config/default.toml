@@ -33,7 +33,7 @@ take_profit_pct = 2.0
 stop_loss_pct = 1.5
 # 最大持仓时间(秒) - 8小时（缩短持仓减少超时亏损）
 max_hold_seconds = 28800
-# 交易冷却时间(秒) - 10分钟（加长冷却减少连续错误）
+# 交易冷却时间(秒) - 10分钟
 cooldown_seconds = 600
 # 日最大交易次数
 max_daily_trades = 50
@@ -49,7 +49,7 @@ volume_ratio_threshold = 0.6
 breakeven_trigger_pct = 0.8
 # 追踪止损触发 (浮盈达此值后启用追踪，必须 < take_profit)
 trailing_trigger_pct = 1.0
-# 追踪止损回撤距离 (从最高/最低点回撤此百分比平仓，收紧以0.5%锁住更多利润)
+# 追踪止损回撤距离 (从最高/最低点回撤此百分比平仓)
 trailing_distance_pct = 0.5
 # 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
 round_trip_fee_pct = 0.1
@@ -57,6 +57,12 @@ round_trip_fee_pct = 0.1
 allow_short = true
 # 策略类型
 strategy_type = "Breakout"
+# 僵尸仓位早退(秒)：设置超过max_hold=禁用
+stale_exit_seconds = 86400
+# 僵尸判定门槛(%)
+stale_pnl_threshold_pct = 0.05
+# EMA趋势强度最低门槛(%)：0=不过滤
+min_trend_strength_pct = 0.0
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 
