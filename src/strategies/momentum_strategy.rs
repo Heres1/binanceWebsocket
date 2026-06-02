@@ -125,6 +125,11 @@ struct StrategyState {
     daily_pnl: f64,
     last_day: u32, // 用于日重置
 
+    // 出场失败熔断保护
+    exit_blocked_until: u64,    // 出场失败后的屏蔽截止时间(ms)
+    last_exit_pnl: f64,         // 最后一次出场累加的pnl(用于回滚)
+    consecutive_exit_failures: u32, // 连续出场失败次数
+
     // RSI状态追踪（检测回升）
     rsi_was_oversold: bool, // RSI曾经低于超卖线
     rsi_oversold_bars: usize, // 超卖标志已持续的K线数（过期机制）
@@ -164,6 +169,9 @@ impl StrategyState {
             daily_trades: 0,
             daily_pnl: 0.0,
             last_day: 0,
+            exit_blocked_until: 0,
+            last_exit_pnl: 0.0,
+            consecutive_exit_failures: 0,
             rsi_was_oversold: false,
             rsi_oversold_bars: 0,
             kline_1m_count: 0,
@@ -286,6 +294,7 @@ impl MomentumStrategy {
                 
                 state.position = Position::None;
                 state.daily_pnl += net_pnl_pct;
+                state.last_exit_pnl = net_pnl_pct;
                 state.rsi_was_oversold = false;
                 let snap = state.snapshot();
                 let path = self.state_file.clone();
@@ -394,6 +403,11 @@ impl MomentumStrategy {
 
         // 检查出场条件（阶梯式保护机制）
         if state.position == Position::Long && state.entry_price > 0.0 {
+            // 熔断保护：出场失败后60秒内不重试
+            if now_ms < state.exit_blocked_until {
+                drop(state);
+                return;
+            }
             let current_price = state.best_bid;
             let hold_secs = (now_ms - state.entry_time) / 1000;
             let rsi = state.rsi_1m.value().unwrap_or(50.0);
@@ -458,6 +472,7 @@ impl MomentumStrategy {
 
                 state.position = Position::None;
                 state.daily_pnl += net_pnl_pct;
+                state.last_exit_pnl = net_pnl_pct; // 记录本次出场累加的pnl，用于失败回滚
                 state.last_trade_time = now_ms;
                 state.rsi_was_oversold = false;
                 let snap = state.snapshot();
@@ -471,6 +486,11 @@ impl MomentumStrategy {
 
         // 做空出场检查
         if state.position == Position::Short && state.entry_price > 0.0 {
+            // 熔断保护：出场失败后60秒内不重试
+            if now_ms < state.exit_blocked_until {
+                drop(state);
+                return;
+            }
             let current_price = state.best_ask; // 平空用ask
             let hold_secs = (now_ms - state.entry_time) / 1000;
 
@@ -531,6 +551,7 @@ impl MomentumStrategy {
 
                 state.position = Position::None;
                 state.daily_pnl += net_pnl_pct;
+                state.last_exit_pnl = net_pnl_pct; // 记录本次出场累加的pnl，用于失败回滚
                 state.last_trade_time = now_ms;
                 let snap = state.snapshot();
                 let path = self.state_file.clone();
@@ -618,6 +639,7 @@ impl MomentumStrategy {
                 state.rsi_oversold_bars = 0;
                 state.last_trade_time = now_ms;
                 state.daily_trades += 1;
+                state.consecutive_exit_failures = 0; // 新仓位清零失败计数
                 let snap = state.snapshot();
                 let path = self.state_file.clone();
                 drop(state);
@@ -666,6 +688,7 @@ impl MomentumStrategy {
                     state.rsi_oversold_bars = 0;
                     state.last_trade_time = now_ms;
                     state.daily_trades += 1;
+                    state.consecutive_exit_failures = 0; // 新仓位清零失败计数
                     let snap = state.snapshot();
                     let path = self.state_file.clone();
                     drop(state);
@@ -728,8 +751,39 @@ impl MomentumStrategy {
             } else {
                 Position::Short
             };
-            log::warn!("⚠️ 平仓失败回滚 | {} | 恢复{:?}持仓 | 入场价: {:.2} | 原因: {}",
-                self.config.symbol, original_position, state.entry_price, event.reason);
+            
+            // 回滚 daily_pnl（之前在出场时已累加，现在要减回去）
+            if state.last_exit_pnl != 0.0 {
+                state.daily_pnl -= state.last_exit_pnl;
+                log::info!("  └─ 回滚 daily_pnl: 减去 {:+.3}% | 修正后: {:+.3}%",
+                    state.last_exit_pnl, state.daily_pnl);
+                state.last_exit_pnl = 0.0;
+            }
+            
+            // 累加连续失败计数
+            state.consecutive_exit_failures += 1;
+            
+            // 超过3次连续失败：强制放弃持仓，避免死循环
+            if state.consecutive_exit_failures >= 3 {
+                log::error!("❗ 连续{}次平仓失败 | {} | 强制清除持仓状态 | 入场价: {:.2} | 原因: {}",
+                    state.consecutive_exit_failures, self.config.symbol, state.entry_price, event.reason);
+                state.position = Position::None;
+                state.entry_price = 0.0;
+                state.consecutive_exit_failures = 0;
+                state.exit_blocked_until = 0;
+                let snap = state.snapshot();
+                let path = self.state_file.clone();
+                drop(state);
+                tokio::task::spawn_blocking(move || snap.save(&path));
+                return;
+            }
+            
+            // 设置熔断保护：60秒内不再尝试出场
+            state.exit_blocked_until = event.timestamp + 60_000;
+            
+            log::warn!("⚠️ 平仓失败回滚 | {} | 恢复{:?}持仓 | 入场价: {:.2} | 60s熔断({}/3) | 原因: {}",
+                self.config.symbol, original_position, state.entry_price,
+                state.consecutive_exit_failures, event.reason);
             state.position = original_position;
             // 保存回滚后的状态
             let snap = state.snapshot();

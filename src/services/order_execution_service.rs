@@ -57,6 +57,19 @@ pub struct OrderExecutionService {
     balance: Arc<Mutex<AccountBalance>>,
 }
 
+/// 按交易对的 LOT_SIZE stepSize 向下取整
+fn round_step_size(quantity: f64, symbol: &str) -> f64 {
+    let decimals: u32 = match symbol {
+        "BTCUSDT" => 5,  // step = 0.00001
+        "ETHUSDT" => 4,  // step = 0.0001
+        "SOLUSDT" => 2,  // step = 0.01
+        _ => 5,
+    };
+    let factor = 10_f64.powi(decimals as i32);
+    // 加极小值避免浮点截断误差（如 0.3*100=29.999... 的情况）
+    ((quantity * factor) + 1e-9).floor() / factor
+}
+
 impl OrderExecutionService {
     /// 创建新的订单执行服务
     pub fn new(
@@ -224,13 +237,22 @@ impl OrderExecutionService {
                     "持有量不足: 需要 {:.6}，实际 {:.6}", quantity, asset_free
                 )).into());
             }
-            if q < quantity {
-                log::info!("平仓量调整 | {} | {:.6} -> {:.6} (扣除手续费)",
-                    signal.symbol, quantity, q);
+            // 按交易对 LOT_SIZE stepSize 向下取整，确保符合交易所精度要求
+            let rounded = round_step_size(q, &signal.symbol);
+            if rounded <= 0.0 {
+                log::error!("平仓异常 | {} | 取整后数量为0 | 原始: {:.6}", signal.symbol, q);
+                return Err(ServiceError::Order(format!(
+                    "取整后数量为0: 原始 {:.6}", q
+                )).into());
             }
-            q
+            if rounded < q {
+                log::info!("平仓量调整 | {} | {:.6} -> {:.6} (LOT_SIZE取整)",
+                    signal.symbol, q, rounded);
+            }
+            rounded
         } else {
-            quantity
+            // 开仓也需要取整
+            round_step_size(quantity, &signal.symbol)
         };
         
         // 5. 调用 API 下单 - 使用市价单快速成交
