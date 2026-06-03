@@ -39,18 +39,18 @@ cooldown_seconds = 600
 max_daily_trades = 50
 # 日最大亏损百分比
 max_daily_loss_pct = 3.0
-# RSI超卖线 (50=更宽松，配合VR=1.0过滤)
-rsi_oversold = 50.0
+# RSI超卖线 (42=要求真正超卖才触发反弹信号，避免下跌中的小回调误触发)
+rsi_oversold = 42.0
 # RSI超买线 (禁用RSI退出)
 rsi_overbought = 100.0
-# 买卖量比阈值 (0.6=降低门槛捕获更多机会)
-volume_ratio_threshold = 0.6
+# 买卖量比阈值 (1.0=要求买方成交量真正主导，过滤弱反弹)
+volume_ratio_threshold = 1.0
 # 保本止损触发 (浮盈达此值后SL上移到入场价，必须 < trailing_trigger)
 breakeven_trigger_pct = 0.8
 # 追踪止损触发 (浮盈达此值后启用追踪，必须 < take_profit)
 trailing_trigger_pct = 1.0
-# 追踪止损回撤距离 (从最高/最低点回撤此百分比平仓)
-trailing_distance_pct = 0.5
+# 追踪止损回撒距离 (从最高/最低点回撒此百分比平仓，0.35%保留更多浮盈)
+trailing_distance_pct = 0.35
 # 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
 round_trip_fee_pct = 0.1
 # 是否允许做空
@@ -61,8 +61,8 @@ strategy_type = "Breakout"
 stale_exit_seconds = 86400
 # 僵尸判定门槛(%)
 stale_pnl_threshold_pct = 0.05
-# EMA趋势强度最低门槛(%)：0=不过滤
-min_trend_strength_pct = 0.0
+# EMA趋势强度最低门槛(%)：要求EMA7/EMA21有有意义的分离，避免震荡市假信号
+min_trend_strength_pct = 0.03
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 
@@ -70,7 +70,7 @@ min_trend_strength_pct = 0.0
 [[trading_pairs]]
 symbol = "BTCUSDT"
 quantity_per_trade = 0.0007   # ~$50 @ $73000
-allow_short = true
+allow_short = false            # 账户无足够BTC，禁用做空
 
 [[trading_pairs]]
 symbol = "ETHUSDT"

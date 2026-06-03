@@ -184,6 +184,9 @@ impl OrderExecutionService {
 
         // 2. 判断是否为平仓操作（SELL/COVER不需要USDT，只需持有资产）
         let is_exit = signal.signal_type == "SELL" || signal.signal_type == "COVER";
+        // SELL=卖出资产(平多), COVER=买回资产(平空)
+        // 只有SELL需要检查资产余额，COVER需要的是USDT
+        let needs_asset_check = signal.signal_type == "SELL";
 
         // 3. 仅对开仓操作做风控检查（平仓操作跳过，确保能及时止损/止盈）
         if !is_exit {
@@ -217,8 +220,9 @@ impl OrderExecutionService {
             }
         }
 
-        // 4. 对平仓操作，使用实际持有量（扣除手续费后的真实余额）
-        let actual_quantity = if is_exit {
+        // 4. 对卖出平仓(SELL)，使用实际持有量（扣除手续费后的真实余额）
+        // 注意：COVER(平空=买回)不需要资产余额检查，它需要的是USDT
+        let actual_quantity = if needs_asset_check {
             let bal = self.balance.lock().await;
             let asset_free = match signal.symbol.as_str() {
                 "BTCUSDT" => bal.btc_free,
@@ -256,7 +260,12 @@ impl OrderExecutionService {
         };
         
         // 5. 调用 API 下单 - 使用市价单快速成交
-        let side = if signal.signal_type == "BUY" { "BUY" } else { "SELL" };
+        // BUY/COVER(买入) vs SELL/SHORT(卖出)
+        let side = if signal.signal_type == "BUY" || signal.signal_type == "COVER" {
+            "BUY"
+        } else {
+            "SELL"
+        };
         
         let order_result = self.client.place_order(
             &signal.symbol,
@@ -362,18 +371,15 @@ impl EventHandler for OrderExecutionService {
             if let Err(e) = self.execute_signal(signal).await {
                 log::error!("订单执行失败: {}", e);
                 
-                // 对平仓失败发布OrderRejected事件，通知策略回滚状态
-                let is_exit = signal.signal_type == "SELL" || signal.signal_type == "COVER";
-                if is_exit {
-                    let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
-                        order_id: Some(signal.signal_id.clone()),
-                        symbol: signal.symbol.clone(),
-                        reason: format!("平仓失败: {}", e),
-                        error_code: None,
-                        timestamp: chrono::Utc::now().timestamp_millis() as u64,
-                    });
-                    let _ = self.event_bus.publish(reject_event).await;
-                }
+                // 所有失败都发布OrderRejected事件，通知策略回滚状态
+                let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
+                    order_id: Some(signal.signal_id.clone()),
+                    symbol: signal.symbol.clone(),
+                    reason: format!("订单失败: {}", e),
+                    error_code: None,
+                    timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                });
+                let _ = self.event_bus.publish(reject_event).await;
             }
         }
         

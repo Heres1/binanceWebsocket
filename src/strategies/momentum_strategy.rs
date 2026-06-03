@@ -93,6 +93,8 @@ struct StrategyState {
     // 5分钟K线指标
     ema_fast_5m: EMA,   // EMA(7)
     ema_slow_5m: EMA,   // EMA(21)
+    ema_trend_5m: EMA,  // EMA(50) - 趋势环境过滤
+    prev_ema_slow_5m: f64, // 上一根5mK线的EMA21值（用于计算斜率）
 
     // 成交量比率（60秒滑动窗口）
     volume_ratio: VolumeRatio,
@@ -134,6 +136,10 @@ struct StrategyState {
     rsi_was_oversold: bool, // RSI曾经低于超卖线
     rsi_oversold_bars: usize, // 超卖标志已持续的K线数（过期机制）
 
+    // 连续止损熔断
+    consecutive_stop_losses: u32,  // 连续止损次数
+    loss_cooldown_until: u64,      // 连续止损后的暂停截止时间(ms)
+
     // 预热计数
     kline_1m_count: usize,
     kline_5m_count: usize,
@@ -150,6 +156,8 @@ impl StrategyState {
             rsi_1m: RSI::new(14),
             ema_fast_5m: EMA::new(7),
             ema_slow_5m: EMA::new(21),
+            ema_trend_5m: EMA::new(50),
+            prev_ema_slow_5m: 0.0,
             volume_ratio: VolumeRatio::new(60),
             best_bid: 0.0,
             best_bid_qty: 0.0,
@@ -174,6 +182,8 @@ impl StrategyState {
             consecutive_exit_failures: 0,
             rsi_was_oversold: false,
             rsi_oversold_bars: 0,
+            consecutive_stop_losses: 0,
+            loss_cooldown_until: 0,
             kline_1m_count: 0,
             kline_5m_count: 0,
         };
@@ -213,9 +223,9 @@ impl StrategyState {
         }
     }
 
-    /// 是否完成预热（需要足够的K线数据）
+    /// 是否完成预热（需要足够的K线数据，EMA50需要50根5mK线）
     fn is_warmed_up(&self) -> bool {
-        self.kline_1m_count >= 21 && self.kline_5m_count >= 21
+        self.kline_1m_count >= 21 && self.kline_5m_count >= 50
     }
 
     /// 重置每日统计
@@ -230,6 +240,8 @@ impl StrategyState {
             self.last_day = day;
             self.daily_trades = 0;
             self.daily_pnl = 0.0;
+            self.consecutive_stop_losses = 0;
+            self.loss_cooldown_until = 0;
         }
     }
 }
@@ -341,8 +353,11 @@ impl MomentumStrategy {
             "5m" => {
                 if event.is_closed {
                     state.kline_5m_count += 1;
+                    // 记录上一根K线的EMA21值（用于斜率计算）
+                    state.prev_ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
                     state.ema_fast_5m.update(event.close);
                     state.ema_slow_5m.update(event.close);
+                    state.ema_trend_5m.update(event.close);
                 }
             }
             _ => {}
@@ -475,6 +490,27 @@ impl MomentumStrategy {
                 state.last_exit_pnl = net_pnl_pct; // 记录本次出场累加的pnl，用于失败回滚
                 state.last_trade_time = now_ms;
                 state.rsi_was_oversold = false;
+
+                // 连续止损熔断计数
+                if reason == "止损" || reason == "时间止损" {
+                    state.consecutive_stop_losses += 1;
+                    let cooldown_ms = match state.consecutive_stop_losses {
+                        2 => 1_200_000,     // 2连亏: 冷協20分钟
+                        3 => 7_200_000,     // 3连亏: 暂停2小时
+                        n if n >= 4 => 14_400_000, // 4+连亏: 暂停4小时
+                        _ => 0,             // 第1次止损不额外冷却
+                    };
+                    if cooldown_ms > 0 {
+                        state.loss_cooldown_until = now_ms + cooldown_ms;
+                        log::warn!("⚠️ 连续{}次止损 | {} | 暂停交易{}min",
+                            state.consecutive_stop_losses, self.config.symbol, cooldown_ms / 60_000);
+                    }
+                } else {
+                    // 盈利出场（追踪/硬止盈/保本）重置计数
+                    state.consecutive_stop_losses = 0;
+                    state.loss_cooldown_until = 0;
+                }
+
                 let snap = state.snapshot();
                 let path = self.state_file.clone();
                 drop(state);
@@ -553,6 +589,27 @@ impl MomentumStrategy {
                 state.daily_pnl += net_pnl_pct;
                 state.last_exit_pnl = net_pnl_pct; // 记录本次出场累加的pnl，用于失败回滚
                 state.last_trade_time = now_ms;
+
+                // 连续止损熔断计数
+                if reason == "空止损" || reason == "空超时" {
+                    state.consecutive_stop_losses += 1;
+                    let cooldown_ms = match state.consecutive_stop_losses {
+                        2 => 1_200_000,     // 2连亏: 冷協20分钟
+                        3 => 7_200_000,     // 3连亏: 暂停2小时
+                        n if n >= 4 => 14_400_000, // 4+连亏: 暂停4小时
+                        _ => 0,             // 第1次止损不额外冷却
+                    };
+                    if cooldown_ms > 0 {
+                        state.loss_cooldown_until = now_ms + cooldown_ms;
+                        log::warn!("⚠️ 连续{}次止损 | {} | 暂停交易{}min",
+                            state.consecutive_stop_losses, self.config.symbol, cooldown_ms / 60_000);
+                    }
+                } else {
+                    // 盈利出场（追踪/硬止盈/保本）重置计数
+                    state.consecutive_stop_losses = 0;
+                    state.loss_cooldown_until = 0;
+                }
+
                 let snap = state.snapshot();
                 let path = self.state_file.clone();
                 drop(state);
@@ -569,6 +626,11 @@ impl MomentumStrategy {
                 return;
             }
 
+            // 连续止损熔断检查
+            if now_ms < state.loss_cooldown_until {
+                return;
+            }
+
             // 日最大交易次数
             if state.daily_trades >= self.config.max_daily_trades {
                 return;
@@ -579,11 +641,24 @@ impl MomentumStrategy {
                 return;
             }
 
-            // === 做多入场条件 ===
+            // === 趋势环境识别（L2层） ===
             let ema_fast_5m = state.ema_fast_5m.value().unwrap_or(0.0);
             let ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
+            let ema_trend = state.ema_trend_5m.value().unwrap_or(0.0);
             let rsi = state.rsi_1m.value().unwrap_or(50.0);
             let vol_ratio = state.volume_ratio.ratio();
+            let current_price = state.best_ask;
+
+            // EMA21斜率：判断中期趋势动能方向
+            let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
+                (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
+            } else { 0.0 };
+
+            // === 做多入场条件 ===
+            // 趋势环境确认：价格在EMA50之上 + EMA21斜率非下降
+            let long_trend_env_ok = ema_trend > 0.0
+                && current_price > ema_trend
+                && ema21_slope > -0.02;
 
             // 条件1: 5分钟趋势向上 + 趋势强度过滤
             let trend_up = ema_fast_5m > ema_slow_5m;
@@ -614,9 +689,10 @@ impl MomentumStrategy {
                 false
             };
 
-            // RSI反弹入场 或 突破入场
-            let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
-                || (breakout_signal && trend_up && trend_strong_enough);
+            // RSI反弹入场 或 突破入场（必须通过趋势环境确认）
+            let entry_signal = long_trend_env_ok
+                && ((trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
+                    || (breakout_signal && trend_up && trend_strong_enough));
 
             if entry_signal {
                 let entry_price = state.best_ask;
@@ -625,9 +701,9 @@ impl MomentumStrategy {
                 let sl_price = entry_price * (1.0 - self.config.stop_loss_pct / 100.0);
                 let tp_price = entry_price * (1.0 + self.config.take_profit_pct / 100.0);
 
-                log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 路径:{} | SL:{:.2} | TP:{:.2}",
+                log::info!("🟢 做多 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2}/{:.2} | 斜率:{:+.3}% | 路径:{} | SL:{:.2} | TP:{:.2}",
                     self.config.symbol, entry_price, rsi, vol_ratio,
-                    ema_fast_5m, ema_slow_5m, entry_path, sl_price, tp_price);
+                    ema_fast_5m, ema_slow_5m, ema_trend, ema21_slope, entry_path, sl_price, tp_price);
 
                 state.position = Position::Long;
                 state.entry_price = entry_price;
@@ -647,6 +723,11 @@ impl MomentumStrategy {
                 self.emit_signal("BUY", entry_price, now_ms).await;
             } else if self.config.allow_short {
                 // === 做空入场条件 ===
+                // 趋势环境确认：价格在EMA50之下 + EMA21斜率非上升
+                let short_trend_env_ok = ema_trend > 0.0
+                    && state.best_bid < ema_trend
+                    && ema21_slope < 0.02;
+
                 let trend_down = ema_fast_5m < ema_slow_5m;
                 let short_trend_strength = if ema_slow_5m > 0.0 {
                     (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
@@ -665,8 +746,9 @@ impl MomentumStrategy {
                 let rsi_overbought_short = rsi > 70.0;
                 let sell_pressure = vol_ratio < (1.0 / self.config.volume_ratio_threshold);
 
-                let short_signal = (breakdown_signal && trend_down && short_trend_strong)
-                    || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
+                let short_signal = short_trend_env_ok
+                    && ((breakdown_signal && trend_down && short_trend_strong)
+                        || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure));
 
                 if short_signal {
                     let entry_price = state.best_bid; // 做空用bid
@@ -674,9 +756,9 @@ impl MomentumStrategy {
                     let sl_price = entry_price * (1.0 + self.config.stop_loss_pct / 100.0);
                     let tp_price = entry_price * (1.0 - self.config.take_profit_pct / 100.0);
 
-                    log::info!("🟡 做空 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2} | 路径:{} | SL:{:.2} | TP:{:.2}",
+                    log::info!("🟡 做空 | {} @ {:.2} | RSI:{:.1} | 量比:{:.2} | EMA5m:{:.2}/{:.2}/{:.2} | 斜率:{:+.3}% | 路径:{} | SL:{:.2} | TP:{:.2}",
                         self.config.symbol, entry_price, rsi, vol_ratio,
-                        ema_fast_5m, ema_slow_5m, short_path, sl_price, tp_price);
+                        ema_fast_5m, ema_slow_5m, ema_trend, ema21_slope, short_path, sl_price, tp_price);
 
                     state.position = Position::Short;
                     state.entry_price = entry_price;
@@ -727,22 +809,45 @@ impl MomentumStrategy {
         }
     }
 
-    /// 处理订单拒绝事件（平仓失败时回滚策略状态）
+    /// 处理订单拒绝事件（入场/平仓失败时回滚策略状态）
     async fn on_order_rejected(&self, event: &OrderRejectedEvent) {
         // 只处理本品种的拒绝事件
         if event.symbol != self.config.symbol {
             return;
         }
-
-        // 检查是否是平仓失败（order_id含“sell”或“cover”）
+    
         let order_id = event.order_id.as_deref().unwrap_or("");
         let is_exit_failure = order_id.contains("_sell_") || order_id.contains("_cover_");
-        
+        let is_entry_failure = order_id.contains("_buy_") || order_id.contains("_short_");
+    
+        if is_entry_failure {
+            // === 入场失败回滚：策略已设置了position但实际未成交，需要回滚为空仓 ===
+            let mut state = self.state.lock().await;
+            if state.position != Position::None {
+                log::warn!("⚠️ 入场失败回滚 | {} | {:?} -> None | 入场价: {:.2} | 原因: {}",
+                    self.config.symbol, state.position, state.entry_price, event.reason);
+                state.position = Position::None;
+                state.entry_price = 0.0;
+                state.entry_time = 0;
+                state.trailing_active = false;
+                state.breakeven_active = false;
+                // 回滚 daily_trades（入场时+1了，现在要-1）
+                if state.daily_trades > 0 {
+                    state.daily_trades -= 1;
+                }
+                let snap = state.snapshot();
+                let path = self.state_file.clone();
+                drop(state);
+                tokio::task::spawn_blocking(move || snap.save(&path));
+            }
+            return;
+        }
+            
         if !is_exit_failure {
             return;
         }
-
-        // 回滚策略状态：重新设置为持仓中
+    
+        // === 平仓失败回滚：策略已设置position=None但实际未平仓，需要恢复持仓 ===
         let mut state = self.state.lock().await;
         if state.position == Position::None && state.entry_price > 0.0 {
             // 根据order_id推断原始持仓方向
@@ -751,7 +856,7 @@ impl MomentumStrategy {
             } else {
                 Position::Short
             };
-            
+                
             // 回滚 daily_pnl（之前在出场时已累加，现在要减回去）
             if state.last_exit_pnl != 0.0 {
                 state.daily_pnl -= state.last_exit_pnl;
@@ -759,10 +864,10 @@ impl MomentumStrategy {
                     state.last_exit_pnl, state.daily_pnl);
                 state.last_exit_pnl = 0.0;
             }
-            
+                
             // 累加连续失败计数
             state.consecutive_exit_failures += 1;
-            
+                
             // 超过3次连续失败：强制放弃持仓，避免死循环
             if state.consecutive_exit_failures >= 3 {
                 log::error!("❗ 连续{}次平仓失败 | {} | 强制清除持仓状态 | 入场价: {:.2} | 原因: {}",
@@ -777,10 +882,10 @@ impl MomentumStrategy {
                 tokio::task::spawn_blocking(move || snap.save(&path));
                 return;
             }
-            
+                
             // 设置熔断保护：60秒内不再尝试出场
             state.exit_blocked_until = event.timestamp + 60_000;
-            
+                
             log::warn!("⚠️ 平仓失败回滚 | {} | 恢复{:?}持仓 | 入场价: {:.2} | 60s熔断({}/3) | 原因: {}",
                 self.config.symbol, original_position, state.entry_price,
                 state.consecutive_exit_failures, event.reason);
