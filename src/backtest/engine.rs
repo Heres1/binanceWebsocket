@@ -32,6 +32,7 @@ struct EngineState {
     rsi_1m: RSI,
     ema_fast_5m: EMA,
     ema_slow_5m: EMA,
+    ema_trend_5m: EMA,          // EMA50 - 趋势环境过滤
     volume_ratio: VolumeRatio,
 
     // 盘口
@@ -65,6 +66,11 @@ struct EngineState {
     recent_lows: Vec<f64>,      // 最近20根K线最低价缓冲区
     lowest_since_entry: f64,    // 入场后最低价（用于做空追踪止损）
 
+    // EMA斜率跟踪
+    prev_ema_slow_5m: f64,      // 上一根5mK线的EMA21值
+    prev_ema_trend_5m: f64,     // 上一根5mK线的EMA50值（判断EMA50方向）
+    ema50_history: Vec<f64>,    // EMA50历史值缓冲（最近20根=100分钟）
+
     // 预热
     kline_1m_count: usize,
     kline_5m_count: usize,
@@ -78,6 +84,7 @@ impl EngineState {
             rsi_1m: RSI::new(14),
             ema_fast_5m: EMA::new(7),
             ema_slow_5m: EMA::new(21),
+            ema_trend_5m: EMA::new(50),
             volume_ratio: VolumeRatio::new(60),
             best_bid: 0.0,
             best_bid_qty: 0.0,
@@ -98,13 +105,16 @@ impl EngineState {
             recent_highs: Vec::with_capacity(20),
             recent_lows: Vec::with_capacity(20),
             lowest_since_entry: f64::MAX,
+            prev_ema_slow_5m: 0.0,
+            prev_ema_trend_5m: 0.0,
+            ema50_history: Vec::with_capacity(20),
             kline_1m_count: 0,
             kline_5m_count: 0,
         }
     }
 
     fn is_warmed_up(&self) -> bool {
-        self.kline_1m_count >= 21 && self.kline_5m_count >= 21
+        self.kline_1m_count >= 21 && self.kline_5m_count >= 50
     }
 
     fn check_daily_reset(&mut self, timestamp_ms: u64) {
@@ -211,8 +221,17 @@ impl BacktestEngine {
                 }
             } else {
                 state.kline_5m_count += 1;
+                state.prev_ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
+                state.prev_ema_trend_5m = state.ema_trend_5m.value().unwrap_or(0.0);
                 state.ema_fast_5m.update(kline.close);
                 state.ema_slow_5m.update(kline.close);
+                state.ema_trend_5m.update(kline.close);
+                // 记录EMA50历史值（保留最近20根=100分钟用于宏观方向判断）
+                let new_ema50 = state.ema_trend_5m.value().unwrap_or(0.0);
+                state.ema50_history.push(new_ema50);
+                if state.ema50_history.len() > 20 {
+                    state.ema50_history.remove(0);
+                }
                 continue; // 5m只更新指标不触发交易
             }
 
@@ -382,8 +401,28 @@ impl BacktestEngine {
 
                 let ema_fast_5m = state.ema_fast_5m.value().unwrap_or(0.0);
                 let ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
+                let ema_trend = state.ema_trend_5m.value().unwrap_or(0.0);
                 let rsi = state.rsi_1m.value().unwrap_or(50.0);
                 let vol_ratio = state.volume_ratio.ratio();
+
+                // EMA21斜率：判断中期趋势动能方向
+                let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
+                    (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
+                } else { 0.0 };
+
+                // EMA50宏观方向：当前EMA50 > 20根bar前的EMA50（确认中期趋势上升）
+                let ema50_macro_rising = if state.ema50_history.len() >= 20 {
+                    ema_trend > state.ema50_history[0]  // 对比20根bar前（100分钟前）
+                } else { false };
+
+                // === 趋势环境过滤（L2层）===
+                let price_above_ema50_pct = if ema_trend > 0.0 {
+                    (kline.close - ema_trend) / ema_trend * 100.0
+                } else { 0.0 };
+                let long_trend_env_ok = ema_trend > 0.0
+                    && price_above_ema50_pct > 0.15
+                    && ema21_slope > 0.03
+                    && ema50_macro_rising;  // EMA50必须在近10根bar内上升
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
                 let trend_strength = if ema_slow_5m > 0.0 {
@@ -394,7 +433,8 @@ impl BacktestEngine {
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (self.config.strategy.rsi_oversold + 5.0)
                     && rsi < self.config.strategy.rsi_overbought;
-                let buy_dominant = vol_ratio > self.config.strategy.volume_ratio_threshold;
+                // RSI反弹路径需要更高VR门槛
+                let rsi_bounce_vr_ok = vol_ratio > 2.5;
                 let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
 
                 // 突破入场条件
@@ -408,9 +448,20 @@ impl BacktestEngine {
                     false
                 };
 
-                // RSI反弹入场 或 突破入场
-                let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
-                    || (breakout_signal && trend_up && trend_strong_enough);
+                // RSI反弹入场 或 突破入场（必须通过趋势环境确认）
+                let trend_entry_signal = long_trend_env_ok
+                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
+                        || (breakout_signal && trend_up && trend_strong_enough));
+
+                // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
+                let mean_revert_signal = if state.recent_highs.len() >= 20 {
+                    let recent_high = state.recent_highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
+                    // 从20bar高点跌>1.2% + RSI<38 + VR>2.5(强买盘) + 盘口支撑
+                    drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
+                } else { false };
+
+                let entry_signal = trend_entry_signal || mean_revert_signal;
 
                 if entry_signal {
                     state.position = Position::Long;
@@ -424,27 +475,26 @@ impl BacktestEngine {
                     state.last_trade_time = timestamp;
                     state.daily_trades += 1;
                 } else if self.config.strategy.allow_short {
-                    // 做空入场
+                    // 做空入场（趋势环境过滤）
+                    let price_below_ema50_pct = if ema_trend > 0.0 {
+                        (ema_trend - kline.close) / ema_trend * 100.0
+                    } else { 0.0 };
+                    // 做空趋势环境：价格低于EMA50 0.40% + 强下降斜率
+                    let short_trend_env_ok = ema_trend > 0.0
+                        && price_below_ema50_pct > 0.40
+                        && ema21_slope < -0.04;  // 只做强势下跌
+
                     let trend_down = ema_fast_5m < ema_slow_5m;
                     let short_trend_strength = if ema_slow_5m > 0.0 {
                         (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
                     } else { 0.0 };
                     let short_trend_strong = short_trend_strength >= self.config.strategy.min_trend_strength_pct;
-                    let breakdown_signal = if state.recent_lows.len() >= 10 {
-                        let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
-                            .iter().copied().fold(f64::INFINITY, f64::min);
-                        let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
-                        // RSI > 35: 防止RSI极度超卖时做空击穿（与做多突破rsi<65对称）
-                        breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 40.0
-                    } else {
-                        false
-                    };
 
-                    let rsi_overbought_short = rsi > 70.0;
-                    let sell_pressure = vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
-
-                    let short_signal = (breakdown_signal && trend_down && short_trend_strong)
-                        || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
+                    // 简化做空入场：趋势确认+EMA空头排列即可（不再要求breakdown信号）
+                    let short_signal = short_trend_env_ok
+                        && trend_down
+                        && short_trend_strong
+                        && rsi < 45.0;  // RSI<45确认弱势才做空
 
                     if short_signal {
                         state.position = Position::Short;
@@ -917,8 +967,17 @@ impl BacktestEngine {
                 }
             } else {
                 state.kline_5m_count += 1;
+                state.prev_ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
+                state.prev_ema_trend_5m = state.ema_trend_5m.value().unwrap_or(0.0);
                 state.ema_fast_5m.update(kline.close);
                 state.ema_slow_5m.update(kline.close);
+                state.ema_trend_5m.update(kline.close);
+                // 记录EMA50历史值（宏观方向过滤）
+                let new_ema50 = state.ema_trend_5m.value().unwrap_or(0.0);
+                state.ema50_history.push(new_ema50);
+                if state.ema50_history.len() > 20 {
+                    state.ema50_history.remove(0);
+                }
                 continue;
             }
 
@@ -1060,8 +1119,28 @@ impl BacktestEngine {
 
                 let ema_fast_5m = state.ema_fast_5m.value().unwrap_or(0.0);
                 let ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
+                let ema_trend = state.ema_trend_5m.value().unwrap_or(0.0);
                 let rsi = state.rsi_1m.value().unwrap_or(50.0);
                 let vol_ratio = state.volume_ratio.ratio();
+
+                // EMA21斜率
+                let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
+                    (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
+                } else { 0.0 };
+
+                // EMA50宏观方向（同步kline回测逻辑）
+                let ema50_macro_rising = if state.ema50_history.len() >= 20 {
+                    ema_trend > state.ema50_history[0]
+                } else { false };
+
+                // 趋势环境过滤
+                let price_above_ema50_pct = if ema_trend > 0.0 {
+                    (kline.close - ema_trend) / ema_trend * 100.0
+                } else { 0.0 };
+                let long_trend_env_ok = ema_trend > 0.0
+                    && price_above_ema50_pct > 0.15
+                    && ema21_slope > 0.03
+                    && ema50_macro_rising;
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
                 let trend_strength = if ema_slow_5m > 0.0 {
@@ -1071,23 +1150,32 @@ impl BacktestEngine {
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (strategy.rsi_oversold + 5.0)
                     && rsi < strategy.rsi_overbought;
-                let buy_dominant = vol_ratio > strategy.volume_ratio_threshold;
+                let rsi_bounce_vr_ok = vol_ratio > 2.5;
                 let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
 
-                // 突破入场条件：价格突破最近N根K线最高价
+                // 突破入场条件
                 let breakout_signal = if state.recent_highs.len() >= 10 {
                     let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
                         .iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
-                    // RSI < 65: 防止在RSI高位追高
                     breakout_pct > 0.05 && vol_ratio > strategy.volume_ratio_threshold && rsi < 65.0
                 } else {
                     false
                 };
 
-                // RSI反弹入场 或 突破入场
-                let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
-                    || (breakout_signal && trend_up && trend_strong_enough);
+                // RSI反弹入场 或 突破入场（必须通过趋势环境确认）
+                let trend_entry_signal = long_trend_env_ok
+                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
+                        || (breakout_signal && trend_up && trend_strong_enough));
+
+                // 均值回归入场信号（同步kline回测）
+                let mean_revert_signal = if state.recent_highs.len() >= 20 {
+                    let recent_high = state.recent_highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
+                    drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
+                } else { false };
+
+                let entry_signal = trend_entry_signal || mean_revert_signal;
 
                 if entry_signal {
                     state.position = Position::Long;
@@ -1101,7 +1189,14 @@ impl BacktestEngine {
                     state.last_trade_time = timestamp;
                     state.daily_trades += 1;
                 } else if strategy.allow_short {
-                    // 做空入场: 价格突破最近N根K线最低价 + 下跌趋势
+                    // 做空入场（趋势环境过滤）
+                    let price_below_ema50_pct = if ema_trend > 0.0 {
+                        (ema_trend - kline.close) / ema_trend * 100.0
+                    } else { 0.0 };
+                    let short_trend_env_ok = ema_trend > 0.0
+                        && price_below_ema50_pct > 0.15
+                        && ema21_slope < -0.03;
+
                     let trend_down = ema_fast_5m < ema_slow_5m;
                     let short_trend_strength = if ema_slow_5m > 0.0 {
                         (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
@@ -1111,19 +1206,17 @@ impl BacktestEngine {
                         let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
                             .iter().copied().fold(f64::INFINITY, f64::min);
                         let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
-                        // 做空需要卖压强: vol_ratio < 1/threshold 意味着sell_vol/buy_vol > threshold
-                    // RSI > 35: 防止RSI极度超卖时做空击穿
-                    breakdown_pct > 0.05 && vol_ratio < (1.0 / strategy.volume_ratio_threshold) && rsi > 40.0
+                        breakdown_pct > 0.05 && vol_ratio < (1.0 / strategy.volume_ratio_threshold) && rsi > 40.0
                     } else {
                         false
                     };
 
-                    // RSI超买反转做空(卖方主导)
                     let rsi_overbought_short = rsi > 70.0;
                     let sell_pressure = vol_ratio < (1.0 / strategy.volume_ratio_threshold);
 
-                    let short_signal = (breakdown_signal && trend_down && short_trend_strong)
-                        || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
+                    let short_signal = short_trend_env_ok
+                        && ((breakdown_signal && trend_down && short_trend_strong)
+                            || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure));
 
                     if short_signal {
                         state.position = Position::Short;

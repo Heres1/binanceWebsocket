@@ -25,42 +25,42 @@ testnet = false
 [strategy]
 # 交易对
 symbol = "BTCUSDT"
-# 每笔交易数量 (BTC) - 约 $10/笔
-quantity_per_trade = 0.00013
-# 硬止盈上限 (必须 > trailing_trigger 否则追踪止损是死代码)
+# 每笔交易数量 (BTC) - 42%资金利用率（已验证的正期望策略可以大仓位）
+quantity_per_trade = 0.003
+# 硬止盈上限
 take_profit_pct = 2.0
-# 初始止损百分比 (放宽止损给趋势呼吸空间，减少噪音扫损)
+# 初始止损百分比
 stop_loss_pct = 1.5
-# 最大持仓时间(秒) - 8小时（缩短持仓减少超时亏损）
+# 最大持仓时间(秒) - 8小时
 max_hold_seconds = 28800
-# 交易冷却时间(秒) - 10分钟
-cooldown_seconds = 600
+# 交易冷却时间(秒)
+cooldown_seconds = 120
 # 日最大交易次数
 max_daily_trades = 50
 # 日最大亏损百分比
 max_daily_loss_pct = 3.0
-# RSI超卖线 (42=要求真正超卖才触发反弹信号，避免下跌中的小回调误触发)
-rsi_oversold = 42.0
+# RSI超卖线 (50=配合突破路径和RSI反弹路径，平衡入场频率)
+rsi_oversold = 50.0
 # RSI超买线 (禁用RSI退出)
 rsi_overbought = 100.0
-# 买卖量比阈值 (1.0=要求买方成交量真正主导，过滤弱反弹)
-volume_ratio_threshold = 1.0
-# 保本止损触发 (浮盈达此值后SL上移到入场价，必须 < trailing_trigger)
+# 买卖量比阈值 (0.6=降低量比要求，配合VR≥2.5的RSI反弹路径)
+volume_ratio_threshold = 0.6
+# 保本止损触发
 breakeven_trigger_pct = 0.8
-# 追踪止损触发 (浮盈达此值后启用追踪，必须 < take_profit)
-trailing_trigger_pct = 1.0
-# 追踪止损回撒距离 (从最高/最低点回撒此百分比平仓，0.35%保留更多浮盈)
-trailing_distance_pct = 0.35
+# 追踪止损触发
+trailing_trigger_pct = 1.5
+# 追踪止损回撒距离
+trailing_distance_pct = 0.8
 # 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
 round_trip_fee_pct = 0.1
-# 是否允许做空
-allow_short = true
+# 是否允许做空 (纯做多策略，熊市保本牛市盈利)
+allow_short = false
 # 策略类型
 strategy_type = "Breakout"
-# 僵尸仓位早退(秒)：设置超过max_hold=禁用
-stale_exit_seconds = 86400
+# 僵尸仓位早退(秒)：禁用（设为极大值，让仓位完全靠timeout/追踪止损退出）
+stale_exit_seconds = 999999
 # 僵尸判定门槛(%)
-stale_pnl_threshold_pct = 0.05
+stale_pnl_threshold_pct = 0.2
 # EMA趋势强度最低门槛(%)：要求EMA7/EMA21有有意义的分离，避免震荡市假信号
 min_trend_strength_pct = 0.03
 
@@ -69,18 +69,18 @@ min_trend_strength_pct = 0.03
 # 多品种交易对配置
 [[trading_pairs]]
 symbol = "BTCUSDT"
-quantity_per_trade = 0.0007   # ~$50 @ $73000
-allow_short = false            # 账户无足够BTC，禁用做空
+quantity_per_trade = 0.003    # ~$210 @ $70000 (42%资金利用率，已验证策略)
+allow_short = false
 
 [[trading_pairs]]
 symbol = "ETHUSDT"
-quantity_per_trade = 0.02     # ~$50 @ $2500
-allow_short = false           # 不持有ETH，只做多
+quantity_per_trade = 0.04     # ~$100 @ $2500 (20%资金，保守因熊市表现差)
+allow_short = false
 
 [[trading_pairs]]
 symbol = "SOLUSDT"
-quantity_per_trade = 0.3      # ~$50 @ $165
-allow_short = false           # 不持有SOL，只做多
+quantity_per_trade = 0.6      # ~$99 @ $165 (20%资金，保守)
+allow_short = false
 
 [risk]
 # 最大持仓金额 (USDT) - 3品种并发

@@ -95,6 +95,7 @@ struct StrategyState {
     ema_slow_5m: EMA,   // EMA(21)
     ema_trend_5m: EMA,  // EMA(50) - 趋势环境过滤
     prev_ema_slow_5m: f64, // 上一根5mK线的EMA21值（用于计算斜率）
+    ema50_history: Vec<f64>, // EMA50历史值（最近20根=100分钟，宏观方向判断）
 
     // 成交量比率（60秒滑动窗口）
     volume_ratio: VolumeRatio,
@@ -158,6 +159,7 @@ impl StrategyState {
             ema_slow_5m: EMA::new(21),
             ema_trend_5m: EMA::new(50),
             prev_ema_slow_5m: 0.0,
+            ema50_history: Vec::with_capacity(20),
             volume_ratio: VolumeRatio::new(60),
             best_bid: 0.0,
             best_bid_qty: 0.0,
@@ -358,6 +360,12 @@ impl MomentumStrategy {
                     state.ema_fast_5m.update(event.close);
                     state.ema_slow_5m.update(event.close);
                     state.ema_trend_5m.update(event.close);
+                    // 记录EMA50历史值（宏观方向过滤）
+                    let new_ema50 = state.ema_trend_5m.value().unwrap_or(0.0);
+                    state.ema50_history.push(new_ema50);
+                    if state.ema50_history.len() > 20 {
+                        state.ema50_history.remove(0);
+                    }
                 }
             }
             _ => {}
@@ -409,13 +417,9 @@ impl MomentumStrategy {
         // 日重置检查
         state.check_daily_reset(event.timestamp);
 
-        // 预热未完成不交易
-        if !state.is_warmed_up() {
-            return;
-        }
-
         let now_ms = event.timestamp;
 
+        // 出场检查不需要预热！确保已有持仓能及时止损/止盈
         // 检查出场条件（阶梯式保护机制）
         if state.position == Position::Long && state.entry_price > 0.0 {
             // 熔断保护：出场失败后60秒内不重试
@@ -621,6 +625,11 @@ impl MomentumStrategy {
 
         // 检查入场条件（空仓时）
         if state.position == Position::None {
+            // 预热未完成不入场（仅阻止入场，不阻止出场）
+            if !state.is_warmed_up() {
+                return;
+            }
+
             // 冷却检查
             if now_ms - state.last_trade_time < self.config.cooldown_seconds * 1000 {
                 return;
@@ -655,10 +664,19 @@ impl MomentumStrategy {
             } else { 0.0 };
 
             // === 做多入场条件 ===
-            // 趋势环境确认：价格在EMA50之上 + EMA21斜率非下降
+            // EMA50宏观方向过滤：确认中期趋势上升
+            let ema50_macro_rising = if state.ema50_history.len() >= 20 {
+                ema_trend > state.ema50_history[0]  // 对比20根bar前（100分钟）
+            } else { false };
+
+            // 趋势环境确认：价格在EMA50之上至少0.15% + EMA21斜率非下降 + EMA50宏观上升
+            let price_above_ema50_pct = if ema_trend > 0.0 {
+                (current_price - ema_trend) / ema_trend * 100.0
+            } else { 0.0 };
             let long_trend_env_ok = ema_trend > 0.0
-                && current_price > ema_trend
-                && ema21_slope > -0.02;
+                && price_above_ema50_pct > 0.15  // 至少高于EMA50 0.15%，避免边缘试探
+                && ema21_slope > 0.03  // 斜率>+0.03% 确认上升动能
+                && ema50_macro_rising;  // EMA50宏观方向必须上升
 
             // 条件1: 5分钟趋势向上 + 趋势强度过滤
             let trend_up = ema_fast_5m > ema_slow_5m;
@@ -672,8 +690,8 @@ impl MomentumStrategy {
                 && rsi > (self.config.rsi_oversold + 5.0)
                 && rsi < self.config.rsi_overbought;
 
-            // 条件3: 买方成交量主导
-            let buy_dominant = vol_ratio > self.config.volume_ratio_threshold;
+            // 条件3: RSI反弹路径需要更高VR门槛（回测验证VR≥2.5过滤弱反弹）
+            let rsi_bounce_vr_ok = vol_ratio > 2.5;
 
             // 条件4: 盘口有买盘支撑
             let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
@@ -690,14 +708,26 @@ impl MomentumStrategy {
             };
 
             // RSI反弹入场 或 突破入场（必须通过趋势环境确认）
-            let entry_signal = long_trend_env_ok
-                && ((trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
+            let trend_entry_signal = long_trend_env_ok
+                && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
                     || (breakout_signal && trend_up && trend_strong_enough));
+
+            // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
+            let mean_revert_signal = if state.recent_highs.len() >= 20 {
+                let recent_high = state.recent_highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let drop_pct = (recent_high - current_price) / recent_high * 100.0;
+                // 从20bar高点跌>1.2% + RSI<38 + VR>2.5(强买盘) + 盘口支撑
+                drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
+            } else { false };
+
+            let entry_signal = trend_entry_signal || mean_revert_signal;
 
             if entry_signal {
                 let entry_price = state.best_ask;
                 // 优先判断RSI反弹路径：两种条件同时满足时RSI反弹更具体
-                let entry_path = if trend_up && rsi_recovering && buy_dominant && bid_support { "RSI反弹" } else { "突破" };
+                let entry_path = if mean_revert_signal { "均值回归" }
+                    else if trend_up && rsi_recovering && rsi_bounce_vr_ok && bid_support { "RSI反弹" }
+                    else { "突破" };
                 let sl_price = entry_price * (1.0 - self.config.stop_loss_pct / 100.0);
                 let tp_price = entry_price * (1.0 + self.config.take_profit_pct / 100.0);
 
@@ -723,10 +753,13 @@ impl MomentumStrategy {
                 self.emit_signal("BUY", entry_price, now_ms).await;
             } else if self.config.allow_short {
                 // === 做空入场条件 ===
-                // 趋势环境确认：价格在EMA50之下 + EMA21斜率非上升
+                // 趋势环境确认：价格在EMA50之下至少0.15% + EMA21斜率非上升
+                let price_below_ema50_pct = if ema_trend > 0.0 {
+                    (ema_trend - state.best_bid) / ema_trend * 100.0
+                } else { 0.0 };
                 let short_trend_env_ok = ema_trend > 0.0
-                    && state.best_bid < ema_trend
-                    && ema21_slope < 0.02;
+                    && price_below_ema50_pct > 0.15  // 至少低于EMA50 0.15%
+                    && ema21_slope < -0.03;  // 斜率<-0.03% 确认下降动能（回测验证）
 
                 let trend_down = ema_fast_5m < ema_slow_5m;
                 let short_trend_strength = if ema_slow_5m > 0.0 {
