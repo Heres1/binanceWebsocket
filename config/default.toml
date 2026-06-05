@@ -25,8 +25,8 @@ testnet = false
 [strategy]
 # 交易对
 symbol = "BTCUSDT"
-# 每笔交易数量 (BTC) - 42%资金利用率（已验证的正期望策略可以大仓位）
-quantity_per_trade = 0.003
+# 每笔交易数量 (BTC) - $200账户适度激进
+quantity_per_trade = 0.002
 # 硬止盈上限
 take_profit_pct = 2.0
 # 初始止损百分比
@@ -37,14 +37,14 @@ max_hold_seconds = 28800
 cooldown_seconds = 120
 # 日最大交易次数
 max_daily_trades = 50
-# 日最大亏损百分比
-max_daily_loss_pct = 3.0
-# RSI超卖线 (50=配合突破路径和RSI反弹路径，平衡入场频率)
-rsi_oversold = 50.0
+# 日最大亏损百分比（收紧风控，$200账户每天最多亏$4）
+max_daily_loss_pct = 2.0
+# RSI超卖线 (35=真正超卖才标记，避免正常波动触发假信号)
+rsi_oversold = 35.0
 # RSI超买线 (禁用RSI退出)
 rsi_overbought = 100.0
-# 买卖量比阈值 (0.6=降低量比要求，配合VR≥2.5的RSI反弹路径)
-volume_ratio_threshold = 0.6
+# 买卖量比阈值 (1.2=要求明确买盘优势才入场)
+volume_ratio_threshold = 1.2
 # 保本止损触发
 breakeven_trigger_pct = 0.8
 # 追踪止损触发
@@ -69,26 +69,27 @@ min_trend_strength_pct = 0.03
 # 多品种交易对配置
 [[trading_pairs]]
 symbol = "BTCUSDT"
-quantity_per_trade = 0.003    # ~$210 @ $70000 (42%资金利用率，已验证策略)
+quantity_per_trade = 0.002    # ~$128 @ $64000 (64%资金，保守中带激进)
 allow_short = false
 
-[[trading_pairs]]
-symbol = "ETHUSDT"
-quantity_per_trade = 0.04     # ~$100 @ $2500 (20%资金，保守因熊市表现差)
-allow_short = false
-
-[[trading_pairs]]
-symbol = "SOLUSDT"
-quantity_per_trade = 0.6      # ~$99 @ $165 (20%资金，保守)
-allow_short = false
+# ETH/SOL在当前熊市不盈利，暂停交易
+# [[trading_pairs]]
+# symbol = "ETHUSDT"
+# quantity_per_trade = 0.02
+# allow_short = false
+#
+# [[trading_pairs]]
+# symbol = "SOLUSDT"
+# quantity_per_trade = 0.3
+# allow_short = false
 
 [risk]
-# 最大持仓金额 (USDT) - 3品种并发
-max_position_usdt = 500.0
-# 单笔最大金额 (USDT)
-max_single_order_usdt = 80.0
-# 日亏损上限 (USDT)
-max_daily_loss_usdt = 50.0
+# 最大持仓金额 (USDT) - 3品种并发$64+$35+$20=$119
+max_position_usdt = 300.0
+# 单笔最大金额 (USDT) - 覆盖BTC 0.002×$70k=$140
+max_single_order_usdt = 150.0
+# 日亏损上限 (USDT) - $200账户保守风控
+max_daily_loss_usdt = 20.0
 # 最小下单间隔 (秒)
 min_order_interval_secs = 10
 
