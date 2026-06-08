@@ -48,7 +48,7 @@ volume_ratio_threshold = 1.2
 # 保本止损触发
 breakeven_trigger_pct = 0.8
 # 追踪止损触发
-trailing_trigger_pct = 1.5
+trailing_trigger_pct = 1.0
 # 追踪止损回撒距离
 trailing_distance_pct = 0.8
 # 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
