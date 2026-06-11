@@ -119,8 +119,9 @@ impl MarketDataService {
                     tokio::time::sleep(Duration::from_secs(self.reconnect_interval)).await;
                 }
                 Err(e) => {
-                    // 如果运行超过30秒，说明曾成功连接过，重置退避间隔
-                    if connect_start.elapsed() > Duration::from_secs(30) {
+                    // 如果连接存活超过90秒，说明曾成功连接并接收数据，重置退避
+                    // （连接超时为30s，必须用明显大于超时时间的阈值避免误重置）
+                    if connect_start.elapsed() > Duration::from_secs(90) {
                         retry_interval = self.reconnect_interval;
                     }
                     log::warn!("WebSocket连接失败: {}，{}秒后重连", e, retry_interval);

@@ -7,6 +7,8 @@ use sha2::Sha256;
 use hex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{DomainError, ServiceError};
@@ -22,6 +24,8 @@ pub struct BinanceClient {
     base_url: String,
     recv_window: u64,  // 毫秒，默认 5000
     max_retries: u32,  // 最大重试次数
+    /// 速率限制：在此时间戳(ms)之前暂停所有REST请求
+    rate_limited_until_ms: Arc<AtomicU64>,
 }
 
 /// 订单响应
@@ -157,10 +161,16 @@ impl BinanceClient {
             reqwest::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .default_headers(headers)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         } else {
-            reqwest::Client::new()
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
         };
         
         Self {
@@ -170,7 +180,25 @@ impl BinanceClient {
             base_url,
             recv_window: 5000,  // 5秒
             max_retries: 2,     // 最多重试2次（共试3次）
+            rate_limited_until_ms: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 检查是否处于速率限制冷却期
+    pub fn is_rate_limited(&self) -> bool {
+        let until = self.rate_limited_until_ms.load(Ordering::Relaxed);
+        if until == 0 { return false; }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        now < until
+    }
+
+    /// 获取剩余冷却秒数（用于日志）
+    pub fn rate_limit_remaining_secs(&self) -> u64 {
+        let until = self.rate_limited_until_ms.load(Ordering::Relaxed);
+        if until == 0 { return 0; }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        if now >= until { return 0; }
+        (until - now) / 1000
     }
 
     /// 创建带自定义 recv_window 的客户端
@@ -213,8 +241,14 @@ impl BinanceClient {
         format!("{}&signature={}", query_string, signature)
     }
 
-    /// 发送 GET 请求（带重试）
+    /// 发送 GET 请求（带重试+速率限制检查）
     async fn get(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
+        // 速率限制检查：如果处于冷却期，直接返回错误而不发请求
+        if self.is_rate_limited() {
+            return Err(ServiceError::Order(format!(
+                "API速率限制中，剩余冷却{}s", self.rate_limit_remaining_secs()
+            )).into());
+        }
         let mut last_err = None;
         
         for attempt in 0..=self.max_retries {
@@ -245,6 +279,11 @@ impl BinanceClient {
 
     /// 发送 POST 请求（带重试，仅网络层失败时重试）
     async fn post(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
+        if self.is_rate_limited() {
+            return Err(ServiceError::Order(format!(
+                "API速率限制中，剩余冷却{}s", self.rate_limit_remaining_secs()
+            )).into());
+        }
         let mut last_err = None;
         
         for attempt in 0..=self.max_retries {
@@ -274,6 +313,11 @@ impl BinanceClient {
 
     /// 发送 DELETE 请求（带重试）
     async fn delete(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
+        if self.is_rate_limited() {
+            return Err(ServiceError::Order(format!(
+                "API速率限制中，剩余冷却{}s", self.rate_limit_remaining_secs()
+            )).into());
+        }
         let mut last_err = None;
         
         for attempt in 0..=self.max_retries {
@@ -331,6 +375,25 @@ impl BinanceClient {
         
         // 根据错误码分类处理
         match error.code {
+            -1003 => {
+                // 速率限制或IP封禁 - 暂停所有REST请求
+                // 尝试从消息中解析ban时间，否则默认暂停120秒
+                let pause_ms = if error.msg.contains("IP banned until") {
+                    // 解析: "...IP banned until 1781112351786..."
+                    error.msg.split("banned until ").nth(1)
+                        .and_then(|s| s.split('.').next())
+                        .and_then(|s| s.trim().parse::<u64>().ok())
+                        .unwrap_or_else(|| {
+                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 300_000
+                        })
+                } else {
+                    // 普通速率限制，暂停120秒
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 120_000
+                };
+                self.rate_limited_until_ms.store(pause_ms, Ordering::Relaxed);
+                log::error!("⚠️ API速率限制触发，暂停REST请求至冷却结束 | 原因: {}", error.msg);
+                ServiceError::Order(format!("速率限制: {}", error.msg))
+            }
             -1000 => ServiceError::Order(format!("未知错误: {}", error.msg)),
             -1013 => ServiceError::Order(format!("数量不符合过滤器: {}", error.msg)),
             -1021 => ServiceError::Order(format!("时间戳偏移: {}", error.msg)),

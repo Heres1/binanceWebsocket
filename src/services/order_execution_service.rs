@@ -124,17 +124,31 @@ impl OrderExecutionService {
         }
     }
 
-    /// 启动定期余额同步任务（每60秒同步一次）
+    /// 启动定期余额同步任务（带指数退避+日志防抖）
     pub fn start_balance_sync_task(&self) {
         let client = self.client.clone();
         let balance = self.balance.clone();
         
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            interval.tick().await; // 跳过第一次立即触发
+            let base_interval = 60u64;
+            let mut current_interval = base_interval;
+            let max_interval = 300u64; // 失败时最大间隔 5 分钟
+            let mut consecutive_failures: u32 = 0;
+            
+            // 等待第一个周期
+            tokio::time::sleep(Duration::from_secs(base_interval)).await;
             
             loop {
-                interval.tick().await;
+                // 速率限制检查：如果客户端处于冷却期，直接跳过本次同步
+                if client.is_rate_limited() {
+                    let remaining = client.rate_limit_remaining_secs();
+                    if consecutive_failures == 0 {
+                        log::warn!("余额同步跳过: API冷却中，剩余{}s", remaining);
+                    }
+                    tokio::time::sleep(Duration::from_secs(remaining.max(60))).await;
+                    continue;
+                }
+                
                 match client.get_account().await {
                     Ok(account) => {
                         let mut bal = balance.lock().await;
@@ -161,11 +175,25 @@ impl OrderExecutionService {
                         }
                         log::debug!("定期余额同步 | USDT: {:.2} | BTC: {:.6}",
                             bal.available_usdt, bal.btc_free);
+                        // 成功时重置退避
+                        if consecutive_failures > 0 {
+                            log::info!("余额同步恢复正常 | 之前连续失败{}次", consecutive_failures);
+                        }
+                        consecutive_failures = 0;
+                        current_interval = base_interval;
                     }
                     Err(e) => {
-                        log::warn!("定期余额同步失败: {}", e);
+                        consecutive_failures += 1;
+                        // 日志防抖：前3次每次都写，之后每10次写一次
+                        if consecutive_failures <= 3 || consecutive_failures % 10 == 0 {
+                            log::warn!("定期余额同步失败(连续{}次): {} | 下次重试: {}s后",
+                                consecutive_failures, e, current_interval * 2);
+                        }
+                        // 指数退避: 60 → 120 → 240 → 300(封顶)
+                        current_interval = (current_interval * 2).min(max_interval);
                     }
                 }
+                tokio::time::sleep(Duration::from_secs(current_interval)).await;
             }
         });
     }
