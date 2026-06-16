@@ -63,6 +63,8 @@ stale_exit_seconds = 999999
 stale_pnl_threshold_pct = 0.2
 # EMA趋势强度最低门槛(%)：要求EMA7/EMA21有有意义的分离，避免震荡市假信号
 min_trend_strength_pct = 0.03
+# 价格距离EMA50最大百分比：趋势过度延伸过滤（防止趋势末端弱突破）
+max_ema50_distance_pct = 1.0
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 

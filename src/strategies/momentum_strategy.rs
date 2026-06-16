@@ -675,6 +675,7 @@ impl MomentumStrategy {
             } else { 0.0 };
             let long_trend_env_ok = ema_trend > 0.0
                 && price_above_ema50_pct > 0.15  // 至少高于EMA50 0.15%，避免边缘试探
+                && price_above_ema50_pct < self.config.max_ema50_distance_pct  // 趋势过度延伸过滤
                 && ema21_slope > 0.03  // 斜率>+0.03% 确认上升动能
                 && ema50_macro_rising;  // EMA50宏观方向必须上升
 

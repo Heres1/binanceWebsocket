@@ -79,6 +79,8 @@ pub struct StrategyConfig {
     pub stale_pnl_threshold_pct: f64,  // 僵尸判定门槛% - 浮盈低于此值视为僵尸
     #[serde(default = "default_min_trend_strength")]
     pub min_trend_strength_pct: f64,   // EMA趋势强度最低门槛%
+    #[serde(default = "default_max_ema50_distance")]
+    pub max_ema50_distance_pct: f64,   // 价格距离EMA50的最大百分比(趋势过度延伸过滤)
 }
 
 fn default_strategy_type() -> String {
@@ -111,6 +113,10 @@ fn default_stale_pnl_threshold() -> f64 {
 
 fn default_min_trend_strength() -> f64 {
     0.0  // 默认0不过滤，向后兼容
+}
+
+fn default_max_ema50_distance() -> f64 {
+    99.0  // 默认99.0=不过滤，向后兼容
 }
 
 /// 做空配置

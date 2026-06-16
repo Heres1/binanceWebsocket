@@ -421,6 +421,7 @@ impl BacktestEngine {
                 } else { 0.0 };
                 let long_trend_env_ok = ema_trend > 0.0
                     && price_above_ema50_pct > 0.15
+                    && price_above_ema50_pct < self.config.strategy.max_ema50_distance_pct
                     && ema21_slope > 0.03
                     && ema50_macro_rising;  // EMA50必须在近10根bar内上升
 
@@ -1139,6 +1140,7 @@ impl BacktestEngine {
                 } else { 0.0 };
                 let long_trend_env_ok = ema_trend > 0.0
                     && price_above_ema50_pct > 0.15
+                    && price_above_ema50_pct < strategy.max_ema50_distance_pct
                     && ema21_slope > 0.03
                     && ema50_macro_rising;
 
