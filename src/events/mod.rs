@@ -80,10 +80,6 @@ pub enum DomainEvent {
     // ========== 策略事件 ==========
     /// 交易信号
     TradingSignal(TradingSignalEvent),
-    /// 网格触发
-    GridTrigger(GridTriggerEvent),
-    /// 网格状态变更
-    GridStateChange(GridStateChangeEvent),
     
     // ========== 风控事件 ==========
     /// 风控检查

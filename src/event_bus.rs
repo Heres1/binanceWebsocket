@@ -53,8 +53,6 @@ pub enum EventType {
     BalanceUpdate,
     PositionChange,
     TradingSignal,
-    GridTrigger,
-    GridStateChange,
     RiskCheck,
     RiskAlert,
     All, // 订阅所有事件
@@ -190,8 +188,6 @@ pub fn extract_event_type(event: &DomainEvent) -> EventType {
         BalanceUpdate(_) => EventType::BalanceUpdate,
         PositionChange(_) => EventType::PositionChange,
         TradingSignal(_) => EventType::TradingSignal,
-        GridTrigger(_) => EventType::GridTrigger,
-        GridStateChange(_) => EventType::GridStateChange,
         RiskCheck(_) => EventType::RiskCheck,
         RiskAlert(_) => EventType::RiskAlert,
     }

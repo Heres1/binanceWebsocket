@@ -434,8 +434,6 @@ impl Clone for OrderExecutionService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::{BinanceConfig, RiskConfig};
 
     #[test]
     fn test_order_execution_service_creation() {

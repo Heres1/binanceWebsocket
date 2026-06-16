@@ -1,6 +1,5 @@
-use crate::commands::{CommandResult, order_commands::PlaceOrderCommand};
 use crate::error::EventBusError;
-use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
+use crate::event_bus::{EventHandler, EventType, TokioEventBus};
 use crate::events::DomainEvent;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -91,47 +90,3 @@ impl EventHandler for OrderHandler {
     }
 }
 
-pub struct OrderCommandHandler {
-    event_bus: Arc<TokioEventBus>,
-}
-impl OrderCommandHandler {
-    /// 创建新的订单命令处理器
-    pub fn new(event_bus: Arc<TokioEventBus>) -> Self {
-        Self { event_bus }
-    }
-
-    /// 处理下单命令
-    pub async fn handle(&self, cmd: PlaceOrderCommand) -> CommandResult {
-        // 参数验证
-        if cmd.quantity <= 0.0 {
-            return CommandResult::failure("数量必须大于0", 400);
-        }
-        
-        // TODO: 调用Binance API下单
-        log::debug!(
-            "处理下单命令: symbol={}, side={:?}, order_type={:?}, price={:?}, qty={}",
-            cmd.symbol, cmd.side, cmd.order_type, cmd.price, cmd.quantity
-        );
-        
-        // 枚举直接转换为字符串（使用Display trait）
-        let side_str = cmd.side.to_string();
-        let order_type_str = cmd.order_type.to_string();
-        
-        // 发布订单提交事件
-        let event = DomainEvent::OrderSubmitted(crate::events::OrderSubmittedEvent {
-            order_id: uuid::Uuid::new_v4().to_string(),
-            symbol: cmd.symbol.clone(),
-            side: side_str,
-            order_type: order_type_str,
-            price: cmd.price,
-            quantity: cmd.quantity,
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
-        });
-        
-        if let Err(e) = self.event_bus.publish(event).await {
-            return CommandResult::failure(format!("发布事件失败: {}", e), 500);
-        }
-        
-        CommandResult::success("订单已提交")
-    }
-}

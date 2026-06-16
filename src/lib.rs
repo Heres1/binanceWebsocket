@@ -1,9 +1,7 @@
 pub mod infrastructure;
 pub mod events;
 pub mod event_bus;
-pub mod commands;
 pub mod handlers;
-pub mod command_bus;
 pub mod error;
 pub mod services;
 pub mod strategies;

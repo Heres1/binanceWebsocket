@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::path::{Path, PathBuf};
 use chrono::Local;
-use crate::infrastructure::error::error::InfrastructureError;
+use crate::error::InfrastructureError;
 type Result<T> = std::result::Result<T, InfrastructureError>;
 
 #[derive(Debug, Clone, PartialEq)]

@@ -4,6 +4,5 @@
 
 pub mod indicators;
 pub mod momentum_strategy;
-pub mod grid_strategy;
 
 pub use momentum_strategy::MomentumStrategy;

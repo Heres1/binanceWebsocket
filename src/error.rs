@@ -20,10 +20,6 @@ pub enum DomainError {
     #[error("事件总线错误: {0}")]
     EventBus(#[from] EventBusError),
     
-    /// 命令总线错误
-    #[error("命令总线错误: {0}")]
-    CommandBus(#[from] CommandBusError),
-    
     /// 领域服务错误
     #[error("服务错误: {0}")]
     Service(#[from] ServiceError),
@@ -98,19 +94,6 @@ pub enum EventBusError {
     ChannelClosed,
 }
 
-/// 命令总线错误
-#[derive(Error, Debug)]
-pub enum CommandBusError {
-    #[error("命令执行失败: {command} - {reason}")]
-    ExecutionFailed { command: String, reason: String },
-    
-    #[error("命令处理器未找到: {0}")]
-    HandlerNotFound(String),
-    
-    #[error("验证失败: {0}")]
-    ValidationFailed(String),
-}
-
 /// 领域服务错误
 #[derive(Error, Debug)]
 pub enum ServiceError {
@@ -155,14 +138,9 @@ mod tests {
     }
 
     #[test]
-    fn test_command_bus_error_creation() {
-        let err = CommandBusError::ValidationFailed("数量必须大于0".to_string());
-        assert!(err.to_string().contains("验证失败"));
-    }
-
-    #[test]
     fn test_service_error_creation() {
         let err = ServiceError::Order("API调用失败".to_string());
         assert!(err.to_string().contains("订单服务错误"));
     }
 }
+
