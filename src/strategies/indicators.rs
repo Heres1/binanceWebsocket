@@ -208,6 +208,240 @@ impl VolumeRatio {
     }
 }
 
+/// 平均真实波动幅度 (ATR) - 基于 Wilder 平滑
+#[derive(Debug, Clone)]
+pub struct ATR {
+    period: usize,
+    prev_close: Option<f64>,
+    value: Option<f64>,
+    count: usize,
+    tr_sum: f64,        // 预热期累加
+    history: Vec<f64>,  // ATR历史值缓冲区（用于百分位计算）
+    history_cap: usize, // 历史缓冲区容量
+}
+
+impl ATR {
+    /// 创建新的 ATR 计算器
+    /// period: 平滑周期 (e.g. 14)
+    /// history_cap: 历史缓冲区大小，用于百分位计算 (e.g. 100)
+    pub fn new(period: usize, history_cap: usize) -> Self {
+        Self {
+            period,
+            prev_close: None,
+            value: None,
+            count: 0,
+            tr_sum: 0.0,
+            history: Vec::with_capacity(history_cap),
+            history_cap,
+        }
+    }
+
+    /// 输入新的 (high, low, close)，返回当前 ATR 值
+    pub fn update(&mut self, high: f64, low: f64, close: f64) -> f64 {
+        let tr = if let Some(prev_c) = self.prev_close {
+            // True Range = max(H-L, |H-PrevClose|, |L-PrevClose|)
+            (high - low)
+                .max((high - prev_c).abs())
+                .max((low - prev_c).abs())
+        } else {
+            high - low // 第一根K线，TR = H-L
+        };
+        self.prev_close = Some(close);
+        self.count += 1;
+
+        match self.value {
+            None => {
+                // 预热期：累加TR
+                self.tr_sum += tr;
+                if self.count >= self.period {
+                    let atr = self.tr_sum / self.period as f64;
+                    self.value = Some(atr);
+                    self.push_history(atr);
+                    atr
+                } else {
+                    tr // 返回当前TR作为估计
+                }
+            }
+            Some(prev_atr) => {
+                // Wilder 平滑: ATR = (prevATR * (period-1) + TR) / period
+                let atr = (prev_atr * (self.period as f64 - 1.0) + tr) / self.period as f64;
+                self.value = Some(atr);
+                self.push_history(atr);
+                atr
+            }
+        }
+    }
+
+    fn push_history(&mut self, atr: f64) {
+        self.history.push(atr);
+        if self.history.len() > self.history_cap {
+            self.history.remove(0);
+        }
+    }
+
+    /// 获取当前 ATR 值
+    pub fn value(&self) -> Option<f64> {
+        self.value
+    }
+
+    /// 是否已完成预热
+    pub fn is_ready(&self) -> bool {
+        self.value.is_some()
+    }
+
+    /// 计算当前ATR在历史中的百分位 (0-100)
+    /// 返回 None 如果历史数据不足
+    pub fn percentile(&self) -> Option<f64> {
+        if self.history.len() < 20 {
+            return None;
+        }
+        let current = self.value?;
+        let count_below = self.history.iter().filter(|&&v| v < current).count();
+        Some(count_below as f64 / self.history.len() as f64 * 100.0)
+    }
+}
+
+/// 平均方向指数 (ADX) - Wilder 方法
+#[derive(Debug, Clone)]
+pub struct ADX {
+    period: usize,
+    prev_high: Option<f64>,
+    prev_low: Option<f64>,
+    prev_close: Option<f64>,
+    // 平滑的+DM, -DM, TR
+    smoothed_plus_dm: f64,
+    smoothed_minus_dm: f64,
+    smoothed_tr: f64,
+    // ADX
+    dx_sum: f64,
+    dx_count: usize,
+    adx_value: Option<f64>,
+    plus_di: f64,
+    minus_di: f64,
+    count: usize,
+}
+
+impl ADX {
+    /// 创建新的 ADX 计算器
+    pub fn new(period: usize) -> Self {
+        Self {
+            period,
+            prev_high: None,
+            prev_low: None,
+            prev_close: None,
+            smoothed_plus_dm: 0.0,
+            smoothed_minus_dm: 0.0,
+            smoothed_tr: 0.0,
+            dx_sum: 0.0,
+            dx_count: 0,
+            adx_value: None,
+            plus_di: 0.0,
+            minus_di: 0.0,
+            count: 0,
+        }
+    }
+
+    /// 输入新的 (high, low, close)，返回当前 ADX 值
+    pub fn update(&mut self, high: f64, low: f64, close: f64) -> f64 {
+        if let (Some(prev_h), Some(prev_l), Some(prev_c)) = (self.prev_high, self.prev_low, self.prev_close) {
+            self.count += 1;
+
+            // 计算+DM和-DM
+            let up_move = high - prev_h;
+            let down_move = prev_l - low;
+
+            let plus_dm = if up_move > down_move && up_move > 0.0 { up_move } else { 0.0 };
+            let minus_dm = if down_move > up_move && down_move > 0.0 { down_move } else { 0.0 };
+
+            // True Range
+            let tr = (high - low)
+                .max((high - prev_c).abs())
+                .max((low - prev_c).abs());
+
+            if self.count <= self.period {
+                // 预热期：累加
+                self.smoothed_plus_dm += plus_dm;
+                self.smoothed_minus_dm += minus_dm;
+                self.smoothed_tr += tr;
+
+                if self.count == self.period {
+                    // 第一次计算DI
+                    if self.smoothed_tr > 0.0 {
+                        self.plus_di = self.smoothed_plus_dm / self.smoothed_tr * 100.0;
+                        self.minus_di = self.smoothed_minus_dm / self.smoothed_tr * 100.0;
+                    }
+                    let dx = self.compute_dx();
+                    self.dx_sum += dx;
+                    self.dx_count += 1;
+                }
+            } else {
+                // Wilder 平滑
+                let n = self.period as f64;
+                self.smoothed_plus_dm = self.smoothed_plus_dm - self.smoothed_plus_dm / n + plus_dm;
+                self.smoothed_minus_dm = self.smoothed_minus_dm - self.smoothed_minus_dm / n + minus_dm;
+                self.smoothed_tr = self.smoothed_tr - self.smoothed_tr / n + tr;
+
+                if self.smoothed_tr > 0.0 {
+                    self.plus_di = self.smoothed_plus_dm / self.smoothed_tr * 100.0;
+                    self.minus_di = self.smoothed_minus_dm / self.smoothed_tr * 100.0;
+                }
+
+                let dx = self.compute_dx();
+
+                if self.adx_value.is_none() {
+                    // 第二次预热：累加DX直到够 period 个
+                    self.dx_sum += dx;
+                    self.dx_count += 1;
+                    if self.dx_count >= self.period {
+                        let adx = self.dx_sum / self.period as f64;
+                        self.adx_value = Some(adx);
+                    }
+                } else {
+                    // Wilder 平滑 ADX
+                    let prev_adx = self.adx_value.unwrap();
+                    let adx = (prev_adx * (self.period as f64 - 1.0) + dx) / self.period as f64;
+                    self.adx_value = Some(adx);
+                }
+            }
+        }
+
+        self.prev_high = Some(high);
+        self.prev_low = Some(low);
+        self.prev_close = Some(close);
+
+        self.adx_value.unwrap_or(0.0)
+    }
+
+    fn compute_dx(&self) -> f64 {
+        let di_sum = self.plus_di + self.minus_di;
+        if di_sum == 0.0 {
+            0.0
+        } else {
+            (self.plus_di - self.minus_di).abs() / di_sum * 100.0
+        }
+    }
+
+    /// 获取当前 ADX 值
+    pub fn value(&self) -> Option<f64> {
+        self.adx_value
+    }
+
+    /// 获取 +DI 值
+    pub fn plus_di(&self) -> f64 {
+        self.plus_di
+    }
+
+    /// 获取 -DI 值
+    pub fn minus_di(&self) -> f64 {
+        self.minus_di
+    }
+
+    /// 是否已完成预热
+    pub fn is_ready(&self) -> bool {
+        self.adx_value.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +489,70 @@ mod tests {
         vr.add_trade(65000, 1.0, true); // 超出窗口
         // 前面的数据应该被清除，只剩当前这笔
         assert_eq!(vr.trade_count(), 1);
+    }
+
+    #[test]
+    fn test_atr_basic() {
+        let mut atr = ATR::new(3, 100);
+        // 3根K线预热
+        atr.update(110.0, 90.0, 100.0);  // TR = 20 (第一根, H-L)
+        atr.update(115.0, 95.0, 110.0);  // TR = max(20, |115-100|, |95-100|) = 20
+        let v = atr.update(120.0, 100.0, 115.0); // TR = max(20, |120-110|, |100-110|) = 20
+        // ATR = (20+20+20) / 3 = 20.0
+        assert!((v - 20.0).abs() < 0.01, "ATR should be 20.0, got {}", v);
+        assert!(atr.is_ready());
+
+        // Wilder平滑: ATR = (20*2 + 15) / 3 = 18.33
+        let v2 = atr.update(125.0, 110.0, 120.0); // TR = max(15, |125-115|, |110-115|) = 15
+        assert!((v2 - 18.33).abs() < 0.1, "ATR should be ~18.33, got {}", v2);
+    }
+
+    #[test]
+    fn test_atr_percentile() {
+        let mut atr = ATR::new(3, 100);
+        // 填充足够历史
+        for i in 0..30 {
+            let h = 100.0 + (i as f64) * 0.5;
+            let l = 100.0 - (i as f64) * 0.5;
+            atr.update(h, l, 100.0);
+        }
+        // 应该有百分位值
+        assert!(atr.percentile().is_some());
+        let pct = atr.percentile().unwrap();
+        assert!(pct >= 0.0 && pct <= 100.0);
+    }
+
+    #[test]
+    fn test_adx_trending_market() {
+        let mut adx = ADX::new(5);
+        // 模拟强上升趋势
+        let mut price = 100.0;
+        let mut last_adx = 0.0;
+        for _ in 0..40 {
+            price += 2.0; // 持续上涨
+            let h = price + 1.0;
+            let l = price - 1.0;
+            last_adx = adx.update(h, l, price);
+        }
+        // 强趋势下 ADX 应该 > 25
+        assert!(last_adx > 25.0, "ADX should be >25 for strong trend, got {}", last_adx);
+        assert!(adx.plus_di() > adx.minus_di(), "+DI should be > -DI in uptrend");
+    }
+
+    #[test]
+    fn test_adx_ranging_market() {
+        let mut adx = ADX::new(5);
+        // 模拟震荡市（价格来回摆动）
+        for i in 0..40 {
+            let offset = if i % 2 == 0 { 2.0 } else { -2.0 };
+            let price = 100.0 + offset;
+            let h = price + 1.0;
+            let l = price - 1.0;
+            adx.update(h, l, price);
+        }
+        // 震荡市 ADX 应该较低
+        if let Some(val) = adx.value() {
+            assert!(val < 35.0, "ADX should be low for ranging market, got {}", val);
+        }
     }
 }

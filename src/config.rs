@@ -81,6 +81,34 @@ pub struct StrategyConfig {
     pub min_trend_strength_pct: f64,   // EMA趋势强度最低门槛%
     #[serde(default = "default_max_ema50_distance")]
     pub max_ema50_distance_pct: f64,   // 价格距离EMA50的最大百分比(趋势过度延伸过滤)
+    #[serde(default = "default_post_stoploss_cooldown")]
+    pub post_stoploss_cooldown_seconds: u64, // 止损后的延长冷却时间(秒)
+    #[serde(default = "default_mean_revert_min_slope")]
+    pub mean_revert_min_slope: f64,          // 均值回归最低斜率门槛(%)，低于此值禁止入场
+    #[serde(default = "default_breakout_min_slope")]
+    pub breakout_min_slope: f64,             // 突破路径最低斜率门槛(%)
+    // ATR动态止损
+    #[serde(default = "default_atr_stop_multiplier")]
+    pub atr_stop_multiplier: f64,            // 止损距离 = N * ATR
+    #[serde(default = "default_atr_trailing_multiplier")]
+    pub atr_trailing_multiplier: f64,        // 追踪止损触发 = N * ATR profit
+    #[serde(default = "default_atr_trailing_distance")]
+    pub atr_trailing_distance: f64,          // 追踪止损距离 = N * ATR
+    #[serde(default = "default_use_atr_stops")]
+    pub use_atr_stops: bool,                 // 是否启用ATR止损
+    // ADX过滤
+    #[serde(default = "default_adx_min_threshold")]
+    pub adx_min_threshold: f64,              // ADX最低门槛(低于=震荡市)
+    #[serde(default = "default_adx_strong_trend")]
+    pub adx_strong_trend: f64,               // 强趋势阈值(入场加分)
+    // 波动率政权过滤
+    #[serde(default = "default_atr_percentile_low")]
+    pub atr_percentile_low: f64,             // ATR百分位下限
+    #[serde(default = "default_atr_percentile_high")]
+    pub atr_percentile_high: f64,            // ATR百分位上限
+    // 多因子评分
+    #[serde(default = "default_entry_score_threshold")]
+    pub entry_score_threshold: u32,          // 入场最低分数(满分100)
 }
 
 fn default_strategy_type() -> String {
@@ -117,6 +145,54 @@ fn default_min_trend_strength() -> f64 {
 
 fn default_max_ema50_distance() -> f64 {
     99.0  // 默认99.0=不过滤，向后兼容
+}
+
+fn default_post_stoploss_cooldown() -> u64 {
+    0  // 默认0=使用普通冷却时间，向后兼容
+}
+
+fn default_mean_revert_min_slope() -> f64 {
+    -0.05  // EMA21斜率必须 > -0.05% 才允许均值回归入场
+}
+
+fn default_breakout_min_slope() -> f64 {
+    0.05  // 突破路径要求EMA21斜率 > 0.05%
+}
+
+fn default_atr_stop_multiplier() -> f64 {
+    2.0
+}
+
+fn default_atr_trailing_multiplier() -> f64 {
+    2.5
+}
+
+fn default_atr_trailing_distance() -> f64 {
+    1.5
+}
+
+fn default_use_atr_stops() -> bool {
+    false  // 默认关闭，向后兼容
+}
+
+fn default_adx_min_threshold() -> f64 {
+    20.0
+}
+
+fn default_adx_strong_trend() -> f64 {
+    30.0
+}
+
+fn default_atr_percentile_low() -> f64 {
+    20.0
+}
+
+fn default_atr_percentile_high() -> f64 {
+    80.0
+}
+
+fn default_entry_score_threshold() -> u32 {
+    55
 }
 
 /// 做空配置

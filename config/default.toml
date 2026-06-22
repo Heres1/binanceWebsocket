@@ -5,7 +5,7 @@
 
 [logging]
 # 日志级别: trace, debug, info, warn, error
-level = "info"
+level = "debug"
 # 日志格式: text, json
 format = "text"
 # 日志文件路径 (自动创建目录)
@@ -28,19 +28,19 @@ symbol = "BTCUSDT"
 # 每笔交易数量 (BTC) - $200账户适度激进
 quantity_per_trade = 0.002
 # 硬止盈上限
-take_profit_pct = 2.0
+take_profit_pct = 3.0
 # 初始止损百分比
 stop_loss_pct = 1.5
-# 最大持仓时间(秒) - 8小时
-max_hold_seconds = 28800
+# 最大持仓时间(秒) - 12小时
+max_hold_seconds = 43200
 # 交易冷却时间(秒)
 cooldown_seconds = 120
 # 日最大交易次数
 max_daily_trades = 50
 # 日最大亏损百分比（收紧风控，$200账户每天最多亏$4）
 max_daily_loss_pct = 2.0
-# RSI超卖线 (35=真正超卖才标记，避免正常波动触发假信号)
-rsi_oversold = 35.0
+# RSI超卖线 (40=平衡交易频率和质量，回测验证最优)
+rsi_oversold = 40.0
 # RSI超买线 (禁用RSI退出)
 rsi_overbought = 100.0
 # 买卖量比阈值 (1.2=要求明确买盘优势才入场)
@@ -57,14 +57,46 @@ round_trip_fee_pct = 0.1
 allow_short = false
 # 策略类型
 strategy_type = "Breakout"
-# 僵尸仓位早退(秒)：禁用（设为极大值，让仓位完全靠timeout/追踪止损退出）
+# 僵尸仓位早退(秒)：禁用（回测验证关闭更优）
 stale_exit_seconds = 999999
 # 僵尸判定门槛(%)
-stale_pnl_threshold_pct = 0.2
+stale_pnl_threshold_pct = 0.3
 # EMA趋势强度最低门槛(%)：要求EMA7/EMA21有有意义的分离，避免震荡市假信号
 min_trend_strength_pct = 0.03
 # 价格距离EMA50最大百分比：趋势过度延伸过滤（防止趋势末端弱突破）
 max_ema50_distance_pct = 1.0
+# 止损后延长冷却时间(秒) - 防止止损后立即重新入场
+post_stoploss_cooldown_seconds = 600
+# 均值回归最低斜率门槛(%) - 防止在暴跌中接飞刀(EMA21斜率必须 > 此值)
+mean_revert_min_slope = -0.10
+# 突破路径最低斜率门槛(%) - 要求更强趋势确认
+breakout_min_slope = 0.05
+
+# === ATR动态止损 ===
+# 止损距离 = N * ATR (8.5x适合BTC 5分钟级别，平衡保护与呼吸空间)
+atr_stop_multiplier = 8.5
+# 追踪止损触发 = 浮盈达到 N * ATR 后开启 (3.0 = 早追踪，捕获更多小移动)
+atr_trailing_multiplier = 3.0
+# 追踪止损距离 = N * ATR (2.0 = 平衡，避免过早止出)
+atr_trailing_distance = 2.0
+# 是否启用ATR止损 (false=回退到固定%止损)
+use_atr_stops = true
+
+# === ADX趋势过滤 ===
+# ADX最低门槛 (低于此值=震荡市，不入场)
+adx_min_threshold = 20.0
+# 强趋势阈值 (ADX>此值=入场评分加分)
+adx_strong_trend = 30.0
+
+# === 波动率政权过滤 ===
+# ATR百分位下限 (禁用: 0.0)
+atr_percentile_low = 0.0
+# ATR百分位上限 (禁用: 100.0)
+atr_percentile_high = 100.0
+
+# === 多因子评分入场 ===
+# 入场最低分数(满分100，低于此值不入场)
+entry_score_threshold = 55
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 

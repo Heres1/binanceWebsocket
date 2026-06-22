@@ -5,7 +5,7 @@
 use crate::backtest::data_loader::{BacktestKline, DataLoader, RecordedEvent};
 use crate::backtest::report::{BacktestReport, TradeRecord};
 use crate::config::StrategyConfig;
-use crate::strategies::indicators::{EMA, RSI, VolumeRatio};
+use crate::strategies::indicators::{EMA, RSI, VolumeRatio, ATR, ADX};
 
 /// 回测引擎配置
 #[derive(Debug, Clone)]
@@ -67,10 +67,17 @@ struct EngineState {
     lowest_since_entry: f64,    // 入场后最低价（用于做空追踪止损）
 
     // EMA斜率跟踪
-    prev_ema_slow_5m: f64,      // 上一根5mK线的EMA21值
-    prev_ema_trend_5m: f64,     // 上一根5mK线的EMA50值（判断EMA50方向）
+    prev_ema_slow_5m: f64,      // 上一桩5mK线的EMA21值
+    prev_ema_trend_5m: f64,     // 上一桩5mK线的EMA50值（判断EMA50方向）
     ema50_history: Vec<f64>,    // EMA50历史值缓冲（最近20根=100分钟）
-
+    
+    // 止损后延长冷却
+    last_exit_was_stoploss: bool,
+    
+    // ATR/ADX指标
+    atr_5m: ATR,
+    adx_5m: ADX,
+    
     // 预热
     kline_1m_count: usize,
     kline_5m_count: usize,
@@ -108,6 +115,9 @@ impl EngineState {
             prev_ema_slow_5m: 0.0,
             prev_ema_trend_5m: 0.0,
             ema50_history: Vec::with_capacity(20),
+            last_exit_was_stoploss: false,
+            atr_5m: ATR::new(14, 100),
+            adx_5m: ADX::new(14),
             kline_1m_count: 0,
             kline_5m_count: 0,
         }
@@ -226,6 +236,9 @@ impl BacktestEngine {
                 state.ema_fast_5m.update(kline.close);
                 state.ema_slow_5m.update(kline.close);
                 state.ema_trend_5m.update(kline.close);
+                // ATR和ADX更新（使用K线的high/low/close）
+                state.atr_5m.update(kline.high, kline.low, kline.close);
+                state.adx_5m.update(kline.high, kline.low, kline.close);
                 // 记录EMA50历史值（保留最近20根=100分钟用于宏观方向判断）
                 let new_ema50 = state.ema_trend_5m.value().unwrap_or(0.0);
                 state.ema50_history.push(new_ema50);
@@ -241,7 +254,7 @@ impl BacktestEngine {
                 continue;
             }
 
-            // 检查出场（阶梯式保护机制 + Intra-bar模拟）
+            // 检查出场（阶梯式保护机制 + Intra-bar模拟 + ATR动态止损）
             if state.position == Position::Long {
                 let hold_secs = (timestamp - state.entry_time) / 1000;
                 let rsi = state.rsi_1m.value().unwrap_or(50.0);
@@ -250,15 +263,38 @@ impl BacktestEngine {
                 state.highest_since_entry = state.highest_since_entry.max(kline.high);
                 let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
+                // ATR动态止损计算
+                let current_atr = state.atr_5m.value().unwrap_or(0.0);
+                let use_atr = self.config.strategy.use_atr_stops && current_atr > 0.0;
+
                 // 计算动态止损价
-                let dynamic_sl = if highest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
-                    state.trailing_active = true;
-                    state.highest_since_entry * (1.0 - self.config.strategy.trailing_distance_pct / 100.0)
-                } else if highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
-                    state.breakeven_active = true;
-                    state.entry_price
+                let dynamic_sl = if use_atr {
+                    // ATR基础止损价
+                    let atr_sl = state.entry_price - self.config.strategy.atr_stop_multiplier * current_atr;
+                    // ATR追踪止损：浮盈超过 N*ATR 后开启
+                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * current_atr;
+                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * current_atr;
+                    let profit_amount = state.highest_since_entry - state.entry_price;
+                    if profit_amount >= atr_trailing_trigger {
+                        state.trailing_active = true;
+                        state.highest_since_entry - atr_trailing_dist
+                    } else if highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        atr_sl
+                    }
                 } else {
-                    state.entry_price * (1.0 - self.config.strategy.stop_loss_pct / 100.0)
+                    // 回退到固定%止损
+                    if highest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
+                        state.trailing_active = true;
+                        state.highest_since_entry * (1.0 - self.config.strategy.trailing_distance_pct / 100.0)
+                    } else if highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        state.entry_price * (1.0 - self.config.strategy.stop_loss_pct / 100.0)
+                    }
                 };
 
                 let tp_price = state.entry_price * (1.0 + self.config.strategy.take_profit_pct / 100.0);
@@ -321,24 +357,44 @@ impl BacktestEngine {
                     state.position = Position::None;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
+                    state.last_exit_was_stoploss = reason == "止损" || reason == "超时";
                 }
             }
 
-            // 做空出场（对称的阶梯式保护）
+            // 做空出场（对称的阶梯式保护 + ATR动态止损）
             if state.position == Position::Short {
                 let hold_secs = (timestamp - state.entry_time) / 1000;
 
                 state.lowest_since_entry = state.lowest_since_entry.min(kline.low);
                 let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
 
-                let dynamic_sl = if lowest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
-                    state.trailing_active = true;
-                    state.lowest_since_entry * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
-                } else if lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
-                    state.breakeven_active = true;
-                    state.entry_price
+                let current_atr = state.atr_5m.value().unwrap_or(0.0);
+                let use_atr = self.config.strategy.use_atr_stops && current_atr > 0.0;
+
+                let dynamic_sl = if use_atr {
+                    let atr_sl = state.entry_price + self.config.strategy.atr_stop_multiplier * current_atr;
+                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * current_atr;
+                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * current_atr;
+                    let profit_amount = state.entry_price - state.lowest_since_entry;
+                    if profit_amount >= atr_trailing_trigger {
+                        state.trailing_active = true;
+                        state.lowest_since_entry + atr_trailing_dist
+                    } else if lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        atr_sl
+                    }
                 } else {
-                    state.entry_price * (1.0 + self.config.strategy.stop_loss_pct / 100.0)
+                    if lowest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
+                        state.trailing_active = true;
+                        state.lowest_since_entry * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
+                    } else if lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        state.entry_price * (1.0 + self.config.strategy.stop_loss_pct / 100.0)
+                    }
                 };
 
                 let tp_price = state.entry_price * (1.0 - self.config.strategy.take_profit_pct / 100.0);
@@ -384,12 +440,19 @@ impl BacktestEngine {
                     state.position = Position::None;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
+                    state.last_exit_was_stoploss = reason == "空止损" || reason == "空超时";
                 }
             }
 
-            // 检查入场
+            // 检查入场（多因子评分 + ADX过滤 + 波动率政权）
             if state.position == Position::None {
-                if timestamp - state.last_trade_time < self.config.strategy.cooldown_seconds * 1000 {
+                // 止损后延长冷却：如果上一笔是止损出场，使用更长的冷却时间
+                let effective_cooldown = if state.last_exit_was_stoploss && self.config.strategy.post_stoploss_cooldown_seconds > 0 {
+                    self.config.strategy.post_stoploss_cooldown_seconds * 1000
+                } else {
+                    self.config.strategy.cooldown_seconds * 1000
+                };
+                if timestamp - state.last_trade_time < effective_cooldown {
                     continue;
                 }
                 if state.daily_trades >= self.config.strategy.max_daily_trades {
@@ -398,6 +461,18 @@ impl BacktestEngine {
                 if state.daily_pnl <= -self.config.strategy.max_daily_loss_pct {
                     continue;
                 }
+
+                // === ADX过滤 ===
+                let adx_val = state.adx_5m.value().unwrap_or(0.0);
+                let adx_ready = state.adx_5m.is_ready();
+                let adx_above_threshold = !adx_ready || adx_val >= self.config.strategy.adx_min_threshold;
+
+                // === 波动率政权过滤 ===
+                let atr_pct = state.atr_5m.percentile();
+                let volatility_normal = match atr_pct {
+                    Some(p) => p >= self.config.strategy.atr_percentile_low && p <= self.config.strategy.atr_percentile_high,
+                    None => true, // 数据不足时不过滤
+                };
 
                 let ema_fast_5m = state.ema_fast_5m.value().unwrap_or(0.0);
                 let ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
@@ -410,9 +485,9 @@ impl BacktestEngine {
                     (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
                 } else { 0.0 };
 
-                // EMA50宏观方向：当前EMA50 > 20根bar前的EMA50（确认中期趋势上升）
+                // EMA50宏观方向
                 let ema50_macro_rising = if state.ema50_history.len() >= 20 {
-                    ema_trend > state.ema50_history[0]  // 对比20根bar前（100分钟前）
+                    ema_trend > state.ema50_history[0]
                 } else { false };
 
                 // === 趋势环境过滤（L2层）===
@@ -423,43 +498,57 @@ impl BacktestEngine {
                     && price_above_ema50_pct > 0.15
                     && price_above_ema50_pct < self.config.strategy.max_ema50_distance_pct
                     && ema21_slope > 0.03
-                    && ema50_macro_rising;  // EMA50必须在近10根bar内上升
+                    && ema50_macro_rising;
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
                 let trend_strength = if ema_slow_5m > 0.0 {
                     (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
                 } else { 0.0 };
                 let trend_strong_enough = trend_strength >= self.config.strategy.min_trend_strength_pct;
-                // RSI天花板：RSI超过overbought时不入场（反弹已走完）
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (self.config.strategy.rsi_oversold + 5.0)
                     && rsi < self.config.strategy.rsi_overbought;
-                // RSI反弹路径需要更高VR门槛
                 let rsi_bounce_vr_ok = vol_ratio > 2.5;
                 let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
+                let slope_positive = ema21_slope > 0.03;
 
                 // 突破入场条件
                 let breakout_signal = if state.recent_highs.len() >= 10 {
                     let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
                         .iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
-                    // RSI < 65: 防止在RSI高位追高
                     breakout_pct > 0.05 && vol_ratio > self.config.strategy.volume_ratio_threshold && rsi < 65.0
                 } else {
                     false
                 };
 
-                // RSI反弹入场 或 突破入场（必须通过趋势环境确认）
+                // === 多因子评分系统 ===
+                let mut entry_score: u32 = 0;
+                if trend_up { entry_score += 15; }
+                if trend_strong_enough { entry_score += 10; }
+                if adx_above_threshold { entry_score += 15; }
+                if rsi_recovering { entry_score += 15; }
+                if vol_ratio > self.config.strategy.volume_ratio_threshold { entry_score += 15; }
+                if bid_support { entry_score += 10; }
+                if slope_positive { entry_score += 10; }
+                if volatility_normal { entry_score += 10; }
+
+                // 突破路径额外要求斜率>配置值
+                let breakout_slope_ok = ema21_slope > self.config.strategy.breakout_min_slope;
+
+                // 趋势入场：评分达标 + 趋势环境确认
                 let trend_entry_signal = long_trend_env_ok
+                    && entry_score >= self.config.strategy.entry_score_threshold
                     && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
-                        || (breakout_signal && trend_up && trend_strong_enough));
+                        || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
 
                 // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
                 let mean_revert_signal = if state.recent_highs.len() >= 20 {
                     let recent_high = state.recent_highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
-                    // 从20bar高点跌>1.2% + RSI<38 + VR>2.5(强买盘) + 盘口支撑
                     drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
+                        && ema21_slope > self.config.strategy.mean_revert_min_slope
+                        && volatility_normal  // 波动率过滤也应用于均值回归
                 } else { false };
 
                 let entry_signal = trend_entry_signal || mean_revert_signal;
@@ -476,26 +565,35 @@ impl BacktestEngine {
                     state.last_trade_time = timestamp;
                     state.daily_trades += 1;
                 } else if self.config.strategy.allow_short {
-                    // 做空入场（趋势环境过滤）
+                    // 做空入场（与实盘momentum_strategy.rs L864-895一致）
                     let price_below_ema50_pct = if ema_trend > 0.0 {
                         (ema_trend - kline.close) / ema_trend * 100.0
                     } else { 0.0 };
-                    // 做空趋势环境：价格低于EMA50 0.40% + 强下降斜率
                     let short_trend_env_ok = ema_trend > 0.0
-                        && price_below_ema50_pct > 0.40
-                        && ema21_slope < -0.04;  // 只做强势下跌
+                        && price_below_ema50_pct > 0.15  // 至少低于EMA50 0.15%
+                        && ema21_slope < -0.03;  // 斜率<-0.03% 确认下降动能
 
                     let trend_down = ema_fast_5m < ema_slow_5m;
                     let short_trend_strength = if ema_slow_5m > 0.0 {
                         (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
                     } else { 0.0 };
                     let short_trend_strong = short_trend_strength >= self.config.strategy.min_trend_strength_pct;
+                    let breakdown_signal = if state.recent_lows.len() >= 10 {
+                        let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
+                            .iter().copied().fold(f64::INFINITY, f64::min);
+                        let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
+                        breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 40.0
+                    } else {
+                        false
+                    };
 
-                    // 简化做空入场：趋势确认+EMA空头排列即可（不再要求breakdown信号）
+                    let rsi_overbought_short = rsi > 70.0;
+                    let sell_pressure = vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
+
                     let short_signal = short_trend_env_ok
-                        && trend_down
-                        && short_trend_strong
-                        && rsi < 45.0;  // RSI<45确认弱势才做空
+                        && adx_above_threshold
+                        && ((breakdown_signal && trend_down && short_trend_strong)
+                            || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure));
 
                     if short_signal {
                         state.position = Position::Short;
@@ -973,6 +1071,9 @@ impl BacktestEngine {
                 state.ema_fast_5m.update(kline.close);
                 state.ema_slow_5m.update(kline.close);
                 state.ema_trend_5m.update(kline.close);
+                // ATR和ADX更新
+                state.atr_5m.update(kline.high, kline.low, kline.close);
+                state.adx_5m.update(kline.high, kline.low, kline.close);
                 // 记录EMA50历史值（宏观方向过滤）
                 let new_ema50 = state.ema_trend_5m.value().unwrap_or(0.0);
                 state.ema50_history.push(new_ema50);
@@ -985,24 +1086,41 @@ impl BacktestEngine {
             state.check_daily_reset(timestamp);
             if !state.is_warmed_up() { continue; }
 
-            // 出场（阶梯式保护机制 + Intra-bar模拟）
+            // 出场（阶梯式保护机制 + ATR动态止损）
             if state.position == Position::Long {
                 let hold_secs = (timestamp - state.entry_time) / 1000;
                 let rsi = state.rsi_1m.value().unwrap_or(50.0);
 
-                // 用K线最高价更新入场后最高价
                 state.highest_since_entry = state.highest_since_entry.max(kline.high);
                 let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
-                // 计算动态止损价
-                let dynamic_sl = if highest_pnl_pct >= strategy.trailing_trigger_pct {
-                    state.trailing_active = true;
-                    state.highest_since_entry * (1.0 - strategy.trailing_distance_pct / 100.0)
-                } else if highest_pnl_pct >= strategy.breakeven_trigger_pct {
-                    state.breakeven_active = true;
-                    state.entry_price
+                let current_atr = state.atr_5m.value().unwrap_or(0.0);
+                let use_atr = strategy.use_atr_stops && current_atr > 0.0;
+
+                let dynamic_sl = if use_atr {
+                    let atr_sl = state.entry_price - strategy.atr_stop_multiplier * current_atr;
+                    let atr_trailing_trigger = strategy.atr_trailing_multiplier * current_atr;
+                    let atr_trailing_dist = strategy.atr_trailing_distance * current_atr;
+                    let profit_amount = state.highest_since_entry - state.entry_price;
+                    if profit_amount >= atr_trailing_trigger {
+                        state.trailing_active = true;
+                        state.highest_since_entry - atr_trailing_dist
+                    } else if highest_pnl_pct >= strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        atr_sl
+                    }
                 } else {
-                    state.entry_price * (1.0 - strategy.stop_loss_pct / 100.0)
+                    if highest_pnl_pct >= strategy.trailing_trigger_pct {
+                        state.trailing_active = true;
+                        state.highest_since_entry * (1.0 - strategy.trailing_distance_pct / 100.0)
+                    } else if highest_pnl_pct >= strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        state.entry_price * (1.0 - strategy.stop_loss_pct / 100.0)
+                    }
                 };
 
                 let tp_price = state.entry_price * (1.0 + strategy.take_profit_pct / 100.0);
@@ -1011,8 +1129,12 @@ impl BacktestEngine {
                 let tp_hit = kline.high >= tp_price;
                 let timeout = hold_secs >= strategy.max_hold_seconds;
                 let rsi_exit = rsi > strategy.rsi_overbought;
+                let current_pnl = (kline.close - state.entry_price) / state.entry_price * 100.0;
+                let stale_exit = hold_secs >= strategy.stale_exit_seconds
+                    && current_pnl < strategy.stale_pnl_threshold_pct
+                    && !state.trailing_active;
 
-                let should_exit = sl_hit || tp_hit || timeout || rsi_exit;
+                let should_exit = sl_hit || tp_hit || timeout || rsi_exit || stale_exit;
 
                 if should_exit {
                     let (exit_price, reason) = if sl_hit && !tp_hit {
@@ -1027,6 +1149,8 @@ impl BacktestEngine {
                             else if state.breakeven_active { "保本止损" }
                             else { "止损" };
                         (dynamic_sl, r)
+                    } else if stale_exit {
+                        (kline.close, "僵尸早退")
                     } else if timeout {
                         (kline.close, "超时")
                     } else {
@@ -1048,26 +1172,44 @@ impl BacktestEngine {
                     state.position = Position::None;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
+                    state.last_exit_was_stoploss = reason == "止损" || reason == "超时";
                 }
             }
 
-            // 做空出场（对称的阶梯式保护）
+            // 做空出场（对称的阶梯式保护 + ATR动态止损）
             if state.position == Position::Short {
                 let hold_secs = (timestamp - state.entry_time) / 1000;
 
-                // 用K线最低价更新入场后最低价
                 state.lowest_since_entry = state.lowest_since_entry.min(kline.low);
                 let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
 
-                // 计算动态止损价（做空方向：价格上涨是亏损）
-                let dynamic_sl = if lowest_pnl_pct >= strategy.trailing_trigger_pct {
-                    state.trailing_active = true;
-                    state.lowest_since_entry * (1.0 + strategy.trailing_distance_pct / 100.0)
-                } else if lowest_pnl_pct >= strategy.breakeven_trigger_pct {
-                    state.breakeven_active = true;
-                    state.entry_price
+                let current_atr = state.atr_5m.value().unwrap_or(0.0);
+                let use_atr = strategy.use_atr_stops && current_atr > 0.0;
+
+                let dynamic_sl = if use_atr {
+                    let atr_sl = state.entry_price + strategy.atr_stop_multiplier * current_atr;
+                    let atr_trailing_trigger = strategy.atr_trailing_multiplier * current_atr;
+                    let atr_trailing_dist = strategy.atr_trailing_distance * current_atr;
+                    let profit_amount = state.entry_price - state.lowest_since_entry;
+                    if profit_amount >= atr_trailing_trigger {
+                        state.trailing_active = true;
+                        state.lowest_since_entry + atr_trailing_dist
+                    } else if lowest_pnl_pct >= strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        atr_sl
+                    }
                 } else {
-                    state.entry_price * (1.0 + strategy.stop_loss_pct / 100.0)
+                    if lowest_pnl_pct >= strategy.trailing_trigger_pct {
+                        state.trailing_active = true;
+                        state.lowest_since_entry * (1.0 + strategy.trailing_distance_pct / 100.0)
+                    } else if lowest_pnl_pct >= strategy.breakeven_trigger_pct {
+                        state.breakeven_active = true;
+                        state.entry_price
+                    } else {
+                        state.entry_price * (1.0 + strategy.stop_loss_pct / 100.0)
+                    }
                 };
 
                 let tp_price = state.entry_price * (1.0 - strategy.take_profit_pct / 100.0);
@@ -1076,8 +1218,12 @@ impl BacktestEngine {
                 let sl_hit = kline.high >= dynamic_sl;
                 let tp_hit = kline.low <= tp_price;
                 let timeout = hold_secs >= strategy.max_hold_seconds;
+                let current_pnl = (state.entry_price - kline.close) / state.entry_price * 100.0;
+                let stale_exit = hold_secs >= strategy.stale_exit_seconds
+                    && current_pnl < strategy.stale_pnl_threshold_pct
+                    && !state.trailing_active;
 
-                let should_exit = sl_hit || tp_hit || timeout;
+                let should_exit = sl_hit || tp_hit || timeout || stale_exit;
 
                 if should_exit {
                     let (exit_price, reason) = if sl_hit && !tp_hit {
@@ -1089,6 +1235,8 @@ impl BacktestEngine {
                         (tp_price, "空止盈")
                     } else if sl_hit && tp_hit {
                         (dynamic_sl, "空止损")
+                    } else if stale_exit {
+                        (kline.close, "空僵尸早退")
                     } else {
                         (kline.close, "空超时")
                     };
@@ -1109,14 +1257,33 @@ impl BacktestEngine {
                     state.position = Position::None;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
+                    state.last_exit_was_stoploss = reason == "空止损" || reason == "空超时";
                 }
             }
 
-            // 入场
+            // 入场（多因子评分 + ADX过滤 + 波动率政权）
             if state.position == Position::None {
-                if timestamp - state.last_trade_time < strategy.cooldown_seconds * 1000 { continue; }
+                // 止损后延长冷却
+                let effective_cooldown = if state.last_exit_was_stoploss && strategy.post_stoploss_cooldown_seconds > 0 {
+                    strategy.post_stoploss_cooldown_seconds * 1000
+                } else {
+                    strategy.cooldown_seconds * 1000
+                };
+                if timestamp - state.last_trade_time < effective_cooldown { continue; }
                 if state.daily_trades >= strategy.max_daily_trades { continue; }
                 if state.daily_pnl <= -strategy.max_daily_loss_pct { continue; }
+
+                // === ADX过滤 ===
+                let adx_val = state.adx_5m.value().unwrap_or(0.0);
+                let adx_ready = state.adx_5m.is_ready();
+                let adx_above_threshold = !adx_ready || adx_val >= strategy.adx_min_threshold;
+
+                // === 波动率政权过滤 ===
+                let atr_pct = state.atr_5m.percentile();
+                let volatility_normal = match atr_pct {
+                    Some(p) => p >= strategy.atr_percentile_low && p <= strategy.atr_percentile_high,
+                    None => true,
+                };
 
                 let ema_fast_5m = state.ema_fast_5m.value().unwrap_or(0.0);
                 let ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
@@ -1124,17 +1291,14 @@ impl BacktestEngine {
                 let rsi = state.rsi_1m.value().unwrap_or(50.0);
                 let vol_ratio = state.volume_ratio.ratio();
 
-                // EMA21斜率
                 let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
                     (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
                 } else { 0.0 };
 
-                // EMA50宏观方向（同步kline回测逻辑）
                 let ema50_macro_rising = if state.ema50_history.len() >= 20 {
                     ema_trend > state.ema50_history[0]
                 } else { false };
 
-                // 趋势环境过滤
                 let price_above_ema50_pct = if ema_trend > 0.0 {
                     (kline.close - ema_trend) / ema_trend * 100.0
                 } else { 0.0 };
@@ -1154,8 +1318,8 @@ impl BacktestEngine {
                     && rsi < strategy.rsi_overbought;
                 let rsi_bounce_vr_ok = vol_ratio > 2.5;
                 let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
+                let slope_positive = ema21_slope > 0.03;
 
-                // 突破入场条件
                 let breakout_signal = if state.recent_highs.len() >= 10 {
                     let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
                         .iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -1165,16 +1329,31 @@ impl BacktestEngine {
                     false
                 };
 
-                // RSI反弹入场 或 突破入场（必须通过趋势环境确认）
-                let trend_entry_signal = long_trend_env_ok
-                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
-                        || (breakout_signal && trend_up && trend_strong_enough));
+                // === 多因子评分系统 ===
+                let mut entry_score: u32 = 0;
+                if trend_up { entry_score += 15; }
+                if trend_strong_enough { entry_score += 10; }
+                if adx_above_threshold { entry_score += 15; }
+                if rsi_recovering { entry_score += 15; }
+                if vol_ratio > strategy.volume_ratio_threshold { entry_score += 15; }
+                if bid_support { entry_score += 10; }
+                if slope_positive { entry_score += 10; }
+                if volatility_normal { entry_score += 10; }
 
-                // 均值回归入场信号（同步kline回测）
+                let breakout_slope_ok = ema21_slope > strategy.breakout_min_slope;
+
+                let trend_entry_signal = long_trend_env_ok
+                    && entry_score >= strategy.entry_score_threshold
+                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
+                        || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
+
+                // 均值回归入场信号
                 let mean_revert_signal = if state.recent_highs.len() >= 20 {
                     let recent_high = state.recent_highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
                     drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
+                        && ema21_slope > strategy.mean_revert_min_slope
+                        && volatility_normal
                 } else { false };
 
                 let entry_signal = trend_entry_signal || mean_revert_signal;
@@ -1217,6 +1396,7 @@ impl BacktestEngine {
                     let sell_pressure = vol_ratio < (1.0 / strategy.volume_ratio_threshold);
 
                     let short_signal = short_trend_env_ok
+                        && adx_above_threshold
                         && ((breakdown_signal && trend_down && short_trend_strong)
                             || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure));
 
