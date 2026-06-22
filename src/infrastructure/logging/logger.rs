@@ -342,17 +342,7 @@ impl Drop for AsyncLogger {
 
 impl log::Log for AsyncLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        if metadata.level() > self.config.level {
-            return false;
-        }
-        // debug/trace 级别：只输出本 crate 的日志，过滤第三方库噪声（tokio/hyper/reqwest 等）
-        if metadata.level() > log::Level::Info {
-            let target = metadata.target();
-            return target.starts_with("rust_binance_event_driven")
-                || target.starts_with("trading")
-                || target.starts_with("backtest");
-        }
-        true
+        metadata.level() <= self.config.level
     }
 
     fn log(&self, record: &Record) {

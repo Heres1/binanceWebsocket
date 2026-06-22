@@ -5,7 +5,7 @@
 
 [logging]
 # 日志级别: trace, debug, info, warn, error
-level = "debug"
+level = "info"
 # 日志格式: text, json
 format = "text"
 # 日志文件路径 (自动创建目录)
