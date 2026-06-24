@@ -40,6 +40,22 @@ struct PersistentState {
     daily_trades: u32,
     daily_pnl: f64,
     last_day: u32,
+    // 入场快照（重启后仍可记录入场动机）
+    #[serde(default)]
+    entry_score: u32,
+    #[serde(default)]
+    entry_path: String,
+    #[serde(default)]
+    entry_atr: f64,  // 入场时ATR快照（防止ATR收缩导致止损过早触发）
+    // 追踪止损状态（重启后需要恢复，否则追踪止损会失效）
+    #[serde(default)]
+    highest_since_entry: f64,
+    #[serde(default)]
+    trailing_active: bool,
+    #[serde(default)]
+    breakeven_active: bool,
+    #[serde(default)]
+    lowest_since_entry: f64,
 }
 
 impl PersistentState {
@@ -157,6 +173,7 @@ struct StrategyState {
     // 当前仓位入场快照（出场日志显示入场动机，便于优化回溯）
     entry_score: u32,        // 入场评分快照
     entry_path: String,      // 入场路径("突破"/"RSI反弹"/"均值回归"/"击穿"/"RSI超买")
+    entry_atr: f64,          // 入场时ATR快照（用于止损计算时取max防止ATR收缩导致止损过早触发）
 }
 
 impl StrategyState {
@@ -208,6 +225,7 @@ impl StrategyState {
             daily_pnl_usdt: 0.0,
             entry_score: 0,
             entry_path: String::new(),
+            entry_atr: 0.0,
         };
         
         // 恢复持久化状态（含合法性校验）
@@ -218,7 +236,8 @@ impl StrategyState {
             } else if has_position && ps.entry_time == 0 {
                 log::error!("恢复状态异常: {:?}持仓中但entry_time=0，丢弃该状态", ps.position);
             } else {
-                log::info!("恢复持仓状态: {:?} | 入场价: {:.2}", ps.position, ps.entry_price);
+                log::info!("恢复持仓状态: {:?} | 入场价: {:.2} | 路径:{} | 评分:{} | 入场ATR:{:.1}",
+                    ps.position, ps.entry_price, ps.entry_path, ps.entry_score, ps.entry_atr);
                 state.position = ps.position;
                 state.entry_price = ps.entry_price;
                 state.entry_time = ps.entry_time;
@@ -226,6 +245,16 @@ impl StrategyState {
                 state.daily_trades = ps.daily_trades;
                 state.daily_pnl = ps.daily_pnl;
                 state.last_day = ps.last_day;
+                state.entry_score = ps.entry_score;
+                state.entry_path = ps.entry_path;
+                state.entry_atr = ps.entry_atr;
+                // 恢复追踪止损状态
+                state.highest_since_entry = ps.highest_since_entry;
+                state.lowest_since_entry = ps.lowest_since_entry;
+                state.trailing_active = ps.trailing_active;
+                state.breakeven_active = ps.breakeven_active;
+                log::info!("  └─ 追踪止损状态: trailing_active={} breakeven_active={} 最高价:{:.2} 最低价:{:.2}",
+                    ps.trailing_active, ps.breakeven_active, ps.highest_since_entry, ps.lowest_since_entry);
             }
         }
         
@@ -242,6 +271,14 @@ impl StrategyState {
             daily_trades: self.daily_trades,
             daily_pnl: self.daily_pnl,
             last_day: self.last_day,
+            entry_score: self.entry_score,
+            entry_path: self.entry_path.clone(),
+            entry_atr: self.entry_atr,
+            // 保存追踪止损状态
+            highest_since_entry: self.highest_since_entry,
+            trailing_active: self.trailing_active,
+            breakeven_active: self.breakeven_active,
+            lowest_since_entry: self.lowest_since_entry,
         }
     }
 
@@ -476,16 +513,17 @@ impl MomentumStrategy {
             let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
             let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
-            // ATR动态止损
+            // ATR动态止损（使用max(当前ATR, 入场ATR)防止ATR收缩导致止损过早触发）
             let current_atr = state.atr_5m.value().unwrap_or(0.0);
-            let use_atr = self.config.use_atr_stops && current_atr > 0.0;
+            let effective_atr = current_atr.max(state.entry_atr); // 核心修复：不允许止损收紧
+            let use_atr = self.config.use_atr_stops && effective_atr > 0.0;
 
             let dynamic_sl = if use_atr {
                 // ATR基础止损价
-                let atr_sl = state.entry_price - self.config.atr_stop_multiplier * current_atr;
+                let atr_sl = state.entry_price - self.config.atr_stop_multiplier * effective_atr;
                 // ATR追踪止损：浮盈超过 N*ATR 后开启
-                let atr_trailing_trigger = self.config.atr_trailing_multiplier * current_atr;
-                let atr_trailing_dist = self.config.atr_trailing_distance * current_atr;
+                let atr_trailing_trigger = self.config.atr_trailing_multiplier * effective_atr;
+                let atr_trailing_dist = self.config.atr_trailing_distance * effective_atr;
                 let profit_amount = state.highest_since_entry - state.entry_price;
                 if profit_amount >= atr_trailing_trigger {
                     if !state.trailing_active {
@@ -559,10 +597,10 @@ impl MomentumStrategy {
                 let net_pnl_pct = pnl_pct - self.config.round_trip_fee_pct;
                 let net_pnl_usdt = self.config.quantity_per_trade * state.entry_price * net_pnl_pct / 100.0;
                 let hold_min = hold_secs / 60;
-                log::info!("🔴 [平多] {} | {:.2}→{:.2} | 毛:{:+.3}% 净:{:+.3}%({:+.2}U) | 原因:{} | 持仓:{}min({}s) | 峰值:{:.2}%(动态SL:{:.2} ATR:{:.1}) | [入场路径:{} 评分:{}] | 今日:{}笔{:+.3}%({:+.2}U)",
+                log::info!("🔴 [平多] {} | {:.2}→{:.2} | 毛:{:+.3}% 净:{:+.3}%({:+.2}U) | 原因:{} | 持仓:{}min({}s) | 峰值:{:.2}%(动态SL:{:.2} ATR:{:.1}/入场:{:.1}) | [入场路径:{} 评分:{}] | 今日:{}笔{:+.3}%({:+.2}U)",
                     self.config.symbol, state.entry_price, current_price, pnl_pct,
                     net_pnl_pct, net_pnl_usdt, reason, hold_min, hold_secs,
-                    highest_pnl_pct, dynamic_sl, current_atr,
+                    highest_pnl_pct, dynamic_sl, current_atr, state.entry_atr,
                     state.entry_path, state.entry_score,
                     state.daily_trades, state.daily_pnl + net_pnl_pct,
                     state.daily_pnl_usdt + net_pnl_usdt);
@@ -621,12 +659,13 @@ impl MomentumStrategy {
 
             let dynamic_sl = {
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
-                let use_atr = self.config.use_atr_stops && current_atr > 0.0;
+                let effective_atr = current_atr.max(state.entry_atr);
+                let use_atr = self.config.use_atr_stops && effective_atr > 0.0;
                 if use_atr {
                     // ATR基础止损价（做空：入场价 + N*ATR）
-                    let atr_sl = state.entry_price + self.config.atr_stop_multiplier * current_atr;
-                    let atr_trailing_trigger = self.config.atr_trailing_multiplier * current_atr;
-                    let atr_trailing_dist = self.config.atr_trailing_distance * current_atr;
+                    let atr_sl = state.entry_price + self.config.atr_stop_multiplier * effective_atr;
+                    let atr_trailing_trigger = self.config.atr_trailing_multiplier * effective_atr;
+                    let atr_trailing_dist = self.config.atr_trailing_distance * effective_atr;
                     let profit_amount = state.entry_price - state.lowest_since_entry;
                     if profit_amount >= atr_trailing_trigger {
                         if !state.trailing_active {
@@ -699,10 +738,10 @@ impl MomentumStrategy {
                 let short_atr = state.atr_5m.value().unwrap_or(0.0);
                 let net_pnl_usdt = self.config.quantity_per_trade * state.entry_price * net_pnl_pct / 100.0;
                 let hold_min = hold_secs / 60;
-                log::info!("🔴 [平空] {} | {:.2}→{:.2} | 毛:{:+.3}% 净:{:+.3}%({:+.2}U) | 原因:{} | 持仓:{}min({}s) | 峰值:{:.2}%(动态SL:{:.2} ATR:{:.1}) | [入场路径:{} 评分:{}] | 今日:{}笔{:+.3}%({:+.2}U)",
+                log::info!("🔴 [平空] {} | {:.2}→{:.2} | 毛:{:+.3}% 净:{:+.3}%({:+.2}U) | 原因:{} | 持仓:{}min({}s) | 峰值:{:.2}%(动态SL:{:.2} ATR:{:.1}/入场:{:.1}) | [入场路径:{} 评分:{}] | 今日:{}笔{:+.3}%({:+.2}U)",
                     self.config.symbol, state.entry_price, current_price, pnl_pct,
                     net_pnl_pct, net_pnl_usdt, reason, hold_min, hold_secs,
-                    lowest_pnl_pct, dynamic_sl, short_atr,
+                    lowest_pnl_pct, dynamic_sl, short_atr, state.entry_atr,
                     state.entry_path, state.entry_score,
                     state.daily_trades, state.daily_pnl + net_pnl_pct,
                     state.daily_pnl_usdt + net_pnl_usdt);
@@ -858,9 +897,10 @@ impl MomentumStrategy {
             if volatility_normal { entry_score += 10; }
 
             // 趋势入场：评分达标 + 趋势环境确认
+            // RSI反弹路径额外要求RSI<60，防止反弹已接近尾声时追进
             let trend_entry_signal = long_trend_env_ok
                 && entry_score >= self.config.entry_score_threshold
-                && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
+                && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support && rsi < 60.0)
                     || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
 
             // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
@@ -903,6 +943,7 @@ impl MomentumStrategy {
                     ema50_macro_rising, long_trend_env_ok);
                 state.entry_score = entry_score;
                 state.entry_path = entry_path.to_string();
+                state.entry_atr = current_atr; // 记录入场ATR快照，出场时取max防止收缩
 
                 state.position = Position::Long;
                 state.entry_price = entry_price;
@@ -972,6 +1013,7 @@ impl MomentumStrategy {
                         state.daily_trades + 1);
                     state.entry_score = 0;
                     state.entry_path = short_path.to_string();
+                    state.entry_atr = current_atr; // 记录入场ATR快照
 
                     state.position = Position::Short;
                     state.entry_price = entry_price;
@@ -1095,6 +1137,14 @@ impl MomentumStrategy {
             log::warn!("⚠️ 平仓失败回滚 | {} | 恢复{:?}持仓 | 入场价: {:.2} | 60s熔断({}/3) | 原因: {}",
                 self.config.symbol, original_position, state.entry_price,
                 state.consecutive_exit_failures, event.reason);
+            // 恢复追踪止损状态（使用当前价格作为基准，因为回滚时无法确定回滚前的精确峰值）
+            let current_price = state.best_bid.max(0.0001); // 使用当前盘口价
+            if original_position == Position::Long {
+                state.highest_since_entry = state.highest_since_entry.max(current_price);
+            } else {
+                state.lowest_since_entry = if state.lowest_since_entry == 0.0 { current_price } else { state.lowest_since_entry.min(current_price) };
+            }
+            // 保持原有的trailing_active和breakeven_active状态不变
             state.position = original_position;
             // 保存回滚后的状态
             let snap = state.snapshot();

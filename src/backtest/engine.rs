@@ -78,6 +78,9 @@ struct EngineState {
     atr_5m: ATR,
     adx_5m: ADX,
     
+    // 入场ATR快照（防止ATR收缩导致止损过早触发）
+    entry_atr: f64,
+    
     // 预热
     kline_1m_count: usize,
     kline_5m_count: usize,
@@ -118,6 +121,7 @@ impl EngineState {
             last_exit_was_stoploss: false,
             atr_5m: ATR::new(14, 100),
             adx_5m: ADX::new(14),
+            entry_atr: 0.0,
             kline_1m_count: 0,
             kline_5m_count: 0,
         }
@@ -263,17 +267,18 @@ impl BacktestEngine {
                 state.highest_since_entry = state.highest_since_entry.max(kline.high);
                 let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
-                // ATR动态止损计算
+                // ATR动态止损计算（使用max(当前ATR, 入场ATR)防止收缩）
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
-                let use_atr = self.config.strategy.use_atr_stops && current_atr > 0.0;
+                let effective_atr = current_atr.max(state.entry_atr);
+                let use_atr = self.config.strategy.use_atr_stops && effective_atr > 0.0;
 
                 // 计算动态止损价
                 let dynamic_sl = if use_atr {
                     // ATR基础止损价
-                    let atr_sl = state.entry_price - self.config.strategy.atr_stop_multiplier * current_atr;
+                    let atr_sl = state.entry_price - self.config.strategy.atr_stop_multiplier * effective_atr;
                     // ATR追踪止损：浮盈超过 N*ATR 后开启
-                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * current_atr;
-                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * current_atr;
+                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * effective_atr;
+                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * effective_atr;
                     let profit_amount = state.highest_since_entry - state.entry_price;
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
@@ -369,12 +374,13 @@ impl BacktestEngine {
                 let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
 
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
-                let use_atr = self.config.strategy.use_atr_stops && current_atr > 0.0;
+                let effective_atr = current_atr.max(state.entry_atr);
+                let use_atr = self.config.strategy.use_atr_stops && effective_atr > 0.0;
 
                 let dynamic_sl = if use_atr {
-                    let atr_sl = state.entry_price + self.config.strategy.atr_stop_multiplier * current_atr;
-                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * current_atr;
-                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * current_atr;
+                    let atr_sl = state.entry_price + self.config.strategy.atr_stop_multiplier * effective_atr;
+                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * effective_atr;
+                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * effective_atr;
                     let profit_amount = state.entry_price - state.lowest_since_entry;
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
@@ -537,9 +543,10 @@ impl BacktestEngine {
                 let breakout_slope_ok = ema21_slope > self.config.strategy.breakout_min_slope;
 
                 // 趋势入场：评分达标 + 趋势环境确认
+                // RSI反弹路径额外要求RSI<60
                 let trend_entry_signal = long_trend_env_ok
                     && entry_score >= self.config.strategy.entry_score_threshold
-                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
+                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support && rsi < 60.0)
                         || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
 
                 // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
@@ -564,6 +571,7 @@ impl BacktestEngine {
                     state.rsi_oversold_bars = 0;
                     state.last_trade_time = timestamp;
                     state.daily_trades += 1;
+                    state.entry_atr = state.atr_5m.value().unwrap_or(0.0);
                 } else if self.config.strategy.allow_short {
                     // 做空入场（与实盘momentum_strategy.rs L864-895一致）
                     let price_below_ema50_pct = if ema_trend > 0.0 {
@@ -606,6 +614,7 @@ impl BacktestEngine {
                         state.rsi_oversold_bars = 0;
                         state.last_trade_time = timestamp;
                         state.daily_trades += 1;
+                        state.entry_atr = state.atr_5m.value().unwrap_or(0.0);
                     }
                 }
             }
@@ -1095,12 +1104,13 @@ impl BacktestEngine {
                 let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
-                let use_atr = strategy.use_atr_stops && current_atr > 0.0;
+                let effective_atr = current_atr.max(state.entry_atr);
+                let use_atr = strategy.use_atr_stops && effective_atr > 0.0;
 
                 let dynamic_sl = if use_atr {
-                    let atr_sl = state.entry_price - strategy.atr_stop_multiplier * current_atr;
-                    let atr_trailing_trigger = strategy.atr_trailing_multiplier * current_atr;
-                    let atr_trailing_dist = strategy.atr_trailing_distance * current_atr;
+                    let atr_sl = state.entry_price - strategy.atr_stop_multiplier * effective_atr;
+                    let atr_trailing_trigger = strategy.atr_trailing_multiplier * effective_atr;
+                    let atr_trailing_dist = strategy.atr_trailing_distance * effective_atr;
                     let profit_amount = state.highest_since_entry - state.entry_price;
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
@@ -1184,12 +1194,13 @@ impl BacktestEngine {
                 let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
 
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
-                let use_atr = strategy.use_atr_stops && current_atr > 0.0;
+                let effective_atr = current_atr.max(state.entry_atr);
+                let use_atr = strategy.use_atr_stops && effective_atr > 0.0;
 
                 let dynamic_sl = if use_atr {
-                    let atr_sl = state.entry_price + strategy.atr_stop_multiplier * current_atr;
-                    let atr_trailing_trigger = strategy.atr_trailing_multiplier * current_atr;
-                    let atr_trailing_dist = strategy.atr_trailing_distance * current_atr;
+                    let atr_sl = state.entry_price + strategy.atr_stop_multiplier * effective_atr;
+                    let atr_trailing_trigger = strategy.atr_trailing_multiplier * effective_atr;
+                    let atr_trailing_dist = strategy.atr_trailing_distance * effective_atr;
                     let profit_amount = state.entry_price - state.lowest_since_entry;
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
@@ -1344,7 +1355,7 @@ impl BacktestEngine {
 
                 let trend_entry_signal = long_trend_env_ok
                     && entry_score >= strategy.entry_score_threshold
-                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support)
+                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support && rsi < 60.0)
                         || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
 
                 // 均值回归入场信号
@@ -1369,6 +1380,7 @@ impl BacktestEngine {
                     state.rsi_oversold_bars = 0;
                     state.last_trade_time = timestamp;
                     state.daily_trades += 1;
+                    state.entry_atr = state.atr_5m.value().unwrap_or(0.0);
                 } else if strategy.allow_short {
                     // 做空入场（趋势环境过滤）
                     let price_below_ema50_pct = if ema_trend > 0.0 {
@@ -1411,6 +1423,7 @@ impl BacktestEngine {
                         state.rsi_oversold_bars = 0;
                         state.last_trade_time = timestamp;
                         state.daily_trades += 1;
+                        state.entry_atr = state.atr_5m.value().unwrap_or(0.0);
                     }
                 }
             }
