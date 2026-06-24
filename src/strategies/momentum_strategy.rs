@@ -292,8 +292,19 @@ impl MomentumStrategy {
         log::info!("   交易对: {}({}) | 每笔: {}", config.symbol, direction, config.quantity_per_trade);
         log::info!("   止盈: {}% | 止损: {}% | 冷却: {}秒", config.take_profit_pct, config.stop_loss_pct, config.cooldown_seconds);
 
+        let mut state = StrategyState::new(&state_file);
+        
+        // 现货模式保护：如果状态文件恢复出 Position::Short 但当前禁止做空，丢弃异常状态
+        if state.position == Position::Short && !config.allow_short {
+            log::error!("⚠️ 状态文件异常: 恢复出空头持仓但当前为现货模式(allow_short=false)，丢弃该状态 | {} @ {:.2}",
+                config.symbol, state.entry_price);
+            state.position = Position::None;
+            state.entry_price = 0.0;
+            state.entry_time = 0;
+        }
+
         Self {
-            state: Arc::new(Mutex::new(StrategyState::new(&state_file))),
+            state: Arc::new(Mutex::new(state)),
             state_file,
             config,
             event_bus,

@@ -127,6 +127,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|p| p.symbol.clone())
         .collect();
 
+    // 现货模式安全检查：现货API不支持裸卖空，强制禁用allow_short
+    let is_spot_mode = !config.binance.testnet; // 实盘连接api.binance.com即现货
+    if is_spot_mode {
+        for pair in &trading_pairs {
+            if pair.allow_short {
+                log::error!("\u{26a0}\u{fe0f} 配置错误: {} 启用了allow_short=true，但当前连接的是现货API(api.binance.com)，现货不支持裸卖空！已强制禁用做空。", pair.symbol);
+            }
+        }
+    }
+    // 强制覆盖: 现货模式下all_short必须为false
+    let trading_pairs: Vec<TradingPairConfig> = trading_pairs.into_iter()
+        .map(|mut p| {
+            if is_spot_mode && p.allow_short {
+                p.allow_short = false;
+            }
+            p
+        })
+        .collect();
+
     log::info!("启动多品种交易 | 品种数: {} | {}",
         symbols.len(),
         symbols.join(", "));

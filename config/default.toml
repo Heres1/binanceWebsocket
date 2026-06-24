@@ -53,7 +53,7 @@ trailing_trigger_pct = 1.0
 trailing_distance_pct = 0.8
 # 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
 round_trip_fee_pct = 0.1
-# 是否允许做空 (纯做多策略，熊市保本牛市盈利)
+# 是否允许做空 (现货模式下必须为false！现货API不支持裸卖空，仅在连接合约API fapi.binance.com时可启用)
 allow_short = false
 # 策略类型
 strategy_type = "Breakout"
