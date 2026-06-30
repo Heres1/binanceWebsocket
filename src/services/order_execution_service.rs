@@ -2,17 +2,15 @@
 //!
 //! 接收交易信号，通过风控检查后调用 Binance API 下单
 
-use std::sync::Arc;
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
-use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
-use crate::events::{
-    DomainEvent, TradingSignalEvent, OrderFilledEvent, OrderRejectedEvent
-};
-use crate::error::{DomainError, EventBusError, ServiceError};
 use crate::clients::BinanceClient;
+use crate::error::{DomainError, EventBusError, ServiceError};
+use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
+use crate::events::{DomainEvent, OrderFilledEvent, OrderRejectedEvent, TradingSignalEvent};
 use crate::risk::RiskMonitorService;
 
 /// 账户余额缓存
@@ -41,7 +39,7 @@ impl AccountBalance {
             sol_locked: 0.0,
         }
     }
-    
+
     /// 当前总持仓价值估算 (基于信号价格的粗略估算)
     pub fn position_value(&self, btc_price: f64) -> f64 {
         (self.btc_free + self.btc_locked) * btc_price
@@ -60,9 +58,9 @@ pub struct OrderExecutionService {
 /// 按交易对的 LOT_SIZE stepSize 向下取整
 fn round_step_size(quantity: f64, symbol: &str) -> f64 {
     let decimals: u32 = match symbol {
-        "BTCUSDT" => 5,  // step = 0.00001
-        "ETHUSDT" => 4,  // step = 0.0001
-        "SOLUSDT" => 2,  // step = 0.01
+        "BTCUSDT" => 5, // step = 0.00001
+        "ETHUSDT" => 4, // step = 0.0001
+        "SOLUSDT" => 2, // step = 0.01
         _ => 5,
     };
     let factor = 10_f64.powi(decimals as i32);
@@ -113,8 +111,13 @@ impl OrderExecutionService {
                         _ => {}
                     }
                 }
-                log::info!("账户余额初始化 | USDT: {:.2} | BTC: {:.6} | ETH: {:.4} | SOL: {:.2}",
-                    bal.available_usdt, bal.btc_free, bal.eth_free, bal.sol_free);
+                log::info!(
+                    "账户余额初始化 | USDT: {:.2} | BTC: {:.6} | ETH: {:.4} | SOL: {:.2}",
+                    bal.available_usdt,
+                    bal.btc_free,
+                    bal.eth_free,
+                    bal.sol_free
+                );
                 Ok(())
             }
             Err(e) => {
@@ -128,16 +131,16 @@ impl OrderExecutionService {
     pub fn start_balance_sync_task(&self) {
         let client = self.client.clone();
         let balance = self.balance.clone();
-        
+
         tokio::spawn(async move {
             let base_interval = 60u64;
             let mut current_interval = base_interval;
             let max_interval = 300u64; // 失败时最大间隔 5 分钟
             let mut consecutive_failures: u32 = 0;
-            
+
             // 等待第一个周期
             tokio::time::sleep(Duration::from_secs(base_interval)).await;
-            
+
             loop {
                 // 速率限制检查：如果客户端处于冷却期，直接跳过本次同步
                 if client.is_rate_limited() {
@@ -148,7 +151,7 @@ impl OrderExecutionService {
                     tokio::time::sleep(Duration::from_secs(remaining.max(60))).await;
                     continue;
                 }
-                
+
                 match client.get_account().await {
                     Ok(account) => {
                         let mut bal = balance.lock().await;
@@ -173,8 +176,11 @@ impl OrderExecutionService {
                                 _ => {}
                             }
                         }
-                        log::debug!("定期余额同步 | USDT: {:.2} | BTC: {:.6}",
-                            bal.available_usdt, bal.btc_free);
+                        log::debug!(
+                            "定期余额同步 | USDT: {:.2} | BTC: {:.6}",
+                            bal.available_usdt,
+                            bal.btc_free
+                        );
                         // 成功时重置退避
                         if consecutive_failures > 0 {
                             log::info!("余额同步恢复正常 | 之前连续失败{}次", consecutive_failures);
@@ -186,8 +192,12 @@ impl OrderExecutionService {
                         consecutive_failures += 1;
                         // 日志防抖：前3次每次都写，之后每10次写一次
                         if consecutive_failures <= 3 || consecutive_failures % 10 == 0 {
-                            log::warn!("定期余额同步失败(连续{}次): {} | 下次重试: {}s后",
-                                consecutive_failures, e, current_interval * 2);
+                            log::warn!(
+                                "定期余额同步失败(连续{}次): {} | 下次重试: {}s后",
+                                consecutive_failures,
+                                e,
+                                current_interval * 2
+                            );
                         }
                         // 指数退避: 60 → 120 → 240 → 300(封顶)
                         current_interval = (current_interval * 2).min(max_interval);
@@ -199,15 +209,12 @@ impl OrderExecutionService {
     }
 
     /// 执行交易信号 - 使用市价单快速成交
-    pub async fn execute_signal(
-        &self,
-        signal: &TradingSignalEvent,
-    ) -> Result<(), DomainError> {
+    pub async fn execute_signal(&self, signal: &TradingSignalEvent) -> Result<(), DomainError> {
         // 1. 计算订单金额
-        let quantity = signal.suggested_quantity.ok_or_else(|| {
-            ServiceError::Order("交易信号缺少数量".to_string())
-        })?;
-        
+        let quantity = signal
+            .suggested_quantity
+            .ok_or_else(|| ServiceError::Order("交易信号缺少数量".to_string()))?;
+
         let order_amount = quantity * signal.suggested_price;
 
         // 2. 判断是否为平仓操作（SELL/COVER不需要USDT，只需持有资产）
@@ -223,16 +230,30 @@ impl OrderExecutionService {
             let current_position = bal.position_value(signal.suggested_price);
             drop(bal);
 
-            log::debug!("风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
-                available_balance, current_position, order_amount);
-            if let Err(alert) = self.risk_service.pre_trade_check(
-                order_amount,
+            log::debug!(
+                "风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
                 available_balance,
                 current_position,
-            ).await {
-                log::warn!("风控拦截 | {} | {} | 金额: {:.2} | 原因: {}",
-                    signal.symbol, signal.signal_type, order_amount, alert.message);
-                
+                order_amount
+            );
+            if let Err(alert) = self
+                .risk_service
+                .pre_trade_check(order_amount, available_balance, current_position)
+                .await
+            {
+                log::warn!(
+                    "风控拦截 | {} | {} | 金额: {:.2} | 原因: {}",
+                    signal.symbol,
+                    signal.signal_type,
+                    order_amount,
+                    alert.message
+                );
+                log::info!(
+                    "本次信号已拒绝并通知策略回滚 | {} | {} | 可用资金不足时不会继续提交订单",
+                    signal.symbol,
+                    signal.signal_type
+                );
+
                 let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
                     order_id: Some(signal.signal_id.clone()),
                     symbol: signal.symbol.clone(),
@@ -240,11 +261,13 @@ impl OrderExecutionService {
                     error_code: None,
                     timestamp: chrono::Utc::now().timestamp_millis() as u64,
                 });
-                
-                self.event_bus.publish(reject_event).await
+
+                self.event_bus
+                    .publish(reject_event)
+                    .await
                     .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
-                
-                return Err(ServiceError::Order(format!("风控拦截: {}", alert.message)).into());
+
+                return Ok(());
             }
         }
 
@@ -263,30 +286,42 @@ impl OrderExecutionService {
             let q = quantity.min(asset_free);
             if q < quantity * 0.5 {
                 // 如果实际持有量不到信号数量的一半，说明余额异常
-                log::error!("平仓异常 | {} | 信号量: {:.6} | 实际持有: {:.6}，跳过",
-                    signal.symbol, quantity, asset_free);
+                log::error!(
+                    "平仓异常 | {} | 信号量: {:.6} | 实际持有: {:.6}，跳过",
+                    signal.symbol,
+                    quantity,
+                    asset_free
+                );
                 return Err(ServiceError::Order(format!(
-                    "持有量不足: 需要 {:.6}，实际 {:.6}", quantity, asset_free
-                )).into());
+                    "持有量不足: 需要 {:.6}，实际 {:.6}",
+                    quantity, asset_free
+                ))
+                .into());
             }
             // 按交易对 LOT_SIZE stepSize 向下取整，确保符合交易所精度要求
             let rounded = round_step_size(q, &signal.symbol);
             if rounded <= 0.0 {
-                log::error!("平仓异常 | {} | 取整后数量为0 | 原始: {:.6}", signal.symbol, q);
-                return Err(ServiceError::Order(format!(
-                    "取整后数量为0: 原始 {:.6}", q
-                )).into());
+                log::error!(
+                    "平仓异常 | {} | 取整后数量为0 | 原始: {:.6}",
+                    signal.symbol,
+                    q
+                );
+                return Err(ServiceError::Order(format!("取整后数量为0: 原始 {:.6}", q)).into());
             }
             if rounded < q {
-                log::info!("平仓量调整 | {} | {:.6} -> {:.6} (LOT_SIZE取整)",
-                    signal.symbol, q, rounded);
+                log::info!(
+                    "平仓量调整 | {} | {:.6} -> {:.6} (LOT_SIZE取整)",
+                    signal.symbol,
+                    q,
+                    rounded
+                );
             }
             rounded
         } else {
             // 开仓也需要取整
             round_step_size(quantity, &signal.symbol)
         };
-        
+
         // 5. 调用 API 下单 - 使用市价单快速成交
         // BUY/COVER(买入) vs SELL/SHORT(卖出)
         let side = if signal.signal_type == "BUY" || signal.signal_type == "COVER" {
@@ -294,25 +329,29 @@ impl OrderExecutionService {
         } else {
             "SELL"
         };
-        
-        let order_result = self.client.place_order(
-            &signal.symbol,
-            side,
-            "MARKET",  // 市价单快速成交
-            actual_quantity,
-            None,       // 市价单不需要价格
-            None,       // 市价单不需要TIF
-        ).await?;
+
+        let order_result = self
+            .client
+            .place_order(
+                &signal.symbol,
+                side,
+                "MARKET", // 市价单快速成交
+                actual_quantity,
+                None, // 市价单不需要价格
+                None, // 市价单不需要TIF
+            )
+            .await?;
 
         // 5. 记录订单到风控
         self.risk_service.record_order(order_amount).await;
 
         // 6. 解析实际成交数据
-        let fill_qty = order_result.executed_qty.parse::<f64>()
-            .unwrap_or(quantity);
-        let actual_quote_qty = order_result.cummulative_quote_qty.parse::<f64>()
+        let fill_qty = order_result.executed_qty.parse::<f64>().unwrap_or(quantity);
+        let actual_quote_qty = order_result
+            .cummulative_quote_qty
+            .parse::<f64>()
             .unwrap_or(order_amount); // 实际花费/收入的 USDT
-        // 市价单实际成交均价 = 总成交额 / 总成交量
+                                      // 市价单实际成交均价 = 总成交额 / 总成交量
         let fill_price = if fill_qty > 0.0 {
             actual_quote_qty / fill_qty
         } else {
@@ -321,10 +360,12 @@ impl OrderExecutionService {
 
         // 从API返回的fills中获取实际手续费
         let (commission, commission_asset) = if let Some(ref fills) = order_result.fills {
-            let total_commission: f64 = fills.iter()
+            let total_commission: f64 = fills
+                .iter()
                 .filter_map(|f| f.commission.parse::<f64>().ok())
                 .sum();
-            let asset = fills.first()
+            let asset = fills
+                .first()
                 .map(|f| f.commission_asset.clone())
                 .unwrap_or_else(|| "USDT".to_string());
             (total_commission, asset)
@@ -371,13 +412,22 @@ impl OrderExecutionService {
             is_maker: false,
             timestamp: chrono::Utc::now().timestamp_millis() as u64,
         });
-        
-        self.event_bus.publish(fill_event).await
+
+        self.event_bus
+            .publish(fill_event)
+            .await
             .map_err(|e| ServiceError::Order(format!("发布事件失败: {}", e)))?;
 
-        log::info!("✅ 成交 | {} {} | 均价: {:.2} | 量: {:.6} | 手续费: {:.6} {} | ID: {}",
-            side, order_result.symbol, fill_price, fill_qty,
-            commission, commission_asset, order_result.order_id);
+        log::info!(
+            "✅ 成交 | {} {} | 均价: {:.2} | 量: {:.6} | 手续费: {:.6} {} | ID: {}",
+            side,
+            order_result.symbol,
+            fill_price,
+            fill_qty,
+            commission,
+            commission_asset,
+            order_result.order_id
+        );
 
         Ok(())
     }
@@ -391,14 +441,18 @@ impl EventHandler for OrderExecutionService {
             if !self.symbols.contains(&signal.symbol) {
                 return Ok(());
             }
-            
-            log::info!("→ 执行信号: {} | {} @ {:.2} | 数量: {:.6}",
-            signal.signal_type, signal.symbol, signal.suggested_price,
-            signal.suggested_quantity.unwrap_or(0.0));
-            
+
+            log::info!(
+                "→ 执行信号: {} | {} @ {:.2} | 数量: {:.6}",
+                signal.signal_type,
+                signal.symbol,
+                signal.suggested_price,
+                signal.suggested_quantity.unwrap_or(0.0)
+            );
+
             if let Err(e) = self.execute_signal(signal).await {
                 log::error!("订单执行失败: {}", e);
-                
+
                 // 所有失败都发布OrderRejected事件，通知策略回滚状态
                 let reject_event = DomainEvent::OrderRejected(OrderRejectedEvent {
                     order_id: Some(signal.signal_id.clone()),
@@ -410,7 +464,7 @@ impl EventHandler for OrderExecutionService {
                 let _ = self.event_bus.publish(reject_event).await;
             }
         }
-        
+
         Ok(())
     }
 

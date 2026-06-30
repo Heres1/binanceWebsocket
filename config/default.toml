@@ -25,14 +25,15 @@ testnet = false
 [strategy]
 # 交易对
 symbol = "BTCUSDT"
-# 每笔交易数量 (BTC) - $200账户适度激进
-quantity_per_trade = 0.002
+# 每笔交易数量 (BTC) - 按当前现货可用资金约62U控制，预留手续费和价格波动缓冲
+quantity_per_trade = 0.0008
 # 硬止盈上限
+# 追踪止损为主，硬止盈只作为极端趋势保护
 take_profit_pct = 3.0
 # 初始止损百分比
 stop_loss_pct = 1.5
-# 最大持仓时间(秒) - 12小时
-max_hold_seconds = 43200
+# 最大持仓时间(秒) - 6小时，避免弱势单长期占用并拖成大亏
+max_hold_seconds = 21600
 # 交易冷却时间(秒)
 cooldown_seconds = 120
 # 日最大交易次数
@@ -43,14 +44,14 @@ max_daily_loss_pct = 2.0
 rsi_oversold = 40.0
 # RSI超买线 (禁用RSI退出)
 rsi_overbought = 100.0
-# 买卖量比阈值 (1.2=要求明确买盘优势才入场)
-volume_ratio_threshold = 1.2
-# 保本止损触发
-breakeven_trigger_pct = 0.8
-# 追踪止损触发
-trailing_trigger_pct = 1.0
+# 买卖量比阈值 (1.8=要求更明确买盘优势才入场)
+volume_ratio_threshold = 1.8
+# 保本止损触发：更早覆盖手续费，提升净收益稳定性
+breakeven_trigger_pct = 0.5
+# 追踪止损触发：更早锁定浮盈
+trailing_trigger_pct = 0.8
 # 追踪止损回撒距离
-trailing_distance_pct = 0.8
+trailing_distance_pct = 0.5
 # 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
 round_trip_fee_pct = 0.1
 # 是否允许做空 (现货模式下必须为false！现货API不支持裸卖空，仅在连接合约API fapi.binance.com时可启用)
@@ -61,24 +62,24 @@ strategy_type = "Breakout"
 stale_exit_seconds = 999999
 # 僵尸判定门槛(%)
 stale_pnl_threshold_pct = 0.3
-# EMA趋势强度最低门槛(%)：要求EMA7/EMA21有有意义的分离，避免震荡市假信号
-min_trend_strength_pct = 0.03
-# 价格距离EMA50最大百分比：趋势过度延伸过滤（防止趋势末端弱突破）
-max_ema50_distance_pct = 1.0
+# EMA趋势强度最低门槛(%)：提高趋势质量，过滤弱趋势小盈利/假信号
+min_trend_strength_pct = 0.06
+# 价格距离EMA50最大百分比：更严格过滤趋势末端追高
+max_ema50_distance_pct = 0.6
 # 止损后延长冷却时间(秒) - 防止止损后立即重新入场
 post_stoploss_cooldown_seconds = 600
-# 均值回归最低斜率门槛(%) - 防止在暴跌中接飞刀(EMA21斜率必须 > 此值)
-mean_revert_min_slope = -0.10
-# 突破路径最低斜率门槛(%) - 要求更强趋势确认
-breakout_min_slope = 0.05
+# 均值回归最低斜率门槛(%) - 只允许上升动能中的回踩，不在下跌中接飞刀
+mean_revert_min_slope = 0.03
+# 突破路径最低斜率门槛(%) - 要求更强趋势确认，过滤震荡假突破
+breakout_min_slope = 0.08
 
 # === ATR动态止损 ===
-# 止损距离 = N * ATR (8.5x适合BTC 5分钟级别，平衡保护与呼吸空间)
-atr_stop_multiplier = 8.5
-# 追踪止损触发 = 浮盈达到 N * ATR 后开启 (3.0 = 早追踪，捕获更多小移动)
-atr_trailing_multiplier = 3.0
-# 追踪止损距离 = N * ATR (2.0 = 平衡，避免过早止出)
-atr_trailing_distance = 2.0
+# 止损距离 = N * ATR，收紧单笔亏损，避免一笔大亏吃掉多笔小盈
+atr_stop_multiplier = 5.0
+# 追踪止损触发 = 浮盈达到 N * ATR 后开启，提前锁定趋势段利润
+atr_trailing_multiplier = 2.0
+# 追踪止损距离 = N * ATR，减少回吐
+atr_trailing_distance = 1.5
 # 是否启用ATR止损 (false=回退到固定%止损)
 use_atr_stops = true
 
@@ -95,15 +96,15 @@ atr_percentile_low = 0.0
 atr_percentile_high = 100.0
 
 # === 多因子评分入场 ===
-# 入场最低分数(满分100，低于此值不入场)
-entry_score_threshold = 55
+# 入场最低分数(满分100，低于此值不入场)：只做更高共振信号
+entry_score_threshold = 75
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 
 # 多品种交易对配置
 [[trading_pairs]]
 symbol = "BTCUSDT"
-quantity_per_trade = 0.002    # ~$128 @ $64000 (64%资金，保守中带激进)
+quantity_per_trade = 0.0008    # 当前现货余额约62U，单笔约48U，避免资金不足反复拒单
 allow_short = false
 
 # ETH/SOL在当前熊市不盈利，暂停交易
@@ -118,10 +119,10 @@ allow_short = false
 # allow_short = false
 
 [risk]
-# 最大持仓金额 (USDT) - 3品种并发$64+$35+$20=$119
-max_position_usdt = 300.0
-# 单笔最大金额 (USDT) - 覆盖BTC 0.002×$70k=$140
-max_single_order_usdt = 150.0
+# 最大持仓金额 (USDT) - 当前单品种现货小资金运行
+max_position_usdt = 120.0
+# 单笔最大金额 (USDT) - 单笔约48U，保留价格波动缓冲
+max_single_order_usdt = 80.0
 # 日亏损上限 (USDT) - $200账户保守风控
 max_daily_loss_usdt = 20.0
 # 最小下单间隔 (秒)
@@ -129,6 +130,6 @@ min_order_interval_secs = 10
 
 [network]
 # 网络连接模式: auto, direct, proxy, ssh_tunnel
-connection_mode = "ssh_tunnel"
+connection_mode = "direct"
 # 代理 URL (仅在 proxy 模式下需要)
 # proxy_url = "http://127.0.0.1:7890"

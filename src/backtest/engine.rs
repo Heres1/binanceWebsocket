@@ -555,6 +555,9 @@ impl BacktestEngine {
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
                     drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
                         && ema21_slope > self.config.strategy.mean_revert_min_slope
+                        && ema_trend > 0.0
+                        && kline.close >= ema_trend
+                        && ema50_macro_rising
                         && volatility_normal  // 波动率过滤也应用于均值回归
                 } else { false };
 
@@ -1364,6 +1367,9 @@ impl BacktestEngine {
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
                     drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
                         && ema21_slope > strategy.mean_revert_min_slope
+                        && ema_trend > 0.0
+                        && kline.close >= ema_trend
+                        && ema50_macro_rising
                         && volatility_normal
                 } else { false };
 
