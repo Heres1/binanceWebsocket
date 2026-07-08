@@ -987,7 +987,7 @@ impl MomentumStrategy {
             let long_trend_env_ok = ema_trend > 0.0
                 && price_above_ema50_pct > 0.15  // 至少高于EMA50 0.15%，避免边缘试探
                 && price_above_ema50_pct < self.config.max_ema50_distance_pct  // 趋势过度延伸过滤
-                && ema21_slope > 0.03  // 斜率>+0.03% 确认上升动能
+                && ema21_slope > self.config.mean_revert_min_slope  // 使用配置化斜率门槛，便于回测同步优化
                 && ema50_macro_rising; // EMA50宏观方向必须上升
 
             // 条件1: 5分钟趋势向上 + 趋势强度过滤
@@ -1056,7 +1056,7 @@ impl MomentumStrategy {
             }
 
             // 趋势入场：评分达标 + 趋势环境确认
-            // RSI反弹路径额外要求RSI<60，防止反弹已接近尾声时追进
+            // RSI反弹路径额外要求RSI<55，避免实盘中RSI接近60时追入反弹末端
             let trend_entry_signal = long_trend_env_ok
                 && entry_score >= self.config.entry_score_threshold
                 && ((trend_up
@@ -1064,7 +1064,7 @@ impl MomentumStrategy {
                     && rsi_recovering
                     && rsi_bounce_vr_ok
                     && bid_support
-                    && rsi < 60.0)
+                    && rsi < 55.0)
                     || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
 
             // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===

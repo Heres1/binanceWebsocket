@@ -204,7 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     println!("\n=========================================");
     println!("  动量短线交易系统已启动");
-    println!("  品种: {} | 每笔: ~$50", symbols.join(", "));
+    println!("  品种: {} | 每笔: {} BTC", symbols.join(", "), config.strategy.quantity_per_trade);
     println!("  止盈: {}% | 止损: {}% | 持仓上限: {}s",
         config.strategy.take_profit_pct, config.strategy.stop_loss_pct, config.strategy.max_hold_seconds);
     println!("  连接: {:?} | 冷却: {}s | 日限: {}次",

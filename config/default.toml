@@ -25,8 +25,8 @@ testnet = false
 [strategy]
 # 交易对
 symbol = "BTCUSDT"
-# 每笔交易数量 (BTC) - 按当前现货可用资金约62U控制，预留手续费和价格波动缓冲
-quantity_per_trade = 0.0008
+# 每笔交易数量 (BTC) - 按服务器实盘可用USDT 161.9345、BTC价约62170重配，接近全额投入并保留约2U滑点缓冲
+quantity_per_trade = 0.00256
 # 硬止盈上限
 # 追踪止损为主，硬止盈只作为极端趋势保护
 take_profit_pct = 3.0
@@ -64,8 +64,8 @@ stale_exit_seconds = 999999
 stale_pnl_threshold_pct = 0.3
 # EMA趋势强度最低门槛(%)：提高趋势质量，过滤弱趋势小盈利/假信号
 min_trend_strength_pct = 0.06
-# 价格距离EMA50最大百分比：更严格过滤趋势末端追高
-max_ema50_distance_pct = 0.6
+# 价格距离EMA50最大百分比：基于实盘亏损收紧，过滤反弹末端追高
+max_ema50_distance_pct = 0.56
 # 止损后延长冷却时间(秒) - 防止止损后立即重新入场
 post_stoploss_cooldown_seconds = 600
 # 均值回归最低斜率门槛(%) - 只允许上升动能中的回踩，不在下跌中接飞刀
@@ -104,7 +104,7 @@ entry_score_threshold = 75
 # 多品种交易对配置
 [[trading_pairs]]
 symbol = "BTCUSDT"
-quantity_per_trade = 0.0008    # 当前现货余额约62U，单笔约48U，避免资金不足反复拒单
+quantity_per_trade = 0.00256   # 按当前可用USDT约161.93U重配，单笔约159U，接近全额使用
 allow_short = false
 
 # ETH/SOL在当前熊市不盈利，暂停交易
@@ -119,12 +119,12 @@ allow_short = false
 # allow_short = false
 
 [risk]
-# 最大持仓金额 (USDT) - 当前单品种现货小资金运行
-max_position_usdt = 120.0
-# 单笔最大金额 (USDT) - 单笔约48U，保留价格波动缓冲
-max_single_order_usdt = 80.0
-# 日亏损上限 (USDT) - $200账户保守风控
-max_daily_loss_usdt = 20.0
+# 最大持仓金额 (USDT) - 当前现货总估值约195U，允许既有BTC余额+新开仓
+max_position_usdt = 215.0
+# 单笔最大金额 (USDT) - 单笔约159U，保留价格波动缓冲
+max_single_order_usdt = 175.0
+# 日亏损上限 (USDT) - 全仓后最多承受约2次常规止损
+max_daily_loss_usdt = 4.0
 # 最小下单间隔 (秒)
 min_order_interval_secs = 10
 
