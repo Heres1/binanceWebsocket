@@ -113,8 +113,10 @@ impl RSI {
                 }
             } else {
                 // 平滑计算
-                self.avg_gain = (self.avg_gain * (self.period as f64 - 1.0) + gain) / self.period as f64;
-                self.avg_loss = (self.avg_loss * (self.period as f64 - 1.0) + loss) / self.period as f64;
+                self.avg_gain =
+                    (self.avg_gain * (self.period as f64 - 1.0) + gain) / self.period as f64;
+                self.avg_loss =
+                    (self.avg_loss * (self.period as f64 - 1.0) + loss) / self.period as f64;
                 let rsi = self.calculate_rsi();
                 self.value = Some(rsi);
             }
@@ -196,7 +198,11 @@ impl VolumeRatio {
         }
 
         if sell_vol == 0.0 {
-            if buy_vol > 0.0 { 10.0 } else { 1.0 }
+            if buy_vol > 0.0 {
+                10.0
+            } else {
+                1.0
+            }
         } else {
             buy_vol / sell_vol
         }
@@ -343,15 +349,25 @@ impl ADX {
 
     /// 输入新的 (high, low, close)，返回当前 ADX 值
     pub fn update(&mut self, high: f64, low: f64, close: f64) -> f64 {
-        if let (Some(prev_h), Some(prev_l), Some(prev_c)) = (self.prev_high, self.prev_low, self.prev_close) {
+        if let (Some(prev_h), Some(prev_l), Some(prev_c)) =
+            (self.prev_high, self.prev_low, self.prev_close)
+        {
             self.count += 1;
 
             // 计算+DM和-DM
             let up_move = high - prev_h;
             let down_move = prev_l - low;
 
-            let plus_dm = if up_move > down_move && up_move > 0.0 { up_move } else { 0.0 };
-            let minus_dm = if down_move > up_move && down_move > 0.0 { down_move } else { 0.0 };
+            let plus_dm = if up_move > down_move && up_move > 0.0 {
+                up_move
+            } else {
+                0.0
+            };
+            let minus_dm = if down_move > up_move && down_move > 0.0 {
+                down_move
+            } else {
+                0.0
+            };
 
             // True Range
             let tr = (high - low)
@@ -378,7 +394,8 @@ impl ADX {
                 // Wilder 平滑
                 let n = self.period as f64;
                 self.smoothed_plus_dm = self.smoothed_plus_dm - self.smoothed_plus_dm / n + plus_dm;
-                self.smoothed_minus_dm = self.smoothed_minus_dm - self.smoothed_minus_dm / n + minus_dm;
+                self.smoothed_minus_dm =
+                    self.smoothed_minus_dm - self.smoothed_minus_dm / n + minus_dm;
                 self.smoothed_tr = self.smoothed_tr - self.smoothed_tr / n + tr;
 
                 if self.smoothed_tr > 0.0 {
@@ -471,7 +488,11 @@ mod tests {
             last_val = rsi.update(p);
         }
         // 持续上涨, RSI应该>70
-        assert!(last_val > 70.0, "RSI should be >70 for uptrend, got {}", last_val);
+        assert!(
+            last_val > 70.0,
+            "RSI should be >70 for uptrend, got {}",
+            last_val
+        );
     }
 
     #[test]
@@ -480,14 +501,14 @@ mod tests {
         // 买方主导
         vr.add_trade(1000, 5.0, false); // 买方主动
         vr.add_trade(2000, 5.0, false); // 买方主动
-        vr.add_trade(3000, 2.0, true);  // 卖方主动
+        vr.add_trade(3000, 2.0, true); // 卖方主动
         let ratio = vr.ratio();
         assert!((ratio - 5.0).abs() < 0.01); // 10/2 = 5.0
 
         // 过期测试: 窗口60s=60000ms, 新trade在ts=65000
         // cutoff = 65000 - 60000 = 5000, 所以ts=1000,2000,3000都被清除
         vr.add_trade(65000, 1.0, true); // 超出窗口
-        // 前面的数据应该被清除，只剩当前这笔
+                                        // 前面的数据应该被清除，只剩当前这笔
         assert_eq!(vr.trade_count(), 1);
     }
 
@@ -495,10 +516,10 @@ mod tests {
     fn test_atr_basic() {
         let mut atr = ATR::new(3, 100);
         // 3根K线预热
-        atr.update(110.0, 90.0, 100.0);  // TR = 20 (第一根, H-L)
-        atr.update(115.0, 95.0, 110.0);  // TR = max(20, |115-100|, |95-100|) = 20
+        atr.update(110.0, 90.0, 100.0); // TR = 20 (第一根, H-L)
+        atr.update(115.0, 95.0, 110.0); // TR = max(20, |115-100|, |95-100|) = 20
         let v = atr.update(120.0, 100.0, 115.0); // TR = max(20, |120-110|, |100-110|) = 20
-        // ATR = (20+20+20) / 3 = 20.0
+                                                 // ATR = (20+20+20) / 3 = 20.0
         assert!((v - 20.0).abs() < 0.01, "ATR should be 20.0, got {}", v);
         assert!(atr.is_ready());
 
@@ -535,8 +556,15 @@ mod tests {
             last_adx = adx.update(h, l, price);
         }
         // 强趋势下 ADX 应该 > 25
-        assert!(last_adx > 25.0, "ADX should be >25 for strong trend, got {}", last_adx);
-        assert!(adx.plus_di() > adx.minus_di(), "+DI should be > -DI in uptrend");
+        assert!(
+            last_adx > 25.0,
+            "ADX should be >25 for strong trend, got {}",
+            last_adx
+        );
+        assert!(
+            adx.plus_di() > adx.minus_di(),
+            "+DI should be > -DI in uptrend"
+        );
     }
 
     #[test]
@@ -552,7 +580,11 @@ mod tests {
         }
         // 震荡市 ADX 应该较低
         if let Some(val) = adx.value() {
-            assert!(val < 35.0, "ADX should be low for ranging market, got {}", val);
+            assert!(
+                val < 35.0,
+                "ADX should be low for ranging market, got {}",
+                val
+            );
         }
     }
 }

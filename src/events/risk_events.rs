@@ -1,5 +1,5 @@
 //! 风控事件
-//! 
+//!
 //! 包含风控检查、风控告警等事件
 
 use serde::{Deserialize, Serialize};
@@ -79,7 +79,7 @@ impl RiskAlertEvent {
         triggered_rule: String,
     ) -> Self {
         use uuid::Uuid;
-        
+
         Self {
             alert_id: Uuid::new_v4().to_string(),
             level,
@@ -93,7 +93,7 @@ impl RiskAlertEvent {
                 .as_millis() as u64,
         }
     }
-    
+
     pub fn with_suggested_action(mut self, action: String) -> Self {
         self.suggested_action = Some(action);
         self
@@ -112,7 +112,7 @@ mod tests {
             "持仓超过限制".to_string(),
             "max_position_btc <= 1.0".to_string(),
         );
-        
+
         assert_eq!(event.level, RiskLevel::High);
         assert_eq!(event.alert_type, "POSITION_LIMIT");
         matches!(event.level, RiskLevel::High);
@@ -129,7 +129,7 @@ mod tests {
             details: "资金充足".to_string(),
             timestamp: 1234567890000,
         };
-        
+
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("CapitalAdequacy"));
         assert!(json.contains("资金充足"));

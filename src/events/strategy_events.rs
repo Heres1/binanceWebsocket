@@ -1,5 +1,5 @@
 //! 策略事件
-//! 
+//!
 //! 包含交易信号事件
 
 use serde::{Deserialize, Serialize};
@@ -28,4 +28,3 @@ pub struct TradingSignalEvent {
     /// 时间戳（毫秒）
     pub timestamp: u64,
 }
-

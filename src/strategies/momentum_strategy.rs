@@ -7,8 +7,8 @@ use crate::config::StrategyConfig;
 use crate::error::EventBusError;
 use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
 use crate::events::{
-    AggTradeEvent, BookTickerEvent, DomainEvent, KlineCompletedEvent, OrderRejectedEvent,
-    TradingSignalEvent,
+    AggTradeEvent, BookTickerEvent, DomainEvent, KlineCompletedEvent, OrderFilledEvent,
+    OrderRejectedEvent, TradingSignalEvent,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ enum Position {
 struct PersistentState {
     position: Position,
     entry_price: f64,
+    #[serde(default)]
+    entry_quantity: f64,
     entry_time: u64,
     last_trade_time: u64,
     daily_trades: u32,
@@ -141,6 +143,7 @@ struct StrategyState {
     // 持仓状态
     position: Position,
     entry_price: f64,
+    entry_quantity: f64,
     entry_time: u64,
 
     // 追踪止损状态
@@ -213,6 +216,7 @@ impl StrategyState {
             last_data_time: 0,
             position: Position::None,
             entry_price: 0.0,
+            entry_quantity: 0.0,
             entry_time: 0,
             highest_since_entry: 0.0,
             trailing_active: false,
@@ -259,15 +263,17 @@ impl StrategyState {
                 );
             } else {
                 log::info!(
-                    "恢复持仓状态: {:?} | 入场价: {:.2} | 路径:{} | 评分:{} | 入场ATR:{:.1}",
+                    "恢复持仓状态: {:?} | 入场价: {:.2} | 数量:{:.6} | 路径:{} | 评分:{} | 入场ATR:{:.1}",
                     ps.position,
                     ps.entry_price,
+                    ps.entry_quantity,
                     ps.entry_path,
                     ps.entry_score,
                     ps.entry_atr
                 );
                 state.position = ps.position;
                 state.entry_price = ps.entry_price;
+                state.entry_quantity = ps.entry_quantity;
                 state.entry_time = ps.entry_time;
                 state.last_trade_time = ps.last_trade_time;
                 state.daily_trades = ps.daily_trades;
@@ -297,6 +303,7 @@ impl StrategyState {
         PersistentState {
             position: self.position.clone(),
             entry_price: self.entry_price,
+            entry_quantity: self.entry_quantity,
             entry_time: self.entry_time,
             last_trade_time: self.last_trade_time,
             daily_trades: self.daily_trades,
@@ -445,6 +452,11 @@ impl MomentumStrategy {
                     "COVER"
                 };
                 let net_pnl_pct = pnl_pct - self.config.round_trip_fee_pct;
+                let exit_quantity = if state.entry_quantity > 0.0 {
+                    state.entry_quantity
+                } else {
+                    self.config.quantity_per_trade
+                };
                 log::warn!(
                     "⚠️ 数据超时紧急平仓 | {} | {:?} | 入场: {:.2} | 当前: {:.2} | 净盈亏: {:.3}%",
                     self.config.symbol,
@@ -462,8 +474,15 @@ impl MomentumStrategy {
                 let path = self.state_file.clone();
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save(&path));
-                self.emit_signal(signal_type, current_price, now_ms, None, None)
-                    .await;
+                self.emit_signal(
+                    signal_type,
+                    current_price,
+                    now_ms,
+                    None,
+                    None,
+                    Some(exit_quantity),
+                )
+                .await;
                 return;
             }
         }
@@ -694,8 +713,12 @@ impl MomentumStrategy {
                 };
 
                 let net_pnl_pct = pnl_pct - self.config.round_trip_fee_pct;
-                let net_pnl_usdt =
-                    self.config.quantity_per_trade * state.entry_price * net_pnl_pct / 100.0;
+                let exit_quantity = if state.entry_quantity > 0.0 {
+                    state.entry_quantity
+                } else {
+                    self.config.quantity_per_trade
+                };
+                let net_pnl_usdt = exit_quantity * state.entry_price * net_pnl_pct / 100.0;
                 let hold_min = hold_secs / 60;
                 log::info!("🔴 [平多] {} | {:.2}→{:.2} | 毛:{:+.3}% 净:{:+.3}%({:+.2}U) | 原因:{} | 持仓:{}min({}s) | 峰值:{:.2}%(动态SL:{:.2} ATR:{:.1}/入场:{:.1}) | [入场路径:{} 评分:{}] | 今日:{}笔{:+.3}%({:+.2}U)",
                     self.config.symbol, state.entry_price, current_price, pnl_pct,
@@ -746,8 +769,15 @@ impl MomentumStrategy {
                 let path = self.state_file.clone();
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save(&path));
-                self.emit_signal("SELL", current_price, now_ms, None, None)
-                    .await;
+                self.emit_signal(
+                    "SELL",
+                    current_price,
+                    now_ms,
+                    None,
+                    None,
+                    Some(exit_quantity),
+                )
+                .await;
                 return;
             }
         }
@@ -857,8 +887,12 @@ impl MomentumStrategy {
 
                 let net_pnl_pct = pnl_pct - self.config.round_trip_fee_pct;
                 let short_atr = state.atr_5m.value().unwrap_or(0.0);
-                let net_pnl_usdt =
-                    self.config.quantity_per_trade * state.entry_price * net_pnl_pct / 100.0;
+                let exit_quantity = if state.entry_quantity > 0.0 {
+                    state.entry_quantity
+                } else {
+                    self.config.quantity_per_trade
+                };
+                let net_pnl_usdt = exit_quantity * state.entry_price * net_pnl_pct / 100.0;
                 let hold_min = hold_secs / 60;
                 log::info!("🔴 [平空] {} | {:.2}→{:.2} | 毛:{:+.3}% 净:{:+.3}%({:+.2}U) | 原因:{} | 持仓:{}min({}s) | 峰值:{:.2}%(动态SL:{:.2} ATR:{:.1}/入场:{:.1}) | [入场路径:{} 评分:{}] | 今日:{}笔{:+.3}%({:+.2}U)",
                     self.config.symbol, state.entry_price, current_price, pnl_pct,
@@ -908,8 +942,15 @@ impl MomentumStrategy {
                 let path = self.state_file.clone();
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save(&path));
-                self.emit_signal("COVER", current_price, now_ms, None, None)
-                    .await;
+                self.emit_signal(
+                    "COVER",
+                    current_price,
+                    now_ms,
+                    None,
+                    None,
+                    Some(exit_quantity),
+                )
+                .await;
                 return;
             }
         }
@@ -1127,6 +1168,7 @@ impl MomentumStrategy {
 
                 state.position = Position::Long;
                 state.entry_price = entry_price;
+                state.entry_quantity = 0.0;
                 state.entry_time = now_ms;
                 state.highest_since_entry = entry_price;
                 state.trailing_active = false;
@@ -1140,8 +1182,15 @@ impl MomentumStrategy {
                 let path = self.state_file.clone();
                 drop(state);
                 tokio::task::spawn_blocking(move || snap.save(&path));
-                self.emit_signal("BUY", entry_price, now_ms, Some(sl_price), Some(tp_price))
-                    .await;
+                self.emit_signal(
+                    "BUY",
+                    entry_price,
+                    now_ms,
+                    Some(sl_price),
+                    Some(tp_price),
+                    None,
+                )
+                .await;
             } else if self.config.allow_short {
                 // === 做空入场条件 ===
                 // 趋势环境确认：价格在EMA50之下至少0.15% + EMA21斜率非上升
@@ -1213,6 +1262,7 @@ impl MomentumStrategy {
 
                     state.position = Position::Short;
                     state.entry_price = entry_price;
+                    state.entry_quantity = self.config.quantity_per_trade;
                     state.entry_time = now_ms;
                     state.lowest_since_entry = entry_price;
                     state.trailing_active = false;
@@ -1226,8 +1276,15 @@ impl MomentumStrategy {
                     let path = self.state_file.clone();
                     drop(state);
                     tokio::task::spawn_blocking(move || snap.save(&path));
-                    self.emit_signal("SHORT", entry_price, now_ms, Some(sl_price), Some(tp_price))
-                        .await;
+                    self.emit_signal(
+                        "SHORT",
+                        entry_price,
+                        now_ms,
+                        Some(sl_price),
+                        Some(tp_price),
+                        Some(self.config.quantity_per_trade),
+                    )
+                    .await;
                 }
             }
         }
@@ -1241,6 +1298,7 @@ impl MomentumStrategy {
         timestamp: u64,
         stop_loss: Option<f64>,
         take_profit: Option<f64>,
+        suggested_quantity: Option<f64>,
     ) {
         let signal = TradingSignalEvent {
             signal_id: format!("momentum_{}_{}", signal_type.to_lowercase(), timestamp),
@@ -1249,7 +1307,7 @@ impl MomentumStrategy {
             signal_type: signal_type.to_string(),
             strength: 1.0,
             suggested_price: price,
-            suggested_quantity: Some(self.config.quantity_per_trade),
+            suggested_quantity,
             stop_loss_price: stop_loss,
             take_profit_price: take_profit,
             timestamp,
@@ -1262,6 +1320,61 @@ impl MomentumStrategy {
         {
             log::error!("发布交易信号失败: {}", e);
         }
+    }
+
+    async fn on_order_filled(&self, event: &OrderFilledEvent) {
+        if event.symbol != self.config.symbol {
+            return;
+        }
+
+        let mut state = self.state.lock().await;
+        let base_asset = event
+            .symbol
+            .strip_suffix("USDT")
+            .unwrap_or(event.symbol.as_str());
+        let net_fill_qty = if event.side == "BUY" && event.commission_asset == base_asset {
+            (event.fill_qty - event.commission).max(0.0)
+        } else {
+            event.fill_qty
+        };
+
+        match event.side.as_str() {
+            "BUY" => {
+                if state.position == Position::Long {
+                    state.entry_price = event.fill_price;
+                    state.entry_quantity = net_fill_qty;
+                    log::info!(
+                        "📌 实际成交入场已记录 | {} | 均价:{:.2} | 数量:{:.6} | 成交额:{:.2}U | 信号:{}",
+                        event.symbol,
+                        event.fill_price,
+                        net_fill_qty,
+                        event.actual_quote_qty,
+                        event.signal_id
+                    );
+                }
+            }
+            "SELL" => {
+                state.entry_quantity = 0.0;
+                if state.position == Position::None {
+                    state.entry_price = 0.0;
+                    state.entry_atr = 0.0;
+                }
+                log::info!(
+                    "📌 实际平仓成交已确认 | {} | 均价:{:.2} | 数量:{:.6} | 成交额:{:.2}U | 信号:{}",
+                    event.symbol,
+                    event.fill_price,
+                    event.fill_qty,
+                    event.actual_quote_qty,
+                    event.signal_id
+                );
+            }
+            _ => {}
+        }
+
+        let snap = state.snapshot();
+        let path = self.state_file.clone();
+        drop(state);
+        tokio::task::spawn_blocking(move || snap.save(&path));
     }
 
     /// 处理订单拒绝事件（入场/平仓失败时回滚策略状态）
@@ -1288,6 +1401,7 @@ impl MomentumStrategy {
                 );
                 state.position = Position::None;
                 state.entry_price = 0.0;
+                state.entry_quantity = 0.0;
                 state.entry_time = 0;
                 state.highest_since_entry = 0.0;
                 state.lowest_since_entry = f64::MAX;
@@ -1296,6 +1410,7 @@ impl MomentumStrategy {
                 state.entry_score = 0;
                 state.entry_path.clear();
                 state.entry_atr = 0.0;
+                state.entry_quantity = 0.0;
                 // 回滚 daily_trades（入场时+1了，现在要-1）
                 if state.daily_trades > 0 {
                     state.daily_trades -= 1;
@@ -1405,6 +1520,7 @@ impl EventHandler for MomentumStrategy {
             DomainEvent::KlineCompleted(e) => self.on_kline(e).await,
             DomainEvent::AggTrade(e) => self.on_agg_trade(e).await,
             DomainEvent::BookTicker(e) => self.on_book_ticker(e).await,
+            DomainEvent::OrderFilled(e) => self.on_order_filled(e).await,
             DomainEvent::OrderRejected(e) => self.on_order_rejected(e).await,
             _ => {}
         }
@@ -1416,6 +1532,7 @@ impl EventHandler for MomentumStrategy {
             EventType::KlineCompleted,
             EventType::AggTrade,
             EventType::BookTicker,
+            EventType::OrderFilled,
             EventType::OrderRejected,
         ]
     }

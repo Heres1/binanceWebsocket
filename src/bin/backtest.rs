@@ -5,9 +5,11 @@
 //!   cargo run --bin backtest -- --mode optimize --symbol BTCUSDT
 //!   cargo run --bin backtest -- --mode replay --file data/recorded/BTCUSDT_20260320.jsonl
 
-use rust_binance_event_driven::backtest::engine::{BacktestConfig, BacktestEngine};
 use rust_binance_event_driven::backtest::data_loader::DataLoader;
-use rust_binance_event_driven::backtest::strategy_v2::{run_backtest_v2, StrategyV2Config, StrategyType};
+use rust_binance_event_driven::backtest::engine::{BacktestConfig, BacktestEngine};
+use rust_binance_event_driven::backtest::strategy_v2::{
+    run_backtest_v2, StrategyType, StrategyV2Config,
+};
 use rust_binance_event_driven::clients::binance_client::BinanceClient;
 use rust_binance_event_driven::config::{AppConfig, StrategyConfig};
 
@@ -16,11 +18,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 命令行参数解析（轻量实现，不依赖clap）
 struct Args {
-    mode: String,        // "kline" or "replay"
-    days: u64,           // 回测天数
-    symbol: String,      // 交易对
+    mode: String,         // "kline" or "replay"
+    days: u64,            // 回测天数
+    symbol: String,       // 交易对
     file: Option<String>, // 录制文件路径（replay模式）
-    capital: f64,        // 初始资金
+    capital: f64,         // 初始资金
 }
 
 impl Args {
@@ -116,6 +118,8 @@ async fn main() {
         initial_capital: args.capital,
         strategy: strategy_config,
         commission_rate: 0.0005, // 0.05%/侧 = 0.1%往返 (BUY免费+SELL 0.1%)
+        position_allocation_pct: config.risk.position_allocation_pct,
+        min_usdt_reserve: config.risk.min_usdt_reserve,
     };
 
     let engine = BacktestEngine::new(backtest_config, data_dir);
@@ -171,7 +175,10 @@ async fn main() {
             }
         }
         other => {
-            eprintln!("未知模式: {} (可选: kline, optimize, optimize_v2, compare, replay)", other);
+            eprintln!(
+                "未知模式: {} (可选: kline, optimize, optimize_v2, compare, replay)",
+                other
+            );
             std::process::exit(1);
         }
     }
@@ -204,11 +211,17 @@ async fn ensure_data(engine: &BacktestEngine, args: &Args, config: &AppConfig) {
             base_url,
         );
 
-        if let Err(e) = loader.download_klines(&client, &args.symbol, "1m", start_ms, now_ms).await {
+        if let Err(e) = loader
+            .download_klines(&client, &args.symbol, "1m", start_ms, now_ms)
+            .await
+        {
             eprintln!("下载1m K线失败: {}", e);
             std::process::exit(1);
         }
-        if let Err(e) = loader.download_klines(&client, &args.symbol, "5m", start_ms, now_ms).await {
+        if let Err(e) = loader
+            .download_klines(&client, &args.symbol, "5m", start_ms, now_ms)
+            .await
+        {
             eprintln!("下载5m K线失败: {}", e);
             std::process::exit(1);
         }
@@ -219,47 +232,77 @@ async fn ensure_data(engine: &BacktestEngine, args: &Args, config: &AppConfig) {
 /// 参数优化器
 fn run_optimization(engine: &BacktestEngine, base: &StrategyConfig) {
     println!("🔧 开始参数优化...");
-    println!("   基准配置: TP={:.2}% SL={:.2}% Hold={}s CD={}s RSI={:.0}/{:.0} VR={:.1}",
-        base.take_profit_pct, base.stop_loss_pct, base.max_hold_seconds,
-        base.cooldown_seconds, base.rsi_oversold, base.rsi_overbought,
-        base.volume_ratio_threshold);
+    println!(
+        "   基准配置: TP={:.2}% SL={:.2}% Hold={}s CD={}s RSI={:.0}/{:.0} VR={:.1}",
+        base.take_profit_pct,
+        base.stop_loss_pct,
+        base.max_hold_seconds,
+        base.cooldown_seconds,
+        base.rsi_oversold,
+        base.rsi_overbought,
+        base.volume_ratio_threshold
+    );
     println!();
 
     // 预加载数据到内存（只读一次磁盘）
     let loader = DataLoader::new("data");
     let klines_1m = match loader.load_klines(&base.symbol, "1m") {
         Ok(k) => k,
-        Err(e) => { eprintln!("加载1m数据失败: {}", e); return; }
+        Err(e) => {
+            eprintln!("加载1m数据失败: {}", e);
+            return;
+        }
     };
     let klines_5m = match loader.load_klines(&base.symbol, "5m") {
         Ok(k) => k,
-        Err(e) => { eprintln!("加载5m数据失败: {}", e); return; }
+        Err(e) => {
+            eprintln!("加载5m数据失败: {}", e);
+            return;
+        }
     };
 
     // 参数网格（必须满足: breakeven < trailing_trigger < TP）
-    let tp_values = [2.0, 3.0, 5.0];              // 宽硬止盈（让追踪止损发挥作用）
-    let sl_values = [0.8, 1.0, 1.5];              // 初始止损
-    let breakeven_values = [0.3, 0.5, 0.8];       // 保本触发
+    let tp_values = [2.0, 3.0, 5.0]; // 宽硬止盈（让追踪止损发挥作用）
+    let sl_values = [0.8, 1.0, 1.5]; // 初始止损
+    let breakeven_values = [0.3, 0.5, 0.8]; // 保本触发
     let trailing_trigger_values = [0.8, 1.0, 1.5]; // 追踪触发
     let trailing_distance_values = [0.3, 0.5, 0.8]; // 追踪距离
     let hold_values: [u64; 4] = [14400, 28800, 43200, 86400]; // 4h/8h/12h/24h
-    let rsi_ob_values = [100.0];                  // 禁用RSI退出
-    let vr_values = [0.6, 0.8, 1.0];             // 量比阈值
-    // 入场参数
-    let rsi_os_values = [40.0, 50.0, 60.0];       // RSI超卖线
-    let cd_values: [u64; 3] = [120, 300, 600];    // 冷却时间
+    let rsi_ob_values = [100.0]; // 禁用RSI退出
+    let vr_values = [0.6, 0.8, 1.0]; // 量比阈值
+                                     // 入场参数
+    let rsi_os_values = [40.0, 50.0, 60.0]; // RSI超卖线
+    let cd_values: [u64; 3] = [120, 300, 600]; // 冷却时间
 
-    let total = tp_values.len() * sl_values.len() * breakeven_values.len()
-        * trailing_trigger_values.len() * trailing_distance_values.len()
-        * hold_values.len() * rsi_ob_values.len() * vr_values.len()
-        * rsi_os_values.len() * cd_values.len();
+    let total = tp_values.len()
+        * sl_values.len()
+        * breakeven_values.len()
+        * trailing_trigger_values.len()
+        * trailing_distance_values.len()
+        * hold_values.len()
+        * rsi_ob_values.len()
+        * vr_values.len()
+        * rsi_os_values.len()
+        * cd_values.len();
     println!("   总组合数: {} | 数据已缓存到内存", total);
     println!("   约束: breakeven < trailing_trigger < TP");
 
     struct Result {
-        tp: f64, sl: f64, breakeven: f64, trailing_trigger: f64, trailing_distance: f64,
-        hold: u64, rsi_ob: f64, vr: f64, rsi_os: f64, cd: u64,
-        return_pct: f64, win_rate: f64, trades: usize, sharpe: f64, max_dd: f64,
+        tp: f64,
+        sl: f64,
+        breakeven: f64,
+        trailing_trigger: f64,
+        trailing_distance: f64,
+        hold: u64,
+        rsi_ob: f64,
+        vr: f64,
+        rsi_os: f64,
+        cd: u64,
+        return_pct: f64,
+        win_rate: f64,
+        trades: usize,
+        sharpe: f64,
+        max_dd: f64,
     }
 
     let mut results: Vec<Result> = Vec::new();
@@ -267,70 +310,89 @@ fn run_optimization(engine: &BacktestEngine, base: &StrategyConfig) {
     let mut positive_count = 0;
 
     for &tp in &tp_values {
-      for &sl in &sl_values {
-        for &breakeven in &breakeven_values {
-          for &trailing_trigger in &trailing_trigger_values {
-            for &trailing_distance in &trailing_distance_values {
-              for &hold in &hold_values {
-                for &rsi_ob in &rsi_ob_values {
-                  for &vr in &vr_values {
-                    for &rsi_os in &rsi_os_values {
-                      for &cd in &cd_values {
-                        count += 1;
-                        if count % 5000 == 0 {
-                            println!("   进度: {}/{} ({:.1}%) | 正收益: {}", count, total, count as f64/total as f64*100.0, positive_count);
-                        }
+        for &sl in &sl_values {
+            for &breakeven in &breakeven_values {
+                for &trailing_trigger in &trailing_trigger_values {
+                    for &trailing_distance in &trailing_distance_values {
+                        for &hold in &hold_values {
+                            for &rsi_ob in &rsi_ob_values {
+                                for &vr in &vr_values {
+                                    for &rsi_os in &rsi_os_values {
+                                        for &cd in &cd_values {
+                                            count += 1;
+                                            if count % 5000 == 0 {
+                                                println!(
+                                                    "   进度: {}/{} ({:.1}%) | 正收益: {}",
+                                                    count,
+                                                    total,
+                                                    count as f64 / total as f64 * 100.0,
+                                                    positive_count
+                                                );
+                                            }
 
-                        // 约束: breakeven < trailing_trigger < TP
-                        if breakeven >= trailing_trigger {
-                            continue;
-                        }
-                        if trailing_trigger >= tp {
-                            continue;
-                        }
+                                            // 约束: breakeven < trailing_trigger < TP
+                                            if breakeven >= trailing_trigger {
+                                                continue;
+                                            }
+                                            if trailing_trigger >= tp {
+                                                continue;
+                                            }
 
-                        let mut strategy = base.clone();
-                        strategy.take_profit_pct = tp;
-                        strategy.stop_loss_pct = sl;
-                        strategy.breakeven_trigger_pct = breakeven;
-                        strategy.trailing_trigger_pct = trailing_trigger;
-                        strategy.trailing_distance_pct = trailing_distance;
-                        strategy.max_hold_seconds = hold;
-                        strategy.rsi_overbought = rsi_ob;
-                        strategy.volume_ratio_threshold = vr;
-                        strategy.rsi_oversold = rsi_os;
-                        strategy.cooldown_seconds = cd;
+                                            let mut strategy = base.clone();
+                                            strategy.take_profit_pct = tp;
+                                            strategy.stop_loss_pct = sl;
+                                            strategy.breakeven_trigger_pct = breakeven;
+                                            strategy.trailing_trigger_pct = trailing_trigger;
+                                            strategy.trailing_distance_pct = trailing_distance;
+                                            strategy.max_hold_seconds = hold;
+                                            strategy.rsi_overbought = rsi_ob;
+                                            strategy.volume_ratio_threshold = vr;
+                                            strategy.rsi_oversold = rsi_os;
+                                            strategy.cooldown_seconds = cd;
 
-                        if let Ok(report) = BacktestEngine::run_backtest_on_data(
-                            &klines_1m, &klines_5m, &strategy, 200.0, 0.00075,
-                        ) {
-                            if report.total_trades >= 5 {
-                                if report.total_return_pct > 0.0 {
-                                    positive_count += 1;
+                                            if let Ok(report) = BacktestEngine::run_backtest_on_data(
+                                                &klines_1m, &klines_5m, &strategy, 200.0, 0.00075,
+                                            ) {
+                                                if report.total_trades >= 5 {
+                                                    if report.total_return_pct > 0.0 {
+                                                        positive_count += 1;
+                                                    }
+                                                    results.push(Result {
+                                                        tp,
+                                                        sl,
+                                                        breakeven,
+                                                        trailing_trigger,
+                                                        trailing_distance,
+                                                        hold,
+                                                        rsi_ob,
+                                                        vr,
+                                                        rsi_os,
+                                                        cd,
+                                                        return_pct: report.total_return_pct,
+                                                        win_rate: report.win_rate,
+                                                        trades: report.total_trades,
+                                                        sharpe: report.sharpe_ratio,
+                                                        max_dd: report.max_drawdown_pct,
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                results.push(Result {
-                                    tp, sl, breakeven, trailing_trigger, trailing_distance,
-                                    hold, rsi_ob, vr, rsi_os, cd,
-                                    return_pct: report.total_return_pct,
-                                    win_rate: report.win_rate,
-                                    trades: report.total_trades,
-                                    sharpe: report.sharpe_ratio,
-                                    max_dd: report.max_drawdown_pct,
-                                });
                             }
                         }
-                      }
                     }
-                  }
                 }
-              }
             }
-          }
         }
-      }
     }
 
-    println!("\n✅ 优化完成: 有效组合 {}/{} | 🟢 正收益组合: {}", results.len(), total, positive_count);
+    println!(
+        "\n✅ 优化完成: 有效组合 {}/{} | 🟢 正收益组合: {}",
+        results.len(),
+        total,
+        positive_count
+    );
 
     // 按收益率排序
     results.sort_by(|a, b| b.return_pct.partial_cmp(&a.return_pct).unwrap());
@@ -393,11 +455,17 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
     let loader = DataLoader::new("data");
     let klines_1m = match loader.load_klines(&base.symbol, "1m") {
         Ok(k) => k,
-        Err(e) => { eprintln!("加载1m数据失败: {}", e); return; }
+        Err(e) => {
+            eprintln!("加载1m数据失败: {}", e);
+            return;
+        }
     };
     let klines_5m = match loader.load_klines(&base.symbol, "5m") {
         Ok(k) => k,
-        Err(e) => { eprintln!("加载5m数据失败: {}", e); return; }
+        Err(e) => {
+            eprintln!("加载5m数据失败: {}", e);
+            return;
+        }
     };
 
     // 使用BNB抵扣后的手续费率
@@ -420,7 +488,7 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
     let cd_values: [u64; 2] = [300, 600];
     let vr_values = [1.2, 1.5];
     let allow_short_values = [true]; // 强制启用做空
-    // RSI出场: 100.0=禁用
+                                     // RSI出场: 100.0=禁用
     let rsi_ob_values = [100.0];
     // 做空专用参数网格
     let short_tp_values = [0.5, 0.8, 1.0, 1.5];
@@ -429,20 +497,48 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
     let short_hold_values: [u64; 3] = [3600, 7200, 14400];
     let short_strength_values = [0.0, 0.03, 0.05, 0.1];
 
-    let total_per_strategy = tp_values.len() * sl_values.len() * trailing_values.len()
-        * hold_values.len() * cd_values.len() * vr_values.len() * allow_short_values.len()
-        * rsi_ob_values.len() * short_tp_values.len() * short_sl_values.len()
-        * short_trailing_values.len() * short_hold_values.len() * short_strength_values.len();
+    let total_per_strategy = tp_values.len()
+        * sl_values.len()
+        * trailing_values.len()
+        * hold_values.len()
+        * cd_values.len()
+        * vr_values.len()
+        * allow_short_values.len()
+        * rsi_ob_values.len()
+        * short_tp_values.len()
+        * short_sl_values.len()
+        * short_trailing_values.len()
+        * short_hold_values.len()
+        * short_strength_values.len();
     let total = total_per_strategy * strategy_types.len();
-    println!("   策略类型: {} | 每类型参数组合: {} | 总组合: {}", strategy_types.len(), total_per_strategy, total);
+    println!(
+        "   策略类型: {} | 每类型参数组合: {} | 总组合: {}",
+        strategy_types.len(),
+        total_per_strategy,
+        total
+    );
     println!();
 
     struct OptResult {
         strategy_name: &'static str,
         strategy_type: StrategyType,
-        tp: f64, sl: f64, trailing: f64, hold: u64, cd: u64, vr: f64, rsi_ob: f64,
-        short_tp: f64, short_sl: f64, short_trailing: f64, short_hold: u64, short_strength: f64,
-        return_pct: f64, win_rate: f64, trades: usize, sharpe: f64, max_dd: f64,
+        tp: f64,
+        sl: f64,
+        trailing: f64,
+        hold: u64,
+        cd: u64,
+        vr: f64,
+        rsi_ob: f64,
+        short_tp: f64,
+        short_sl: f64,
+        short_trailing: f64,
+        short_hold: u64,
+        short_strength: f64,
+        return_pct: f64,
+        win_rate: f64,
+        trades: usize,
+        sharpe: f64,
+        max_dd: f64,
         profit_loss_ratio: f64,
     }
 
@@ -454,94 +550,130 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
         let mut strategy_best_return = f64::NEG_INFINITY;
 
         for &tp in &tp_values {
-          for &sl in &sl_values {
-            for &trailing in &trailing_values {
-              for &hold in &hold_values {
-                for &cd in &cd_values {
-                  for &vr in &vr_values {
-                    for &allow_short in &allow_short_values {
-                      for &rsi_ob in &rsi_ob_values {
-                        for &short_tp in &short_tp_values {
-                          for &short_sl in &short_sl_values {
-                            for &short_trailing in &short_trailing_values {
-                              for &short_hold in &short_hold_values {
-                                for &short_strength in &short_strength_values {
-                                    count += 1;
-                                    strategy_count += 1;
+            for &sl in &sl_values {
+                for &trailing in &trailing_values {
+                    for &hold in &hold_values {
+                        for &cd in &cd_values {
+                            for &vr in &vr_values {
+                                for &allow_short in &allow_short_values {
+                                    for &rsi_ob in &rsi_ob_values {
+                                        for &short_tp in &short_tp_values {
+                                            for &short_sl in &short_sl_values {
+                                                for &short_trailing in &short_trailing_values {
+                                                    for &short_hold in &short_hold_values {
+                                                        for &short_strength in
+                                                            &short_strength_values
+                                                        {
+                                                            count += 1;
+                                                            strategy_count += 1;
 
-                                    if count % 5000 == 0 {
-                                        println!("   进度: {}/{} ({:.1}%)", count, total,
-                                            count as f64 / total as f64 * 100.0);
-                                    }
+                                                            if count % 5000 == 0 {
+                                                                println!(
+                                                                    "   进度: {}/{} ({:.1}%)",
+                                                                    count,
+                                                                    total,
+                                                                    count as f64 / total as f64
+                                                                        * 100.0
+                                                                );
+                                                            }
 
-                                    let config = StrategyV2Config {
-                                        strategy_type,
-                                        take_profit_pct: tp,
-                                        stop_loss_pct: sl,
-                                        trailing_stop_pct: trailing,
-                                        max_hold_seconds: hold,
-                                        cooldown_seconds: cd,
-                                        rsi_oversold: 30.0,
-                                        rsi_overbought: rsi_ob,
-                                        volume_ratio_threshold: vr,
-                                        allow_short,
-                                        breakout_lookback: 20,
-                                        min_entry_score: 60.0,
-                                        quantity_per_trade: base.quantity_per_trade,
-                                        short_take_profit_pct: short_tp,
-                                        short_stop_loss_pct: short_sl,
-                                        short_trailing_stop_pct: short_trailing,
-                                        short_max_hold_seconds: short_hold,
-                                        short_min_trend_strength: short_strength,
-                                    };
+                                                            let config = StrategyV2Config {
+                                                                strategy_type,
+                                                                take_profit_pct: tp,
+                                                                stop_loss_pct: sl,
+                                                                trailing_stop_pct: trailing,
+                                                                max_hold_seconds: hold,
+                                                                cooldown_seconds: cd,
+                                                                rsi_oversold: 30.0,
+                                                                rsi_overbought: rsi_ob,
+                                                                volume_ratio_threshold: vr,
+                                                                allow_short,
+                                                                breakout_lookback: 20,
+                                                                min_entry_score: 60.0,
+                                                                quantity_per_trade: base
+                                                                    .quantity_per_trade,
+                                                                short_take_profit_pct: short_tp,
+                                                                short_stop_loss_pct: short_sl,
+                                                                short_trailing_stop_pct:
+                                                                    short_trailing,
+                                                                short_max_hold_seconds: short_hold,
+                                                                short_min_trend_strength:
+                                                                    short_strength,
+                                                            };
 
-                                    let report = run_backtest_v2(
-                                        &klines_1m, &klines_5m, &config, capital, commission_rate,
-                                    );
+                                                            let report = run_backtest_v2(
+                                                                &klines_1m,
+                                                                &klines_5m,
+                                                                &config,
+                                                                capital,
+                                                                commission_rate,
+                                                            );
 
-                                    if report.total_trades >= 5 {
-                                        if report.total_return_pct > strategy_best_return {
-                                            strategy_best_return = report.total_return_pct;
+                                                            if report.total_trades >= 5 {
+                                                                if report.total_return_pct
+                                                                    > strategy_best_return
+                                                                {
+                                                                    strategy_best_return =
+                                                                        report.total_return_pct;
+                                                                }
+                                                                results.push(OptResult {
+                                                                    strategy_name,
+                                                                    strategy_type,
+                                                                    tp,
+                                                                    sl,
+                                                                    trailing,
+                                                                    hold,
+                                                                    cd,
+                                                                    vr,
+                                                                    rsi_ob,
+                                                                    short_tp,
+                                                                    short_sl,
+                                                                    short_trailing,
+                                                                    short_hold,
+                                                                    short_strength,
+                                                                    return_pct: report
+                                                                        .total_return_pct,
+                                                                    win_rate: report.win_rate,
+                                                                    trades: report.total_trades,
+                                                                    sharpe: report.sharpe_ratio,
+                                                                    max_dd: report.max_drawdown_pct,
+                                                                    profit_loss_ratio: report
+                                                                        .profit_loss_ratio,
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
-                                        results.push(OptResult {
-                                            strategy_name,
-                                            strategy_type,
-                                            tp, sl, trailing, hold, cd, vr, rsi_ob,
-                                            short_tp, short_sl, short_trailing, short_hold, short_strength,
-                                            return_pct: report.total_return_pct,
-                                            win_rate: report.win_rate,
-                                            trades: report.total_trades,
-                                            sharpe: report.sharpe_ratio,
-                                            max_dd: report.max_drawdown_pct,
-                                            profit_loss_ratio: report.profit_loss_ratio,
-                                        });
                                     }
                                 }
-                              }
                             }
-                          }
                         }
-                      }
                     }
-                  }
                 }
-              }
             }
-          }
         }
-        println!("   [OK] {} 完成: {} 组合已测试 | 最优收益: {:.3}%",
-            strategy_name, strategy_count, strategy_best_return);
+        println!(
+            "   [OK] {} 完成: {} 组合已测试 | 最优收益: {:.3}%",
+            strategy_name, strategy_count, strategy_best_return
+        );
     }
 
-    println!("
-{}", "=".repeat(80));
+    println!(
+        "
+{}",
+        "=".repeat(80)
+    );
     println!("   V2优化完成: 有效组合 {}/{}", results.len(), total);
 
     // 按收益率排序
     results.sort_by(|a, b| b.return_pct.partial_cmp(&a.return_pct).unwrap());
 
-    println!("
---- TOP 20 最优策略配置 ---");
+    println!(
+        "
+--- TOP 20 最优策略配置 ---"
+    );
     println!("   {:<3} {:<8} {:<5} {:<5} {:<5} {:<6} {:<4} {:<4} {:<5} {:<5} {:<5} {:<6} {:<5} {:<8} {:<6} {:<6} {:<7} {:<6} {:<6}",
         "#", "策略", "TP%", "SL%", "TR%", "Hold", "CD", "VR", "sTP%", "sSL%", "sTR%", "sHold", "sStr",
         "Return%", "Win%", "Trades", "Sharpe", "P/L", "MaxDD%");
@@ -556,8 +688,10 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
 
     // 显示最优配置的完整报告
     if let Some(best) = results.first() {
-        println!("
---- 最优策略配置 ---");
+        println!(
+            "
+--- 最优策略配置 ---"
+        );
         println!("   策略类型 = {}", best.strategy_name);
         println!("   --- 多头参数 ---");
         println!("   take_profit_pct = {:.2}", best.tp);
@@ -611,11 +745,17 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
     let loader = DataLoader::new("data");
     let klines_1m = match loader.load_klines(&base.symbol, "1m") {
         Ok(k) => k,
-        Err(e) => { eprintln!("加载1m数据失败: {}", e); return; }
+        Err(e) => {
+            eprintln!("加载1m数据失败: {}", e);
+            return;
+        }
     };
     let klines_5m = match loader.load_klines(&base.symbol, "5m") {
         Ok(k) => k,
-        Err(e) => { eprintln!("加载5m数据失败: {}", e); return; }
+        Err(e) => {
+            eprintln!("加载5m数据失败: {}", e);
+            return;
+        }
     };
 
     let commission_rate = 0.0005;
@@ -627,7 +767,10 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
     let last_ts = klines_1m.last().map(|k| k.open_time).unwrap_or(0);
     let total_days = (last_ts - first_ts) as f64 / 86_400_000.0;
 
-    println!("   数据范围: {:.1}天 | 1m数据: {}根 | 5m数据: {}根", total_days, total_1m, total_5m);
+    println!(
+        "   数据范围: {:.1}天 | 1m数据: {}根 | 5m数据: {}根",
+        total_days, total_1m, total_5m
+    );
     println!();
 
     // 定义时间段切片（每段15天，交叠滑动）
@@ -638,18 +781,52 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
     }
 
     let periods = vec![
-        Period { name: "全量(60天)", start_pct: 0.0, end_pct: 1.0 },
-        Period { name: "P1(第1-15天)", start_pct: 0.0, end_pct: 0.25 },
-        Period { name: "P2(第8-22天)", start_pct: 0.117, end_pct: 0.367 },
-        Period { name: "P3(第16-30天)", start_pct: 0.25, end_pct: 0.50 },
-        Period { name: "P4(第23-37天)", start_pct: 0.367, end_pct: 0.617 },
-        Period { name: "P5(第31-45天)", start_pct: 0.50, end_pct: 0.75 },
-        Period { name: "P6(第38-52天)", start_pct: 0.617, end_pct: 0.867 },
-        Period { name: "P7(第46-60天)", start_pct: 0.75, end_pct: 1.0 },
+        Period {
+            name: "全量(60天)",
+            start_pct: 0.0,
+            end_pct: 1.0,
+        },
+        Period {
+            name: "P1(第1-15天)",
+            start_pct: 0.0,
+            end_pct: 0.25,
+        },
+        Period {
+            name: "P2(第8-22天)",
+            start_pct: 0.117,
+            end_pct: 0.367,
+        },
+        Period {
+            name: "P3(第16-30天)",
+            start_pct: 0.25,
+            end_pct: 0.50,
+        },
+        Period {
+            name: "P4(第23-37天)",
+            start_pct: 0.367,
+            end_pct: 0.617,
+        },
+        Period {
+            name: "P5(第31-45天)",
+            start_pct: 0.50,
+            end_pct: 0.75,
+        },
+        Period {
+            name: "P6(第38-52天)",
+            start_pct: 0.617,
+            end_pct: 0.867,
+        },
+        Period {
+            name: "P7(第46-60天)",
+            start_pct: 0.75,
+            end_pct: 1.0,
+        },
     ];
 
-    println!("   {:<16} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10}",
-        "时段", "年化%", "胜率%", "笔数", "夏普", "盈亏比", "maxDD%", "平均持仓s");
+    println!(
+        "   {:<16} {:<10} {:<8} {:<8} {:<8} {:<8} {:<8} {:<10}",
+        "时段", "年化%", "胜率%", "笔数", "夏普", "盈亏比", "maxDD%", "平均持仓s"
+    );
     println!("   {}", "-".repeat(82));
 
     let mut all_annual = Vec::new();
@@ -670,9 +847,16 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
             continue;
         }
 
-        match BacktestEngine::run_backtest_on_data(slice_1m, slice_5m, base, capital, commission_rate) {
+        match BacktestEngine::run_backtest_on_data(
+            slice_1m,
+            slice_5m,
+            base,
+            capital,
+            commission_rate,
+        ) {
             Ok(report) => {
-                println!("   {:<16} {:<10.2} {:<8.1} {:<8} {:<8.2} {:<8.2} {:<8.2} {:<10.0}",
+                println!(
+                    "   {:<16} {:<10.2} {:<8.1} {:<8} {:<8.2} {:<8.2} {:<8.2} {:<10.0}",
                     period.name,
                     report.annual_return_pct,
                     report.win_rate,
@@ -680,7 +864,8 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
                     report.sharpe_ratio,
                     report.profit_loss_ratio,
                     report.max_drawdown_pct,
-                    report.avg_hold_seconds);
+                    report.avg_hold_seconds
+                );
 
                 if period.name != "全量(60天)" {
                     all_annual.push(report.annual_return_pct);
@@ -704,21 +889,47 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
         let max_annual = all_annual.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let avg_wr = all_winrate.iter().sum::<f64>() / n;
         let min_wr = all_winrate.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max_wr = all_winrate.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max_wr = all_winrate
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
         let avg_trades = all_trades.iter().sum::<f64>() / n;
         let positive_periods = all_annual.iter().filter(|&&x| x > 0.0).count();
 
-        println!("   年化收益: 平均 {:.2}% | 最低 {:.2}% | 最高 {:.2}%", avg_annual, min_annual, max_annual);
-        println!("   胜率:     平均 {:.1}% | 最低 {:.1}% | 最高 {:.1}%", avg_wr, min_wr, max_wr);
-        println!("   平均交易: {:.1}笔/段 | 正收益时段: {}/{}", avg_trades, positive_periods, all_annual.len());
+        println!(
+            "   年化收益: 平均 {:.2}% | 最低 {:.2}% | 最高 {:.2}%",
+            avg_annual, min_annual, max_annual
+        );
+        println!(
+            "   胜率:     平均 {:.1}% | 最低 {:.1}% | 最高 {:.1}%",
+            avg_wr, min_wr, max_wr
+        );
+        println!(
+            "   平均交易: {:.1}笔/段 | 正收益时段: {}/{}",
+            avg_trades,
+            positive_periods,
+            all_annual.len()
+        );
 
-        let std_dev = (all_annual.iter().map(|x| (x - avg_annual).powi(2)).sum::<f64>() / n).sqrt();
-        let cv = if avg_annual.abs() > 0.01 { std_dev / avg_annual.abs() * 100.0 } else { 999.0 };
+        let std_dev = (all_annual
+            .iter()
+            .map(|x| (x - avg_annual).powi(2))
+            .sum::<f64>()
+            / n)
+            .sqrt();
+        let cv = if avg_annual.abs() > 0.01 {
+            std_dev / avg_annual.abs() * 100.0
+        } else {
+            999.0
+        };
         println!("   收益标准差: {:.2}% | 变异系数: {:.1}%", std_dev, cv);
         println!();
 
         if positive_periods == all_annual.len() && min_wr >= 50.0 {
-            println!("   ✅ 稳定性评估: 通过 - 所有时段均正收益，胜率稳定在{:.0}%以上", min_wr);
+            println!(
+                "   ✅ 稳定性评估: 通过 - 所有时段均正收益，胜率稳定在{:.0}%以上",
+                min_wr
+            );
         } else if positive_periods as f64 >= all_annual.len() as f64 * 0.7 {
             println!("   ⚠️ 稳定性评估: 谨慎 - 部分时段亏损，建议降低仓位");
         } else {
@@ -738,4 +949,3 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
     println!("   [✓] 多因子评分: 回测与实盘完全一致(8因子满分100)");
     println!("   [∗] daily_pnl差异: 回测用毛盈亏累加，实盘用净盈亏(差异0.1%/笔，影响可忽略)");
 }
-

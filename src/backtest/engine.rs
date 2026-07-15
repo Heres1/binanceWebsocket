@@ -5,7 +5,39 @@
 use crate::backtest::data_loader::{BacktestKline, DataLoader, RecordedEvent};
 use crate::backtest::report::{BacktestReport, TradeRecord};
 use crate::config::StrategyConfig;
-use crate::strategies::indicators::{EMA, RSI, VolumeRatio, ATR, ADX};
+use crate::strategies::indicators::{VolumeRatio, ADX, ATR, EMA, RSI};
+
+const DEFAULT_POSITION_ALLOCATION_PCT: f64 = 0.985;
+const DEFAULT_MIN_USDT_RESERVE: f64 = 2.0;
+
+fn round_backtest_quantity(quantity: f64, symbol: &str) -> f64 {
+    let decimals: i32 = match symbol {
+        "BTCUSDT" => 5,
+        "ETHUSDT" => 4,
+        "SOLUSDT" => 2,
+        _ => 5,
+    };
+    let factor = 10_f64.powi(decimals);
+    ((quantity * factor) + 1e-9).floor() / factor
+}
+
+fn dynamic_entry_quantity(
+    available_capital: f64,
+    entry_price: f64,
+    strategy: &StrategyConfig,
+    position_allocation_pct: f64,
+    min_usdt_reserve: f64,
+) -> f64 {
+    if available_capital <= 0.0 || entry_price <= 0.0 {
+        return 0.0;
+    }
+
+    let alloc_cap = available_capital * position_allocation_pct;
+    let reserve_cap = (available_capital - min_usdt_reserve).max(0.0);
+    let quantity_cap = strategy.quantity_per_trade * entry_price;
+    let deployable = alloc_cap.min(reserve_cap).min(quantity_cap);
+    round_backtest_quantity(deployable / entry_price, &strategy.symbol)
+}
 
 /// 回测引擎配置
 #[derive(Debug, Clone)]
@@ -14,6 +46,8 @@ pub struct BacktestConfig {
     pub initial_capital: f64,
     pub strategy: StrategyConfig,
     pub commission_rate: f64, // 手续费率，默认0.001 (0.1%)
+    pub position_allocation_pct: f64,
+    pub min_usdt_reserve: f64,
 }
 
 /// 内部持仓状态
@@ -32,7 +66,7 @@ struct EngineState {
     rsi_1m: RSI,
     ema_fast_5m: EMA,
     ema_slow_5m: EMA,
-    ema_trend_5m: EMA,          // EMA50 - 趋势环境过滤
+    ema_trend_5m: EMA, // EMA50 - 趋势环境过滤
     volume_ratio: VolumeRatio,
 
     // 盘口
@@ -44,12 +78,14 @@ struct EngineState {
     // 持仓
     position: Position,
     entry_price: f64,
+    entry_quantity: f64,
     entry_time: u64,
+    available_capital: f64,
 
     // 追踪止损状态
-    highest_since_entry: f64,   // 入场后最高价
-    trailing_active: bool,      // 追踪止损是否激活
-    breakeven_active: bool,     // 保本止损是否激活
+    highest_since_entry: f64, // 入场后最高价
+    trailing_active: bool,    // 追踪止损是否激活
+    breakeven_active: bool,   // 保本止损是否激活
 
     // 冷却与统计
     last_trade_time: u64,
@@ -62,32 +98,32 @@ struct EngineState {
     rsi_oversold_bars: usize, // 超卖标志已持续的K线数（过期机制）
 
     // 突破入场状态
-    recent_highs: Vec<f64>,     // 最近20根K线最高价缓冲区
-    recent_lows: Vec<f64>,      // 最近20根K线最低价缓冲区
-    lowest_since_entry: f64,    // 入场后最低价（用于做空追踪止损）
+    recent_highs: Vec<f64>,  // 最近20根K线最高价缓冲区
+    recent_lows: Vec<f64>,   // 最近20根K线最低价缓冲区
+    lowest_since_entry: f64, // 入场后最低价（用于做空追踪止损）
 
     // EMA斜率跟踪
-    prev_ema_slow_5m: f64,      // 上一桩5mK线的EMA21值
-    prev_ema_trend_5m: f64,     // 上一桩5mK线的EMA50值（判断EMA50方向）
-    ema50_history: Vec<f64>,    // EMA50历史值缓冲（最近20根=100分钟）
-    
+    prev_ema_slow_5m: f64,   // 上一桩5mK线的EMA21值
+    prev_ema_trend_5m: f64,  // 上一桩5mK线的EMA50值（判断EMA50方向）
+    ema50_history: Vec<f64>, // EMA50历史值缓冲（最近20根=100分钟）
+
     // 止损后延长冷却
     last_exit_was_stoploss: bool,
-    
+
     // ATR/ADX指标
     atr_5m: ATR,
     adx_5m: ADX,
-    
+
     // 入场ATR快照（防止ATR收缩导致止损过早触发）
     entry_atr: f64,
-    
+
     // 预热
     kline_1m_count: usize,
     kline_5m_count: usize,
 }
 
 impl EngineState {
-    fn new() -> Self {
+    fn new(initial_capital: f64) -> Self {
         Self {
             ema_fast_1m: EMA::new(7),
             ema_slow_1m: EMA::new(21),
@@ -102,7 +138,9 @@ impl EngineState {
             best_ask_qty: 0.0,
             position: Position::None,
             entry_price: 0.0,
+            entry_quantity: 0.0,
             entry_time: 0,
+            available_capital: initial_capital,
             highest_since_entry: 0.0,
             trailing_active: false,
             breakeven_active: false,
@@ -180,7 +218,7 @@ impl BacktestEngine {
         let start_time = events.first().map(|(k, _)| k.open_time).unwrap_or(0);
         let end_time = events.last().map(|(k, _)| k.close_time).unwrap_or(0);
 
-        let mut state = EngineState::new();
+        let mut state = EngineState::new(self.config.initial_capital);
         let mut trades: Vec<TradeRecord> = Vec::new();
         let mut trade_id = 0;
 
@@ -265,7 +303,8 @@ impl BacktestEngine {
 
                 // 用K线最高价更新入场后最高价（价格确实到达过该点）
                 state.highest_since_entry = state.highest_since_entry.max(kline.high);
-                let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
+                let highest_pnl_pct =
+                    (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
                 // ATR动态止损计算（使用max(当前ATR, 入场ATR)防止收缩）
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
@@ -275,10 +314,13 @@ impl BacktestEngine {
                 // 计算动态止损价
                 let dynamic_sl = if use_atr {
                     // ATR基础止损价
-                    let atr_sl = state.entry_price - self.config.strategy.atr_stop_multiplier * effective_atr;
+                    let atr_sl = state.entry_price
+                        - self.config.strategy.atr_stop_multiplier * effective_atr;
                     // ATR追踪止损：浮盈超过 N*ATR 后开启
-                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * effective_atr;
-                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * effective_atr;
+                    let atr_trailing_trigger =
+                        self.config.strategy.atr_trailing_multiplier * effective_atr;
+                    let atr_trailing_dist =
+                        self.config.strategy.atr_trailing_distance * effective_atr;
                     let profit_amount = state.highest_since_entry - state.entry_price;
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
@@ -293,7 +335,8 @@ impl BacktestEngine {
                     // 回退到固定%止损
                     if highest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
                         state.trailing_active = true;
-                        state.highest_since_entry * (1.0 - self.config.strategy.trailing_distance_pct / 100.0)
+                        state.highest_since_entry
+                            * (1.0 - self.config.strategy.trailing_distance_pct / 100.0)
                     } else if highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
                         state.breakeven_active = true;
                         state.entry_price
@@ -302,7 +345,8 @@ impl BacktestEngine {
                     }
                 };
 
-                let tp_price = state.entry_price * (1.0 + self.config.strategy.take_profit_pct / 100.0);
+                let tp_price =
+                    state.entry_price * (1.0 + self.config.strategy.take_profit_pct / 100.0);
 
                 // Intra-bar: 用low检测SL触发，用high检测TP触发
                 let sl_hit = kline.low <= dynamic_sl;
@@ -319,17 +363,25 @@ impl BacktestEngine {
                 if should_exit {
                     // 确定出场价和原因（SL优先于TP，保守估计）
                     let (exit_price, reason) = if sl_hit && !tp_hit {
-                        let r = if state.trailing_active { "追踪止损" }
-                            else if state.breakeven_active { "保本止损" }
-                            else { "止损" };
+                        let r = if state.trailing_active {
+                            "追踪止损"
+                        } else if state.breakeven_active {
+                            "保本止损"
+                        } else {
+                            "止损"
+                        };
                         (dynamic_sl, r)
                     } else if tp_hit && !sl_hit {
                         (tp_price, "硬止盈")
                     } else if sl_hit && tp_hit {
                         // 同一根K线内同时触发，保守假设止损先触发
-                        let r = if state.trailing_active { "追踪止损" }
-                            else if state.breakeven_active { "保本止损" }
-                            else { "止损" };
+                        let r = if state.trailing_active {
+                            "追踪止损"
+                        } else if state.breakeven_active {
+                            "保本止损"
+                        } else {
+                            "止损"
+                        };
                         (dynamic_sl, r)
                     } else if stale_exit {
                         (kline.close, "僵尸早退")
@@ -340,9 +392,10 @@ impl BacktestEngine {
                     };
 
                     let pnl_pct = (exit_price - state.entry_price) / state.entry_price * 100.0;
-                    let quantity = self.config.strategy.quantity_per_trade;
+                    let quantity = state.entry_quantity;
                     let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
-                    let commission = quantity * (state.entry_price + exit_price) * self.config.commission_rate;
+                    let commission =
+                        quantity * (state.entry_price + exit_price) * self.config.commission_rate;
 
                     trade_id += 1;
                     trades.push(TradeRecord {
@@ -360,6 +413,8 @@ impl BacktestEngine {
                     });
 
                     state.position = Position::None;
+                    state.entry_quantity = 0.0;
+                    state.available_capital += pnl_usdt - commission;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
                     state.last_exit_was_stoploss = reason == "止损" || reason == "超时";
@@ -371,16 +426,20 @@ impl BacktestEngine {
                 let hold_secs = (timestamp - state.entry_time) / 1000;
 
                 state.lowest_since_entry = state.lowest_since_entry.min(kline.low);
-                let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
+                let lowest_pnl_pct =
+                    (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
 
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
                 let effective_atr = current_atr.max(state.entry_atr);
                 let use_atr = self.config.strategy.use_atr_stops && effective_atr > 0.0;
 
                 let dynamic_sl = if use_atr {
-                    let atr_sl = state.entry_price + self.config.strategy.atr_stop_multiplier * effective_atr;
-                    let atr_trailing_trigger = self.config.strategy.atr_trailing_multiplier * effective_atr;
-                    let atr_trailing_dist = self.config.strategy.atr_trailing_distance * effective_atr;
+                    let atr_sl = state.entry_price
+                        + self.config.strategy.atr_stop_multiplier * effective_atr;
+                    let atr_trailing_trigger =
+                        self.config.strategy.atr_trailing_multiplier * effective_atr;
+                    let atr_trailing_dist =
+                        self.config.strategy.atr_trailing_distance * effective_atr;
                     let profit_amount = state.entry_price - state.lowest_since_entry;
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
@@ -394,7 +453,8 @@ impl BacktestEngine {
                 } else {
                     if lowest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
                         state.trailing_active = true;
-                        state.lowest_since_entry * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
+                        state.lowest_since_entry
+                            * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
                     } else if lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
                         state.breakeven_active = true;
                         state.entry_price
@@ -403,7 +463,8 @@ impl BacktestEngine {
                     }
                 };
 
-                let tp_price = state.entry_price * (1.0 - self.config.strategy.take_profit_pct / 100.0);
+                let tp_price =
+                    state.entry_price * (1.0 - self.config.strategy.take_profit_pct / 100.0);
 
                 let sl_hit = kline.high >= dynamic_sl;
                 let tp_hit = kline.low <= tp_price;
@@ -417,9 +478,13 @@ impl BacktestEngine {
 
                 if should_exit {
                     let (exit_price, reason) = if sl_hit && !tp_hit {
-                        let r = if state.trailing_active { "空追踪止损" }
-                            else if state.breakeven_active { "空保本止损" }
-                            else { "空止损" };
+                        let r = if state.trailing_active {
+                            "空追踪止损"
+                        } else if state.breakeven_active {
+                            "空保本止损"
+                        } else {
+                            "空止损"
+                        };
                         (dynamic_sl, r)
                     } else if tp_hit && !sl_hit {
                         (tp_price, "空止盈")
@@ -432,18 +497,28 @@ impl BacktestEngine {
                     };
 
                     let pnl_pct = (state.entry_price - exit_price) / state.entry_price * 100.0;
-                    let quantity = self.config.strategy.quantity_per_trade;
+                    let quantity = state.entry_quantity;
                     let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
-                    let commission = quantity * (state.entry_price + exit_price) * self.config.commission_rate;
+                    let commission =
+                        quantity * (state.entry_price + exit_price) * self.config.commission_rate;
 
                     trade_id += 1;
                     trades.push(TradeRecord {
-                        id: trade_id, entry_time: state.entry_time, exit_time: timestamp,
-                        entry_price: state.entry_price, exit_price, quantity,
-                        pnl_pct, pnl_usdt, commission, hold_seconds: hold_secs,
+                        id: trade_id,
+                        entry_time: state.entry_time,
+                        exit_time: timestamp,
+                        entry_price: state.entry_price,
+                        exit_price,
+                        quantity,
+                        pnl_pct,
+                        pnl_usdt,
+                        commission,
+                        hold_seconds: hold_secs,
                         exit_reason: reason.to_string(),
                     });
                     state.position = Position::None;
+                    state.entry_quantity = 0.0;
+                    state.available_capital += pnl_usdt - commission;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
                     state.last_exit_was_stoploss = reason == "空止损" || reason == "空超时";
@@ -453,7 +528,9 @@ impl BacktestEngine {
             // 检查入场（多因子评分 + ADX过滤 + 波动率政权）
             if state.position == Position::None {
                 // 止损后延长冷却：如果上一笔是止损出场，使用更长的冷却时间
-                let effective_cooldown = if state.last_exit_was_stoploss && self.config.strategy.post_stoploss_cooldown_seconds > 0 {
+                let effective_cooldown = if state.last_exit_was_stoploss
+                    && self.config.strategy.post_stoploss_cooldown_seconds > 0
+                {
                     self.config.strategy.post_stoploss_cooldown_seconds * 1000
                 } else {
                     self.config.strategy.cooldown_seconds * 1000
@@ -471,12 +548,16 @@ impl BacktestEngine {
                 // === ADX过滤 ===
                 let adx_val = state.adx_5m.value().unwrap_or(0.0);
                 let adx_ready = state.adx_5m.is_ready();
-                let adx_above_threshold = !adx_ready || adx_val >= self.config.strategy.adx_min_threshold;
+                let adx_above_threshold =
+                    !adx_ready || adx_val >= self.config.strategy.adx_min_threshold;
 
                 // === 波动率政权过滤 ===
                 let atr_pct = state.atr_5m.percentile();
                 let volatility_normal = match atr_pct {
-                    Some(p) => p >= self.config.strategy.atr_percentile_low && p <= self.config.strategy.atr_percentile_high,
+                    Some(p) => {
+                        p >= self.config.strategy.atr_percentile_low
+                            && p <= self.config.strategy.atr_percentile_high
+                    }
                     None => true, // 数据不足时不过滤
                 };
 
@@ -489,17 +570,23 @@ impl BacktestEngine {
                 // EMA21斜率：判断中期趋势动能方向
                 let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
                     (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
 
                 // EMA50宏观方向
                 let ema50_macro_rising = if state.ema50_history.len() >= 20 {
                     ema_trend > state.ema50_history[0]
-                } else { false };
+                } else {
+                    false
+                };
 
                 // === 趋势环境过滤（L2层）===
                 let price_above_ema50_pct = if ema_trend > 0.0 {
                     (kline.close - ema_trend) / ema_trend * 100.0
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 let long_trend_env_ok = ema_trend > 0.0
                     && price_above_ema50_pct > 0.15
                     && price_above_ema50_pct < self.config.strategy.max_ema50_distance_pct
@@ -509,8 +596,11 @@ impl BacktestEngine {
                 let trend_up = ema_fast_5m > ema_slow_5m;
                 let trend_strength = if ema_slow_5m > 0.0 {
                     (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
-                } else { 0.0 };
-                let trend_strong_enough = trend_strength >= self.config.strategy.min_trend_strength_pct;
+                } else {
+                    0.0
+                };
+                let trend_strong_enough =
+                    trend_strength >= self.config.strategy.min_trend_strength_pct;
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (self.config.strategy.rsi_oversold + 5.0)
                     && rsi < self.config.strategy.rsi_overbought;
@@ -520,24 +610,44 @@ impl BacktestEngine {
 
                 // 突破入场条件
                 let breakout_signal = if state.recent_highs.len() >= 10 {
-                    let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
-                        .iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let lookback_high = state.recent_highs[..state.recent_highs.len() - 1]
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
-                    breakout_pct > 0.05 && vol_ratio > self.config.strategy.volume_ratio_threshold && rsi < 65.0
+                    breakout_pct > 0.05
+                        && vol_ratio > self.config.strategy.volume_ratio_threshold
+                        && rsi < 65.0
                 } else {
                     false
                 };
 
                 // === 多因子评分系统 ===
                 let mut entry_score: u32 = 0;
-                if trend_up { entry_score += 15; }
-                if trend_strong_enough { entry_score += 10; }
-                if adx_above_threshold { entry_score += 15; }
-                if rsi_recovering { entry_score += 15; }
-                if vol_ratio > self.config.strategy.volume_ratio_threshold { entry_score += 15; }
-                if bid_support { entry_score += 10; }
-                if slope_positive { entry_score += 10; }
-                if volatility_normal { entry_score += 10; }
+                if trend_up {
+                    entry_score += 15;
+                }
+                if trend_strong_enough {
+                    entry_score += 10;
+                }
+                if adx_above_threshold {
+                    entry_score += 15;
+                }
+                if rsi_recovering {
+                    entry_score += 15;
+                }
+                if vol_ratio > self.config.strategy.volume_ratio_threshold {
+                    entry_score += 15;
+                }
+                if bid_support {
+                    entry_score += 10;
+                }
+                if slope_positive {
+                    entry_score += 10;
+                }
+                if volatility_normal {
+                    entry_score += 10;
+                }
 
                 // 突破路径额外要求斜率>配置值
                 let breakout_slope_ok = ema21_slope > self.config.strategy.breakout_min_slope;
@@ -546,26 +656,54 @@ impl BacktestEngine {
                 // RSI反弹路径额外要求RSI<55，避免实盘中RSI接近60时追入反弹末端
                 let trend_entry_signal = long_trend_env_ok
                     && entry_score >= self.config.strategy.entry_score_threshold
-                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support && rsi < 55.0)
-                        || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
+                    && ((trend_up
+                        && trend_strong_enough
+                        && rsi_recovering
+                        && rsi_bounce_vr_ok
+                        && bid_support
+                        && rsi < 55.0)
+                        || (breakout_signal
+                            && trend_up
+                            && trend_strong_enough
+                            && breakout_slope_ok));
 
                 // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
                 let mean_revert_signal = if state.recent_highs.len() >= 20 {
-                    let recent_high = state.recent_highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let recent_high = state
+                        .recent_highs
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
-                    drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
+                    drop_pct > 1.2
+                        && rsi < 38.0
+                        && vol_ratio > 2.5
+                        && bid_support
                         && ema21_slope > self.config.strategy.mean_revert_min_slope
                         && ema_trend > 0.0
                         && kline.close >= ema_trend
                         && ema50_macro_rising
-                        && volatility_normal  // 波动率过滤也应用于均值回归
-                } else { false };
+                        && volatility_normal // 波动率过滤也应用于均值回归
+                } else {
+                    false
+                };
 
                 let entry_signal = trend_entry_signal || mean_revert_signal;
 
                 if entry_signal {
+                    let entry_quantity = dynamic_entry_quantity(
+                        state.available_capital,
+                        kline.close,
+                        &self.config.strategy,
+                        self.config.position_allocation_pct,
+                        self.config.min_usdt_reserve,
+                    );
+                    if entry_quantity <= 0.0 {
+                        continue;
+                    }
                     state.position = Position::Long;
                     state.entry_price = kline.close;
+                    state.entry_quantity = entry_quantity;
                     state.entry_time = timestamp;
                     state.highest_since_entry = kline.close;
                     state.trailing_active = false;
@@ -579,36 +717,60 @@ impl BacktestEngine {
                     // 做空入场（与实盘momentum_strategy.rs L864-895一致）
                     let price_below_ema50_pct = if ema_trend > 0.0 {
                         (ema_trend - kline.close) / ema_trend * 100.0
-                    } else { 0.0 };
+                    } else {
+                        0.0
+                    };
                     let short_trend_env_ok = ema_trend > 0.0
                         && price_below_ema50_pct > 0.15  // 至少低于EMA50 0.15%
-                        && ema21_slope < -0.03;  // 斜率<-0.03% 确认下降动能
+                        && ema21_slope < -0.03; // 斜率<-0.03% 确认下降动能
 
                     let trend_down = ema_fast_5m < ema_slow_5m;
                     let short_trend_strength = if ema_slow_5m > 0.0 {
                         (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
-                    } else { 0.0 };
-                    let short_trend_strong = short_trend_strength >= self.config.strategy.min_trend_strength_pct;
+                    } else {
+                        0.0
+                    };
+                    let short_trend_strong =
+                        short_trend_strength >= self.config.strategy.min_trend_strength_pct;
                     let breakdown_signal = if state.recent_lows.len() >= 10 {
-                        let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
-                            .iter().copied().fold(f64::INFINITY, f64::min);
+                        let lookback_low = state.recent_lows[..state.recent_lows.len() - 1]
+                            .iter()
+                            .copied()
+                            .fold(f64::INFINITY, f64::min);
                         let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
-                        breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 40.0
+                        breakdown_pct > 0.05
+                            && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold)
+                            && rsi > 40.0
                     } else {
                         false
                     };
 
                     let rsi_overbought_short = rsi > 70.0;
-                    let sell_pressure = vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
+                    let sell_pressure =
+                        vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
 
                     let short_signal = short_trend_env_ok
                         && adx_above_threshold
                         && ((breakdown_signal && trend_down && short_trend_strong)
-                            || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure));
+                            || (trend_down
+                                && short_trend_strong
+                                && rsi_overbought_short
+                                && sell_pressure));
 
                     if short_signal {
+                        let entry_quantity = dynamic_entry_quantity(
+                            state.available_capital,
+                            kline.close,
+                            &self.config.strategy,
+                            self.config.position_allocation_pct,
+                            self.config.min_usdt_reserve,
+                        );
+                        if entry_quantity <= 0.0 {
+                            continue;
+                        }
                         state.position = Position::Short;
                         state.entry_price = kline.close;
+                        state.entry_quantity = entry_quantity;
                         state.entry_time = timestamp;
                         state.lowest_since_entry = kline.close;
                         state.trailing_active = false;
@@ -633,15 +795,23 @@ impl BacktestEngine {
                     (state.entry_price - current_price) / state.entry_price * 100.0
                 };
                 let hold_secs = (last_kline.close_time - state.entry_time) / 1000;
-                let quantity = self.config.strategy.quantity_per_trade;
+                let quantity = state.entry_quantity;
                 let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
-                let commission = quantity * (state.entry_price + current_price) * self.config.commission_rate;
+                let commission =
+                    quantity * (state.entry_price + current_price) * self.config.commission_rate;
 
                 trade_id += 1;
                 trades.push(TradeRecord {
-                    id: trade_id, entry_time: state.entry_time, exit_time: last_kline.close_time,
-                    entry_price: state.entry_price, exit_price: current_price, quantity,
-                    pnl_pct, pnl_usdt, commission, hold_seconds: hold_secs,
+                    id: trade_id,
+                    entry_time: state.entry_time,
+                    exit_time: last_kline.close_time,
+                    entry_price: state.entry_price,
+                    exit_price: current_price,
+                    quantity,
+                    pnl_pct,
+                    pnl_usdt,
+                    commission,
+                    hold_seconds: hold_secs,
                     exit_reason: "回测结束".to_string(),
                 });
             }
@@ -658,13 +828,16 @@ impl BacktestEngine {
     }
 
     /// 执行录制数据回放回测
-    pub fn run_replay_backtest(&self, file_path: &str) -> Result<BacktestReport, crate::error::DomainError> {
+    pub fn run_replay_backtest(
+        &self,
+        file_path: &str,
+    ) -> Result<BacktestReport, crate::error::DomainError> {
         let events = self.data_loader.load_recorded_events(file_path)?;
 
         println!("\n🔄 开始回放回测...");
         println!("   事件数: {}", events.len());
 
-        let mut state = EngineState::new();
+        let mut state = EngineState::new(self.config.initial_capital);
         let mut trades: Vec<TradeRecord> = Vec::new();
         let mut trade_id = 0;
         let mut start_time = 0u64;
@@ -673,10 +846,14 @@ impl BacktestEngine {
         for event in &events {
             match event {
                 RecordedEvent::Kline(kline) => {
-                    if kline.close <= 0.0 { continue; }
+                    if kline.close <= 0.0 {
+                        continue;
+                    }
 
                     let ts = kline.close_time;
-                    if start_time == 0 { start_time = ts; }
+                    if start_time == 0 {
+                        start_time = ts;
+                    }
                     end_time = ts;
 
                     match kline.interval.as_str() {
@@ -713,14 +890,30 @@ impl BacktestEngine {
                         _ => {}
                     }
                 }
-                RecordedEvent::AggTrade { quantity, is_buyer_maker, timestamp, .. } => {
-                    if *quantity <= 0.0 { continue; }
-                    state.volume_ratio.add_trade(*timestamp, *quantity, *is_buyer_maker);
-                    if start_time == 0 { start_time = *timestamp; }
+                RecordedEvent::AggTrade {
+                    quantity,
+                    is_buyer_maker,
+                    timestamp,
+                    ..
+                } => {
+                    if *quantity <= 0.0 {
+                        continue;
+                    }
+                    state
+                        .volume_ratio
+                        .add_trade(*timestamp, *quantity, *is_buyer_maker);
+                    if start_time == 0 {
+                        start_time = *timestamp;
+                    }
                     end_time = *timestamp;
                 }
                 RecordedEvent::BookTicker {
-                    best_bid, best_bid_qty, best_ask, best_ask_qty, timestamp, ..
+                    best_bid,
+                    best_bid_qty,
+                    best_ask,
+                    best_ask_qty,
+                    timestamp,
+                    ..
                 } => {
                     if *best_bid <= 0.0 || *best_ask <= 0.0 || best_bid >= best_ask {
                         continue;
@@ -731,7 +924,9 @@ impl BacktestEngine {
                     state.best_ask = *best_ask;
                     state.best_ask_qty = *best_ask_qty;
 
-                    if start_time == 0 { start_time = *timestamp; }
+                    if start_time == 0 {
+                        start_time = *timestamp;
+                    }
                     end_time = *timestamp;
 
                     state.check_daily_reset(*timestamp);
@@ -748,13 +943,19 @@ impl BacktestEngine {
 
                         // 更新入场后最高价
                         state.highest_since_entry = state.highest_since_entry.max(current_price);
-                        let pnl_pct = (current_price - state.entry_price) / state.entry_price * 100.0;
-                        let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
+                        let pnl_pct =
+                            (current_price - state.entry_price) / state.entry_price * 100.0;
+                        let highest_pnl_pct = (state.highest_since_entry - state.entry_price)
+                            / state.entry_price
+                            * 100.0;
 
                         // 计算动态止损价
-                        let dynamic_sl = if highest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
+                        let dynamic_sl = if highest_pnl_pct
+                            >= self.config.strategy.trailing_trigger_pct
+                        {
                             state.trailing_active = true;
-                            state.highest_since_entry * (1.0 - self.config.strategy.trailing_distance_pct / 100.0)
+                            state.highest_since_entry
+                                * (1.0 - self.config.strategy.trailing_distance_pct / 100.0)
                         } else if highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
                             state.breakeven_active = true;
                             state.entry_price
@@ -782,9 +983,11 @@ impl BacktestEngine {
                                 "RSI超买"
                             };
 
-                            let quantity = self.config.strategy.quantity_per_trade;
+                            let quantity = state.entry_quantity;
                             let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
-                            let commission = quantity * (state.entry_price + current_price) * self.config.commission_rate;
+                            let commission = quantity
+                                * (state.entry_price + current_price)
+                                * self.config.commission_rate;
 
                             trade_id += 1;
                             trades.push(TradeRecord {
@@ -802,6 +1005,8 @@ impl BacktestEngine {
                             });
 
                             state.position = Position::None;
+                            state.entry_quantity = 0.0;
+                            state.available_capital += pnl_usdt - commission;
                             state.daily_pnl += pnl_pct;
                             state.last_trade_time = *timestamp;
                             continue;
@@ -814,12 +1019,18 @@ impl BacktestEngine {
                         let hold_secs = (timestamp - state.entry_time) / 1000;
 
                         state.lowest_since_entry = state.lowest_since_entry.min(current_price);
-                        let pnl_pct = (state.entry_price - current_price) / state.entry_price * 100.0;
-                        let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
+                        let pnl_pct =
+                            (state.entry_price - current_price) / state.entry_price * 100.0;
+                        let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry)
+                            / state.entry_price
+                            * 100.0;
 
-                        let dynamic_sl = if lowest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
+                        let dynamic_sl = if lowest_pnl_pct
+                            >= self.config.strategy.trailing_trigger_pct
+                        {
                             state.trailing_active = true;
-                            state.lowest_since_entry * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
+                            state.lowest_since_entry
+                                * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
                         } else if lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
                             state.breakeven_active = true;
                             state.entry_price
@@ -844,9 +1055,11 @@ impl BacktestEngine {
                                 "空超时"
                             };
 
-                            let quantity = self.config.strategy.quantity_per_trade;
+                            let quantity = state.entry_quantity;
                             let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
-                            let commission = quantity * (state.entry_price + current_price) * self.config.commission_rate;
+                            let commission = quantity
+                                * (state.entry_price + current_price)
+                                * self.config.commission_rate;
 
                             trade_id += 1;
                             trades.push(TradeRecord {
@@ -864,6 +1077,8 @@ impl BacktestEngine {
                             });
 
                             state.position = Position::None;
+                            state.entry_quantity = 0.0;
+                            state.available_capital += pnl_usdt - commission;
                             state.daily_pnl += pnl_pct;
                             state.last_trade_time = *timestamp;
                             continue;
@@ -872,7 +1087,9 @@ impl BacktestEngine {
 
                     // 入场检查
                     if state.position == Position::None {
-                        if timestamp - state.last_trade_time < self.config.strategy.cooldown_seconds * 1000 {
+                        if timestamp - state.last_trade_time
+                            < self.config.strategy.cooldown_seconds * 1000
+                        {
                             continue;
                         }
                         if state.daily_trades >= self.config.strategy.max_daily_trades {
@@ -890,8 +1107,11 @@ impl BacktestEngine {
                         let trend_up = ema_fast_5m > ema_slow_5m;
                         let trend_strength = if ema_slow_5m > 0.0 {
                             (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
-                        } else { 0.0 };
-                        let trend_strong_enough = trend_strength >= self.config.strategy.min_trend_strength_pct;
+                        } else {
+                            0.0
+                        };
+                        let trend_strong_enough =
+                            trend_strength >= self.config.strategy.min_trend_strength_pct;
                         let rsi_recovering = state.rsi_was_oversold
                             && rsi > (self.config.strategy.rsi_oversold + 5.0)
                             && rsi < self.config.strategy.rsi_overbought;
@@ -900,21 +1120,41 @@ impl BacktestEngine {
 
                         // 突破入场（replay模式用best_ask作为当前价）
                         let breakout_signal = if state.recent_highs.len() >= 10 {
-                            let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
-                                .iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                            let breakout_pct = (state.best_ask - lookback_high) / lookback_high * 100.0;
+                            let lookback_high = state.recent_highs[..state.recent_highs.len() - 1]
+                                .iter()
+                                .copied()
+                                .fold(f64::NEG_INFINITY, f64::max);
+                            let breakout_pct =
+                                (state.best_ask - lookback_high) / lookback_high * 100.0;
                             // RSI < 65: 防止在RSI高位追高
-                            breakout_pct > 0.05 && vol_ratio > self.config.strategy.volume_ratio_threshold && rsi < 65.0
+                            breakout_pct > 0.05
+                                && vol_ratio > self.config.strategy.volume_ratio_threshold
+                                && rsi < 65.0
                         } else {
                             false
                         };
 
-                        let entry_signal = (trend_up && trend_strong_enough && rsi_recovering && buy_dominant && bid_support)
+                        let entry_signal = (trend_up
+                            && trend_strong_enough
+                            && rsi_recovering
+                            && buy_dominant
+                            && bid_support)
                             || (breakout_signal && trend_up && trend_strong_enough);
 
                         if entry_signal {
+                            let entry_quantity = dynamic_entry_quantity(
+                                state.available_capital,
+                                state.best_ask,
+                                &self.config.strategy,
+                                self.config.position_allocation_pct,
+                                self.config.min_usdt_reserve,
+                            );
+                            if entry_quantity <= 0.0 {
+                                continue;
+                            }
                             state.position = Position::Long;
                             state.entry_price = state.best_ask;
+                            state.entry_quantity = entry_quantity;
                             state.entry_time = *timestamp;
                             state.highest_since_entry = state.best_ask;
                             state.trailing_active = false;
@@ -928,27 +1168,52 @@ impl BacktestEngine {
                             let trend_down = ema_fast_5m < ema_slow_5m;
                             let short_trend_strength = if ema_slow_5m > 0.0 {
                                 (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
-                            } else { 0.0 };
-                            let short_trend_strong = short_trend_strength >= self.config.strategy.min_trend_strength_pct;
+                            } else {
+                                0.0
+                            };
+                            let short_trend_strong =
+                                short_trend_strength >= self.config.strategy.min_trend_strength_pct;
                             let breakdown_signal = if state.recent_lows.len() >= 10 {
-                                let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
-                                    .iter().copied().fold(f64::INFINITY, f64::min);
-                                let breakdown_pct = (lookback_low - state.best_bid) / lookback_low * 100.0;
+                                let lookback_low = state.recent_lows[..state.recent_lows.len() - 1]
+                                    .iter()
+                                    .copied()
+                                    .fold(f64::INFINITY, f64::min);
+                                let breakdown_pct =
+                                    (lookback_low - state.best_bid) / lookback_low * 100.0;
                                 // RSI > 35: 防止RSI极度超卖时做空击穿
-                                breakdown_pct > 0.05 && vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold) && rsi > 40.0
+                                breakdown_pct > 0.05
+                                    && vol_ratio
+                                        < (1.0 / self.config.strategy.volume_ratio_threshold)
+                                    && rsi > 40.0
                             } else {
                                 false
                             };
 
                             let rsi_overbought_short = rsi > 70.0;
-                            let sell_pressure = vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
+                            let sell_pressure =
+                                vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
 
-                            let short_signal = (breakdown_signal && trend_down && short_trend_strong)
-                                || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure);
+                            let short_signal =
+                                (breakdown_signal && trend_down && short_trend_strong)
+                                    || (trend_down
+                                        && short_trend_strong
+                                        && rsi_overbought_short
+                                        && sell_pressure);
 
                             if short_signal {
+                                let entry_quantity = dynamic_entry_quantity(
+                                    state.available_capital,
+                                    state.best_bid,
+                                    &self.config.strategy,
+                                    self.config.position_allocation_pct,
+                                    self.config.min_usdt_reserve,
+                                );
+                                if entry_quantity <= 0.0 {
+                                    continue;
+                                }
                                 state.position = Position::Short;
                                 state.entry_price = state.best_bid;
+                                state.entry_quantity = entry_quantity;
                                 state.entry_time = *timestamp;
                                 state.lowest_since_entry = state.best_bid;
                                 state.trailing_active = false;
@@ -978,14 +1243,22 @@ impl BacktestEngine {
                     (state.entry_price - current_price) / state.entry_price * 100.0
                 };
                 let hold_secs = (end_time - state.entry_time) / 1000;
-                let quantity = self.config.strategy.quantity_per_trade;
+                let quantity = state.entry_quantity;
                 let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
-                let commission = quantity * (state.entry_price + current_price) * self.config.commission_rate;
+                let commission =
+                    quantity * (state.entry_price + current_price) * self.config.commission_rate;
                 trade_id += 1;
                 trades.push(TradeRecord {
-                    id: trade_id, entry_time: state.entry_time, exit_time: end_time,
-                    entry_price: state.entry_price, exit_price: current_price, quantity,
-                    pnl_pct, pnl_usdt, commission, hold_seconds: hold_secs,
+                    id: trade_id,
+                    entry_time: state.entry_time,
+                    exit_time: end_time,
+                    entry_price: state.entry_price,
+                    exit_price: current_price,
+                    quantity,
+                    pnl_pct,
+                    pnl_usdt,
+                    commission,
+                    hold_seconds: hold_secs,
                     exit_reason: "回测结束".to_string(),
                 });
             }
@@ -1007,11 +1280,20 @@ impl BacktestEngine {
     }
 
     /// 使用指定策略配置运行K线回测（不打印过程，用于参数优化）
-    pub fn run_with_config(&self, strategy: &StrategyConfig) -> Result<BacktestReport, crate::error::DomainError> {
+    pub fn run_with_config(
+        &self,
+        strategy: &StrategyConfig,
+    ) -> Result<BacktestReport, crate::error::DomainError> {
         let symbol = &self.config.symbol;
         let klines_1m = self.data_loader.load_klines(symbol, "1m")?;
         let klines_5m = self.data_loader.load_klines(symbol, "5m")?;
-        Self::run_backtest_on_data(&klines_1m, &klines_5m, strategy, self.config.initial_capital, self.config.commission_rate)
+        Self::run_backtest_on_data(
+            &klines_1m,
+            &klines_5m,
+            strategy,
+            self.config.initial_capital,
+            self.config.commission_rate,
+        )
     }
 
     /// 使用预加载数据运行回测（零IO，用于高速参数优化）
@@ -1022,7 +1304,6 @@ impl BacktestEngine {
         initial_capital: f64,
         commission_rate: f64,
     ) -> Result<BacktestReport, crate::error::DomainError> {
-
         let mut events: Vec<(&BacktestKline, bool)> = Vec::new();
         for k in klines_1m {
             events.push((k, true));
@@ -1035,12 +1316,14 @@ impl BacktestEngine {
         let start_time = events.first().map(|(k, _)| k.open_time).unwrap_or(0);
         let end_time = events.last().map(|(k, _)| k.close_time).unwrap_or(0);
 
-        let mut state = EngineState::new();
+        let mut state = EngineState::new(initial_capital);
         let mut trades: Vec<TradeRecord> = Vec::new();
         let mut trade_id = 0;
 
         for (kline, is_1m) in &events {
-            if kline.close <= 0.0 { continue; }
+            if kline.close <= 0.0 {
+                continue;
+            }
             let timestamp = kline.close_time;
 
             if *is_1m {
@@ -1096,7 +1379,9 @@ impl BacktestEngine {
             }
 
             state.check_daily_reset(timestamp);
-            if !state.is_warmed_up() { continue; }
+            if !state.is_warmed_up() {
+                continue;
+            }
 
             // 出场（阶梯式保护机制 + ATR动态止损）
             if state.position == Position::Long {
@@ -1104,7 +1389,8 @@ impl BacktestEngine {
                 let rsi = state.rsi_1m.value().unwrap_or(50.0);
 
                 state.highest_since_entry = state.highest_since_entry.max(kline.high);
-                let highest_pnl_pct = (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
+                let highest_pnl_pct =
+                    (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
                 let effective_atr = current_atr.max(state.entry_atr);
@@ -1151,16 +1437,24 @@ impl BacktestEngine {
 
                 if should_exit {
                     let (exit_price, reason) = if sl_hit && !tp_hit {
-                        let r = if state.trailing_active { "追踪止损" }
-                            else if state.breakeven_active { "保本止损" }
-                            else { "止损" };
+                        let r = if state.trailing_active {
+                            "追踪止损"
+                        } else if state.breakeven_active {
+                            "保本止损"
+                        } else {
+                            "止损"
+                        };
                         (dynamic_sl, r)
                     } else if tp_hit && !sl_hit {
                         (tp_price, "硬止盈")
                     } else if sl_hit && tp_hit {
-                        let r = if state.trailing_active { "追踪止损" }
-                            else if state.breakeven_active { "保本止损" }
-                            else { "止损" };
+                        let r = if state.trailing_active {
+                            "追踪止损"
+                        } else if state.breakeven_active {
+                            "保本止损"
+                        } else {
+                            "止损"
+                        };
                         (dynamic_sl, r)
                     } else if stale_exit {
                         (kline.close, "僵尸早退")
@@ -1171,18 +1465,27 @@ impl BacktestEngine {
                     };
 
                     let pnl_pct = (exit_price - state.entry_price) / state.entry_price * 100.0;
-                    let quantity = strategy.quantity_per_trade;
+                    let quantity = state.entry_quantity;
                     let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
                     let commission = quantity * (state.entry_price + exit_price) * commission_rate;
 
                     trade_id += 1;
                     trades.push(TradeRecord {
-                        id: trade_id, entry_time: state.entry_time, exit_time: timestamp,
-                        entry_price: state.entry_price, exit_price, quantity,
-                        pnl_pct, pnl_usdt, commission, hold_seconds: hold_secs,
+                        id: trade_id,
+                        entry_time: state.entry_time,
+                        exit_time: timestamp,
+                        entry_price: state.entry_price,
+                        exit_price,
+                        quantity,
+                        pnl_pct,
+                        pnl_usdt,
+                        commission,
+                        hold_seconds: hold_secs,
                         exit_reason: reason.to_string(),
                     });
                     state.position = Position::None;
+                    state.entry_quantity = 0.0;
+                    state.available_capital += pnl_usdt - commission;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
                     state.last_exit_was_stoploss = reason == "止损" || reason == "超时";
@@ -1194,7 +1497,8 @@ impl BacktestEngine {
                 let hold_secs = (timestamp - state.entry_time) / 1000;
 
                 state.lowest_since_entry = state.lowest_since_entry.min(kline.low);
-                let lowest_pnl_pct = (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
+                let lowest_pnl_pct =
+                    (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
 
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
                 let effective_atr = current_atr.max(state.entry_atr);
@@ -1241,9 +1545,13 @@ impl BacktestEngine {
 
                 if should_exit {
                     let (exit_price, reason) = if sl_hit && !tp_hit {
-                        let r = if state.trailing_active { "空追踪止损" }
-                            else if state.breakeven_active { "空保本止损" }
-                            else { "空止损" };
+                        let r = if state.trailing_active {
+                            "空追踪止损"
+                        } else if state.breakeven_active {
+                            "空保本止损"
+                        } else {
+                            "空止损"
+                        };
                         (dynamic_sl, r)
                     } else if tp_hit && !sl_hit {
                         (tp_price, "空止盈")
@@ -1257,18 +1565,27 @@ impl BacktestEngine {
 
                     // 做空盈亏: (入场价 - 出场价) / 入场价
                     let pnl_pct = (state.entry_price - exit_price) / state.entry_price * 100.0;
-                    let quantity = strategy.quantity_per_trade;
+                    let quantity = state.entry_quantity;
                     let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
                     let commission = quantity * (state.entry_price + exit_price) * commission_rate;
 
                     trade_id += 1;
                     trades.push(TradeRecord {
-                        id: trade_id, entry_time: state.entry_time, exit_time: timestamp,
-                        entry_price: state.entry_price, exit_price, quantity,
-                        pnl_pct, pnl_usdt, commission, hold_seconds: hold_secs,
+                        id: trade_id,
+                        entry_time: state.entry_time,
+                        exit_time: timestamp,
+                        entry_price: state.entry_price,
+                        exit_price,
+                        quantity,
+                        pnl_pct,
+                        pnl_usdt,
+                        commission,
+                        hold_seconds: hold_secs,
                         exit_reason: reason.to_string(),
                     });
                     state.position = Position::None;
+                    state.entry_quantity = 0.0;
+                    state.available_capital += pnl_usdt - commission;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
                     state.last_exit_was_stoploss = reason == "空止损" || reason == "空超时";
@@ -1278,14 +1595,22 @@ impl BacktestEngine {
             // 入场（多因子评分 + ADX过滤 + 波动率政权）
             if state.position == Position::None {
                 // 止损后延长冷却
-                let effective_cooldown = if state.last_exit_was_stoploss && strategy.post_stoploss_cooldown_seconds > 0 {
+                let effective_cooldown = if state.last_exit_was_stoploss
+                    && strategy.post_stoploss_cooldown_seconds > 0
+                {
                     strategy.post_stoploss_cooldown_seconds * 1000
                 } else {
                     strategy.cooldown_seconds * 1000
                 };
-                if timestamp - state.last_trade_time < effective_cooldown { continue; }
-                if state.daily_trades >= strategy.max_daily_trades { continue; }
-                if state.daily_pnl <= -strategy.max_daily_loss_pct { continue; }
+                if timestamp - state.last_trade_time < effective_cooldown {
+                    continue;
+                }
+                if state.daily_trades >= strategy.max_daily_trades {
+                    continue;
+                }
+                if state.daily_pnl <= -strategy.max_daily_loss_pct {
+                    continue;
+                }
 
                 // === ADX过滤 ===
                 let adx_val = state.adx_5m.value().unwrap_or(0.0);
@@ -1295,7 +1620,9 @@ impl BacktestEngine {
                 // === 波动率政权过滤 ===
                 let atr_pct = state.atr_5m.percentile();
                 let volatility_normal = match atr_pct {
-                    Some(p) => p >= strategy.atr_percentile_low && p <= strategy.atr_percentile_high,
+                    Some(p) => {
+                        p >= strategy.atr_percentile_low && p <= strategy.atr_percentile_high
+                    }
                     None => true,
                 };
 
@@ -1307,15 +1634,21 @@ impl BacktestEngine {
 
                 let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
                     (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
 
                 let ema50_macro_rising = if state.ema50_history.len() >= 20 {
                     ema_trend > state.ema50_history[0]
-                } else { false };
+                } else {
+                    false
+                };
 
                 let price_above_ema50_pct = if ema_trend > 0.0 {
                     (kline.close - ema_trend) / ema_trend * 100.0
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 let long_trend_env_ok = ema_trend > 0.0
                     && price_above_ema50_pct > 0.15
                     && price_above_ema50_pct < strategy.max_ema50_distance_pct
@@ -1325,7 +1658,9 @@ impl BacktestEngine {
                 let trend_up = ema_fast_5m > ema_slow_5m;
                 let trend_strength = if ema_slow_5m > 0.0 {
                     (ema_fast_5m - ema_slow_5m) / ema_slow_5m * 100.0
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 let trend_strong_enough = trend_strength >= strategy.min_trend_strength_pct;
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (strategy.rsi_oversold + 5.0)
@@ -1335,8 +1670,10 @@ impl BacktestEngine {
                 let slope_positive = ema21_slope > 0.03;
 
                 let breakout_signal = if state.recent_highs.len() >= 10 {
-                    let lookback_high = state.recent_highs[..state.recent_highs.len()-1]
-                        .iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let lookback_high = state.recent_highs[..state.recent_highs.len() - 1]
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
                     breakout_pct > 0.05 && vol_ratio > strategy.volume_ratio_threshold && rsi < 65.0
                 } else {
@@ -1345,39 +1682,83 @@ impl BacktestEngine {
 
                 // === 多因子评分系统 ===
                 let mut entry_score: u32 = 0;
-                if trend_up { entry_score += 15; }
-                if trend_strong_enough { entry_score += 10; }
-                if adx_above_threshold { entry_score += 15; }
-                if rsi_recovering { entry_score += 15; }
-                if vol_ratio > strategy.volume_ratio_threshold { entry_score += 15; }
-                if bid_support { entry_score += 10; }
-                if slope_positive { entry_score += 10; }
-                if volatility_normal { entry_score += 10; }
+                if trend_up {
+                    entry_score += 15;
+                }
+                if trend_strong_enough {
+                    entry_score += 10;
+                }
+                if adx_above_threshold {
+                    entry_score += 15;
+                }
+                if rsi_recovering {
+                    entry_score += 15;
+                }
+                if vol_ratio > strategy.volume_ratio_threshold {
+                    entry_score += 15;
+                }
+                if bid_support {
+                    entry_score += 10;
+                }
+                if slope_positive {
+                    entry_score += 10;
+                }
+                if volatility_normal {
+                    entry_score += 10;
+                }
 
                 let breakout_slope_ok = ema21_slope > strategy.breakout_min_slope;
 
                 let trend_entry_signal = long_trend_env_ok
                     && entry_score >= strategy.entry_score_threshold
-                    && ((trend_up && trend_strong_enough && rsi_recovering && rsi_bounce_vr_ok && bid_support && rsi < 55.0)
-                        || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
+                    && ((trend_up
+                        && trend_strong_enough
+                        && rsi_recovering
+                        && rsi_bounce_vr_ok
+                        && bid_support
+                        && rsi < 55.0)
+                        || (breakout_signal
+                            && trend_up
+                            && trend_strong_enough
+                            && breakout_slope_ok));
 
                 // 均值回归入场信号
                 let mean_revert_signal = if state.recent_highs.len() >= 20 {
-                    let recent_high = state.recent_highs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let recent_high = state
+                        .recent_highs
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
-                    drop_pct > 1.2 && rsi < 38.0 && vol_ratio > 2.5 && bid_support
+                    drop_pct > 1.2
+                        && rsi < 38.0
+                        && vol_ratio > 2.5
+                        && bid_support
                         && ema21_slope > strategy.mean_revert_min_slope
                         && ema_trend > 0.0
                         && kline.close >= ema_trend
                         && ema50_macro_rising
                         && volatility_normal
-                } else { false };
+                } else {
+                    false
+                };
 
                 let entry_signal = trend_entry_signal || mean_revert_signal;
 
                 if entry_signal {
+                    let entry_quantity = dynamic_entry_quantity(
+                        state.available_capital,
+                        kline.close,
+                        strategy,
+                        DEFAULT_POSITION_ALLOCATION_PCT,
+                        DEFAULT_MIN_USDT_RESERVE,
+                    );
+                    if entry_quantity <= 0.0 {
+                        continue;
+                    }
                     state.position = Position::Long;
                     state.entry_price = kline.close;
+                    state.entry_quantity = entry_quantity;
                     state.entry_time = timestamp;
                     state.highest_since_entry = kline.close;
                     state.trailing_active = false;
@@ -1391,21 +1772,29 @@ impl BacktestEngine {
                     // 做空入场（趋势环境过滤）
                     let price_below_ema50_pct = if ema_trend > 0.0 {
                         (ema_trend - kline.close) / ema_trend * 100.0
-                    } else { 0.0 };
-                    let short_trend_env_ok = ema_trend > 0.0
-                        && price_below_ema50_pct > 0.15
-                        && ema21_slope < -0.03;
+                    } else {
+                        0.0
+                    };
+                    let short_trend_env_ok =
+                        ema_trend > 0.0 && price_below_ema50_pct > 0.15 && ema21_slope < -0.03;
 
                     let trend_down = ema_fast_5m < ema_slow_5m;
                     let short_trend_strength = if ema_slow_5m > 0.0 {
                         (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
-                    } else { 0.0 };
-                    let short_trend_strong = short_trend_strength >= strategy.min_trend_strength_pct;
+                    } else {
+                        0.0
+                    };
+                    let short_trend_strong =
+                        short_trend_strength >= strategy.min_trend_strength_pct;
                     let breakdown_signal = if state.recent_lows.len() >= 10 {
-                        let lookback_low = state.recent_lows[..state.recent_lows.len()-1]
-                            .iter().copied().fold(f64::INFINITY, f64::min);
+                        let lookback_low = state.recent_lows[..state.recent_lows.len() - 1]
+                            .iter()
+                            .copied()
+                            .fold(f64::INFINITY, f64::min);
                         let breakdown_pct = (lookback_low - kline.close) / lookback_low * 100.0;
-                        breakdown_pct > 0.05 && vol_ratio < (1.0 / strategy.volume_ratio_threshold) && rsi > 40.0
+                        breakdown_pct > 0.05
+                            && vol_ratio < (1.0 / strategy.volume_ratio_threshold)
+                            && rsi > 40.0
                     } else {
                         false
                     };
@@ -1416,11 +1805,25 @@ impl BacktestEngine {
                     let short_signal = short_trend_env_ok
                         && adx_above_threshold
                         && ((breakdown_signal && trend_down && short_trend_strong)
-                            || (trend_down && short_trend_strong && rsi_overbought_short && sell_pressure));
+                            || (trend_down
+                                && short_trend_strong
+                                && rsi_overbought_short
+                                && sell_pressure));
 
                     if short_signal {
+                        let entry_quantity = dynamic_entry_quantity(
+                            state.available_capital,
+                            kline.close,
+                            strategy,
+                            DEFAULT_POSITION_ALLOCATION_PCT,
+                            DEFAULT_MIN_USDT_RESERVE,
+                        );
+                        if entry_quantity <= 0.0 {
+                            continue;
+                        }
                         state.position = Position::Short;
                         state.entry_price = kline.close;
+                        state.entry_quantity = entry_quantity;
                         state.entry_time = timestamp;
                         state.lowest_since_entry = kline.close;
                         state.trailing_active = false;
@@ -1445,19 +1848,31 @@ impl BacktestEngine {
                     (state.entry_price - current_price) / state.entry_price * 100.0
                 };
                 let hold_secs = (last_kline.close_time - state.entry_time) / 1000;
-                let quantity = strategy.quantity_per_trade;
+                let quantity = state.entry_quantity;
                 let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
                 let commission = quantity * (state.entry_price + current_price) * commission_rate;
                 trade_id += 1;
                 trades.push(TradeRecord {
-                    id: trade_id, entry_time: state.entry_time, exit_time: last_kline.close_time,
-                    entry_price: state.entry_price, exit_price: current_price, quantity,
-                    pnl_pct, pnl_usdt, commission, hold_seconds: hold_secs,
+                    id: trade_id,
+                    entry_time: state.entry_time,
+                    exit_time: last_kline.close_time,
+                    entry_price: state.entry_price,
+                    exit_price: current_price,
+                    quantity,
+                    pnl_pct,
+                    pnl_usdt,
+                    commission,
+                    hold_seconds: hold_secs,
                     exit_reason: "回测结束".to_string(),
                 });
             }
         }
 
-        Ok(BacktestReport::generate(trades, initial_capital, start_time, end_time))
+        Ok(BacktestReport::generate(
+            trades,
+            initial_capital,
+            start_time,
+            end_time,
+        ))
     }
 }

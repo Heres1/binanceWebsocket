@@ -98,7 +98,13 @@ impl DataLoader {
             }
 
             let klines = client
-                .get_klines(symbol, interval, Some(current_start), Some(end_time), Some(1000))
+                .get_klines(
+                    symbol,
+                    interval,
+                    Some(current_start),
+                    Some(end_time),
+                    Some(1000),
+                )
                 .await?;
 
             if klines.is_empty() {
@@ -111,7 +117,11 @@ impl DataLoader {
                 all_klines.push(BacktestKline::from_kline_data(k, symbol, interval));
             }
 
-            println!("   已下载 {} 根K线 (总计: {})", klines.len(), all_klines.len());
+            println!(
+                "   已下载 {} 根K线 (总计: {})",
+                klines.len(),
+                all_klines.len()
+            );
 
             // 下一批从最后一根K线的close_time+1开始
             current_start = last_time + 1;
@@ -137,20 +147,27 @@ impl DataLoader {
     }
 
     /// 从本地文件加载K线数据
-    pub fn load_klines(&self, symbol: &str, interval: &str) -> Result<Vec<BacktestKline>, DomainError> {
+    pub fn load_klines(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> Result<Vec<BacktestKline>, DomainError> {
         let file_path = format!("{}/history/{}_{}.json", self.data_dir, symbol, interval);
 
         if !Path::new(&file_path).exists() {
-            return Err(crate::error::ServiceError::MarketData(
-                format!("K线数据文件不存在: {} (请先运行下载)", file_path)
-            ).into());
+            return Err(crate::error::ServiceError::MarketData(format!(
+                "K线数据文件不存在: {} (请先运行下载)",
+                file_path
+            ))
+            .into());
         }
 
         let content = std::fs::read_to_string(&file_path)
             .map_err(|e| crate::error::InfrastructureError::io_with_operation("读取K线文件", e))?;
 
-        let klines: Vec<BacktestKline> = serde_json::from_str(&content)
-            .map_err(|e| crate::error::ServiceError::MarketData(format!("解析K线文件失败: {}", e)))?;
+        let klines: Vec<BacktestKline> = serde_json::from_str(&content).map_err(|e| {
+            crate::error::ServiceError::MarketData(format!("解析K线文件失败: {}", e))
+        })?;
 
         println!("📂 加载K线: {} {} ({} 根)", symbol, interval, klines.len());
         Ok(klines)
@@ -159,9 +176,11 @@ impl DataLoader {
     /// 从录制文件加载事件数据
     pub fn load_recorded_events(&self, file_path: &str) -> Result<Vec<RecordedEvent>, DomainError> {
         if !Path::new(file_path).exists() {
-            return Err(crate::error::ServiceError::MarketData(
-                format!("录制文件不存在: {}", file_path)
-            ).into());
+            return Err(crate::error::ServiceError::MarketData(format!(
+                "录制文件不存在: {}",
+                file_path
+            ))
+            .into());
         }
 
         let content = std::fs::read_to_string(file_path)

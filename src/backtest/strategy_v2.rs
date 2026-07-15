@@ -9,7 +9,7 @@
 
 use crate::backtest::data_loader::BacktestKline;
 use crate::backtest::report::{BacktestReport, TradeRecord};
-use crate::strategies::indicators::{EMA, RSI, VolumeRatio};
+use crate::strategies::indicators::{VolumeRatio, EMA, RSI};
 
 /// 策略类型枚举
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -88,7 +88,7 @@ impl Default for StrategyV2Config {
             short_take_profit_pct: 1.0,
             short_stop_loss_pct: 0.5,
             short_trailing_stop_pct: 0.3,
-            short_max_hold_seconds: 14400, // 4小时
+            short_max_hold_seconds: 14400,  // 4小时
             short_min_trend_strength: 0.05, // EMA差值>0.05%
         }
     }
@@ -120,8 +120,8 @@ struct StateV2 {
     direction: Direction,
     entry_price: f64,
     entry_time: u64,
-    highest_since_entry: f64,  // 入场后最高价（追踪止损用）
-    lowest_since_entry: f64,   // 入场后最低价（做空追踪止损用）
+    highest_since_entry: f64, // 入场后最高价（追踪止损用）
+    lowest_since_entry: f64,  // 入场后最低价（做空追踪止损用）
 
     // 冷却与统计
     last_trade_time: u64,
@@ -396,7 +396,8 @@ fn check_exit_v2(
 
         // 检查trailing stop（bar内low <= trailing价格）
         if config.trailing_stop_pct > 0.0
-            && state.highest_since_entry > state.entry_price * (1.0 + config.trailing_stop_pct / 100.0)
+            && state.highest_since_entry
+                > state.entry_price * (1.0 + config.trailing_stop_pct / 100.0)
             && kline.low <= trailing_price
         {
             return Some((trailing_price, "追踪止损".to_string()));
@@ -435,7 +436,8 @@ fn check_exit_v2(
 
         // Trailing stop
         if config.short_trailing_stop_pct > 0.0
-            && state.lowest_since_entry < state.entry_price * (1.0 - config.short_trailing_stop_pct / 100.0)
+            && state.lowest_since_entry
+                < state.entry_price * (1.0 - config.short_trailing_stop_pct / 100.0)
             && kline.high >= trailing_price
         {
             return Some((trailing_price, "追踪止损".to_string()));
@@ -494,7 +496,8 @@ fn check_entry_v2(
                 && trend_down_5m
                 && vol_ratio < (1.0 / config.volume_ratio_threshold)
                 && trend_strength_5m > config.short_min_trend_strength
-                && ema_fast_1m < ema_slow_1m  // 1m也确认下跌
+                && ema_fast_1m < ema_slow_1m
+            // 1m也确认下跌
             {
                 return Some(Direction::Short);
             }
@@ -502,16 +505,19 @@ fn check_entry_v2(
 
         StrategyType::EmaCrossover => {
             // 做多：1m快线从下方穿越慢线（金叉）+ 5m趋势向上
-            let crossed_up = state.prev_ema_fast_1m <= state.prev_ema_slow_1m
-                && ema_fast_1m > ema_slow_1m;
+            let crossed_up =
+                state.prev_ema_fast_1m <= state.prev_ema_slow_1m && ema_fast_1m > ema_slow_1m;
             if crossed_up && trend_up_5m {
                 return Some(Direction::Long);
             }
             // 做空：1m快线从上方穿越慢线（死叉）+ 5m趋势向下 + 趋势强度确认
             if config.allow_short {
-                let crossed_down = state.prev_ema_fast_1m >= state.prev_ema_slow_1m
-                    && ema_fast_1m < ema_slow_1m;
-                if crossed_down && trend_down_5m && trend_strength_5m > config.short_min_trend_strength {
+                let crossed_down =
+                    state.prev_ema_fast_1m >= state.prev_ema_slow_1m && ema_fast_1m < ema_slow_1m;
+                if crossed_down
+                    && trend_down_5m
+                    && trend_strength_5m > config.short_min_trend_strength
+                {
                     return Some(Direction::Short);
                 }
             }
@@ -567,24 +573,48 @@ fn check_entry_v2(
             let mut short_score: f64 = 0.0;
 
             // 趋势得分 (30分)
-            if trend_up_5m { long_score += 30.0; }
-            if trend_down_5m { short_score += 30.0; }
+            if trend_up_5m {
+                long_score += 30.0;
+            }
+            if trend_down_5m {
+                short_score += 30.0;
+            }
 
             // 1m EMA方向 (20分)
-            if ema_fast_1m > ema_slow_1m { long_score += 20.0; }
-            if ema_fast_1m < ema_slow_1m { short_score += 20.0; }
+            if ema_fast_1m > ema_slow_1m {
+                long_score += 20.0;
+            }
+            if ema_fast_1m < ema_slow_1m {
+                short_score += 20.0;
+            }
 
             // RSI得分 (25分)
-            if rsi < 40.0 { long_score += 25.0; } // 偏低，有上涨空间
-            else if rsi < 50.0 { long_score += 15.0; }
-            if rsi > 60.0 { short_score += 25.0; } // 偏高，有下跌风险
-            else if rsi > 50.0 { short_score += 15.0; }
+            if rsi < 40.0 {
+                long_score += 25.0;
+            }
+            // 偏低，有上涨空间
+            else if rsi < 50.0 {
+                long_score += 15.0;
+            }
+            if rsi > 60.0 {
+                short_score += 25.0;
+            }
+            // 偏高，有下跌风险
+            else if rsi > 50.0 {
+                short_score += 15.0;
+            }
 
             // 成交量得分 (25分)
-            if vol_ratio > 1.5 { long_score += 25.0; }
-            else if vol_ratio > 1.2 { long_score += 15.0; }
-            if vol_ratio < 0.67 { short_score += 25.0; }
-            else if vol_ratio < 0.83 { short_score += 15.0; }
+            if vol_ratio > 1.5 {
+                long_score += 25.0;
+            } else if vol_ratio > 1.2 {
+                long_score += 15.0;
+            }
+            if vol_ratio < 0.67 {
+                short_score += 25.0;
+            } else if vol_ratio < 0.83 {
+                short_score += 15.0;
+            }
 
             if long_score >= config.min_entry_score {
                 return Some(Direction::Long);

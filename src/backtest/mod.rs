@@ -4,11 +4,11 @@
 
 pub mod data_loader;
 pub mod engine;
-pub mod report;
 pub mod recorder;
+pub mod report;
 pub mod strategy_v2;
 
+pub use data_loader::DataLoader;
 pub use engine::BacktestEngine;
 pub use report::BacktestReport;
-pub use data_loader::DataLoader;
-pub use strategy_v2::{run_backtest_v2, StrategyV2Config, StrategyType};
+pub use strategy_v2::{run_backtest_v2, StrategyType, StrategyV2Config};

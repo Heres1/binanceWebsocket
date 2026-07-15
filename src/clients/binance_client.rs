@@ -2,13 +2,13 @@
 //!
 //! 提供下单、撤单、查询订单、查询账户等功能
 
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use hex;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{DomainError, ServiceError};
@@ -22,8 +22,8 @@ pub struct BinanceClient {
     api_key: String,
     secret_key: String,
     base_url: String,
-    recv_window: u64,  // 毫秒，默认 5000
-    max_retries: u32,  // 最大重试次数
+    recv_window: u64, // 毫秒，默认 5000
+    max_retries: u32, // 最大重试次数
     /// 速率限制：在此时间戳(ms)之前暂停所有REST请求
     rate_limited_until_ms: Arc<AtomicU64>,
 }
@@ -152,12 +152,15 @@ impl BinanceClient {
     /// 创建新的 Binance 客户端
     pub fn new(api_key: String, secret_key: String, base_url: String) -> Self {
         use reqwest::header;
-        
+
         // 如果是 SSH 隧道模式（localhost），需要禁用证书验证并设置正确的 Host 头
         let client = if base_url.contains("localhost") {
             let mut headers = header::HeaderMap::new();
-            headers.insert(header::HOST, header::HeaderValue::from_static("api.binance.com"));
-            
+            headers.insert(
+                header::HOST,
+                header::HeaderValue::from_static("api.binance.com"),
+            );
+
             reqwest::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .default_headers(headers)
@@ -172,14 +175,14 @@ impl BinanceClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new())
         };
-        
+
         Self {
             client,
             api_key,
             secret_key,
             base_url,
-            recv_window: 5000,  // 5秒
-            max_retries: 2,     // 最多重试2次（共试3次）
+            recv_window: 5000, // 5秒
+            max_retries: 2,    // 最多重试2次（共试3次）
             rate_limited_until_ms: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -187,17 +190,29 @@ impl BinanceClient {
     /// 检查是否处于速率限制冷却期
     pub fn is_rate_limited(&self) -> bool {
         let until = self.rate_limited_until_ms.load(Ordering::Relaxed);
-        if until == 0 { return false; }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        if until == 0 {
+            return false;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         now < until
     }
 
     /// 获取剩余冷却秒数（用于日志）
     pub fn rate_limit_remaining_secs(&self) -> u64 {
         let until = self.rate_limited_until_ms.load(Ordering::Relaxed);
-        if until == 0 { return 0; }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-        if now >= until { return 0; }
+        if until == 0 {
+            return 0;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        if now >= until {
+            return 0;
+        }
         (until - now) / 1000
     }
 
@@ -225,9 +240,8 @@ impl BinanceClient {
 
     /// 构建带签名的查询字符串（使用 BTreeMap 保证参数顺序确定性）
     fn build_signed_query(&self, params: &HashMap<String, String>) -> String {
-        let mut query: BTreeMap<String, String> = params.iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut query: BTreeMap<String, String> =
+            params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         query.insert("timestamp".to_string(), self.timestamp().to_string());
         query.insert("recvWindow".to_string(), self.recv_window.to_string());
 
@@ -242,26 +256,33 @@ impl BinanceClient {
     }
 
     /// 发送 GET 请求（带重试+速率限制检查）
-    async fn get(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
+    async fn get(
+        &self,
+        path: &str,
+        params: &HashMap<String, String>,
+    ) -> Result<serde_json::Value, DomainError> {
         // 速率限制检查：如果处于冷却期，直接返回错误而不发请求
         if self.is_rate_limited() {
             return Err(ServiceError::Order(format!(
-                "API速率限制中，剩余冷却{}s", self.rate_limit_remaining_secs()
-            )).into());
+                "API速率限制中，剩余冷却{}s",
+                self.rate_limit_remaining_secs()
+            ))
+            .into());
         }
         let mut last_err = None;
-        
+
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
                 log::warn!("GET {} 重试 {}/{}", path, attempt, self.max_retries);
                 tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
             }
-            
+
             // 每次重试重新生成签名（timestamp会变）
             let query = self.build_signed_query(params);
             let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
-            
-            match self.client
+
+            match self
+                .client
                 .get(&url)
                 .header("X-MBX-APIKEY", &self.api_key)
                 .send()
@@ -273,29 +294,36 @@ impl BinanceClient {
                 }
             }
         }
-        
+
         Err(last_err.unwrap().into())
     }
 
     /// 发送 POST 请求（带重试，仅网络层失败时重试）
-    async fn post(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
+    async fn post(
+        &self,
+        path: &str,
+        params: &HashMap<String, String>,
+    ) -> Result<serde_json::Value, DomainError> {
         if self.is_rate_limited() {
             return Err(ServiceError::Order(format!(
-                "API速率限制中，剩余冷却{}s", self.rate_limit_remaining_secs()
-            )).into());
+                "API速率限制中，剩余冷却{}s",
+                self.rate_limit_remaining_secs()
+            ))
+            .into());
         }
         let mut last_err = None;
-        
+
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
                 log::warn!("POST {} 重试 {}/{}", path, attempt, self.max_retries);
                 tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
             }
-            
+
             let query = self.build_signed_query(params);
             let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
-            
-            match self.client
+
+            match self
+                .client
                 .post(&url)
                 .header("X-MBX-APIKEY", &self.api_key)
                 .send()
@@ -307,29 +335,36 @@ impl BinanceClient {
                 }
             }
         }
-        
+
         Err(last_err.unwrap().into())
     }
 
     /// 发送 DELETE 请求（带重试）
-    async fn delete(&self, path: &str, params: &HashMap<String, String>) -> Result<serde_json::Value, DomainError> {
+    async fn delete(
+        &self,
+        path: &str,
+        params: &HashMap<String, String>,
+    ) -> Result<serde_json::Value, DomainError> {
         if self.is_rate_limited() {
             return Err(ServiceError::Order(format!(
-                "API速率限制中，剩余冷却{}s", self.rate_limit_remaining_secs()
-            )).into());
+                "API速率限制中，剩余冷却{}s",
+                self.rate_limit_remaining_secs()
+            ))
+            .into());
         }
         let mut last_err = None;
-        
+
         for attempt in 0..=self.max_retries {
             if attempt > 0 {
                 log::warn!("DELETE {} 重试 {}/{}", path, attempt, self.max_retries);
                 tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
             }
-            
+
             let query = self.build_signed_query(params);
             let url = format!("{}/api/v3{}?{}", self.base_url, path, query);
-            
-            match self.client
+
+            match self
+                .client
                 .delete(&url)
                 .header("X-MBX-APIKEY", &self.api_key)
                 .send()
@@ -341,12 +376,15 @@ impl BinanceClient {
                 }
             }
         }
-        
+
         Err(last_err.unwrap().into())
     }
 
     /// 处理 HTTP 响应
-    async fn handle_response(&self, response: reqwest::Response) -> Result<serde_json::Value, DomainError> {
+    async fn handle_response(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<serde_json::Value, DomainError> {
         let status = response.status();
         let text = response
             .text()
@@ -358,21 +396,25 @@ impl BinanceClient {
             if let Ok(error) = serde_json::from_str::<BinanceApiError>(&text) {
                 return Err(self.handle_api_error(error));
             }
-            
+
             return Err(DomainError::Service(ServiceError::MarketData(format!(
                 "HTTP 错误 {}: {}",
                 status, text
             ))));
         }
 
-        serde_json::from_str(&text)
-            .map_err(|e| DomainError::Service(ServiceError::MarketData(format!("JSON 解析失败: {}, 响应: {}", e, text))))
+        serde_json::from_str(&text).map_err(|e| {
+            DomainError::Service(ServiceError::MarketData(format!(
+                "JSON 解析失败: {}, 响应: {}",
+                e, text
+            )))
+        })
     }
 
     /// 处理 Binance API 错误
     fn handle_api_error(&self, error: BinanceApiError) -> DomainError {
         let error_msg = format!("Binance API 错误 [{}]: {}", error.code, error.msg);
-        
+
         // 根据错误码分类处理
         match error.code {
             -1003 => {
@@ -380,18 +422,33 @@ impl BinanceClient {
                 // 尝试从消息中解析ban时间，否则默认暂停120秒
                 let pause_ms = if error.msg.contains("IP banned until") {
                     // 解析: "...IP banned until 1781112351786..."
-                    error.msg.split("banned until ").nth(1)
+                    error
+                        .msg
+                        .split("banned until ")
+                        .nth(1)
                         .and_then(|s| s.split('.').next())
                         .and_then(|s| s.trim().parse::<u64>().ok())
                         .unwrap_or_else(|| {
-                            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 300_000
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64
+                                + 300_000
                         })
                 } else {
                     // 普通速率限制，暂停120秒
-                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 + 120_000
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64
+                        + 120_000
                 };
-                self.rate_limited_until_ms.store(pause_ms, Ordering::Relaxed);
-                log::error!("⚠️ API速率限制触发，暂停REST请求至冷却结束 | 原因: {}", error.msg);
+                self.rate_limited_until_ms
+                    .store(pause_ms, Ordering::Relaxed);
+                log::error!(
+                    "⚠️ API速率限制触发，暂停REST请求至冷却结束 | 原因: {}",
+                    error.msg
+                );
                 ServiceError::Order(format!("速率限制: {}", error.msg))
             }
             -1000 => ServiceError::Order(format!("未知错误: {}", error.msg)),
@@ -400,7 +457,8 @@ impl BinanceClient {
             -2010 => ServiceError::Order(format!("资金不足: {}", error.msg)),
             -2011 => ServiceError::Order(format!("订单取消: {}", error.msg)),
             _ => ServiceError::Order(error_msg),
-        }.into()
+        }
+        .into()
     }
 
     /// 下单
@@ -448,7 +506,11 @@ impl BinanceClient {
 
         log::debug!(
             "API响应: {} {} {} @ {} (数量: {})",
-            order.symbol, order.side, order.order_type, order.price, order.orig_qty
+            order.symbol,
+            order.side,
+            order.order_type,
+            order.price,
+            order.orig_qty
         );
 
         Ok(order)
@@ -462,7 +524,10 @@ impl BinanceClient {
         orig_client_order_id: Option<String>,
     ) -> Result<CancelOrderResponse, DomainError> {
         if order_id.is_none() && orig_client_order_id.is_none() {
-            return Err(ServiceError::Order("必须提供 order_id 或 orig_client_order_id".to_string()).into());
+            return Err(ServiceError::Order(
+                "必须提供 order_id 或 orig_client_order_id".to_string(),
+            )
+            .into());
         }
 
         let mut params = HashMap::new();
@@ -480,7 +545,11 @@ impl BinanceClient {
         let cancel_response: CancelOrderResponse = serde_json::from_value(response)
             .map_err(|e| ServiceError::Order(format!("解析撤单响应失败: {}", e)))?;
 
-        log::info!("订单已撤销: {} #{}", cancel_response.symbol, cancel_response.order_id);
+        log::info!(
+            "订单已撤销: {} #{}",
+            cancel_response.symbol,
+            cancel_response.order_id
+        );
 
         Ok(cancel_response)
     }
@@ -493,7 +562,10 @@ impl BinanceClient {
         orig_client_order_id: Option<String>,
     ) -> Result<OrderResponse, DomainError> {
         if order_id.is_none() && orig_client_order_id.is_none() {
-            return Err(ServiceError::Order("必须提供 order_id 或 orig_client_order_id".to_string()).into());
+            return Err(ServiceError::Order(
+                "必须提供 order_id 或 orig_client_order_id".to_string(),
+            )
+            .into());
         }
 
         let mut params = HashMap::new();
@@ -518,11 +590,15 @@ impl BinanceClient {
     pub async fn get_account(&self) -> Result<AccountInfo, DomainError> {
         let params = HashMap::new();
         let response = self.get("/account", &params).await?;
-        
+
         let account: AccountInfo = serde_json::from_value(response)
             .map_err(|e| ServiceError::Account(format!("解析账户信息失败: {}", e)))?;
 
-        log::debug!("账户信息获取成功 | 可交易: {} | 资产数: {}", account.can_trade, account.balances.len());
+        log::debug!(
+            "账户信息获取成功 | 可交易: {} | 资产数: {}",
+            account.can_trade,
+            account.balances.len()
+        );
 
         Ok(account)
     }
@@ -530,8 +606,9 @@ impl BinanceClient {
     /// 获取特定资产余额
     pub async fn get_balance(&self, asset: &str) -> Result<Balance, DomainError> {
         let account = self.get_account().await?;
-        
-        account.balances
+
+        account
+            .balances
             .into_iter()
             .find(|b| b.asset == asset)
             .ok_or_else(|| ServiceError::Account(format!("未找到资产: {}", asset)).into())
@@ -568,40 +645,49 @@ impl BinanceClient {
             url.push_str(&format!("&endTime={}", end));
         }
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
             .map_err(|e| ServiceError::MarketData(format!("获取K线失败: {}", e)))?;
 
         let status = response.status();
-        let text = response.text().await
+        let text = response
+            .text()
+            .await
             .map_err(|e| ServiceError::MarketData(format!("读取K线响应失败: {}", e)))?;
 
         if !status.is_success() {
-            return Err(DomainError::Service(ServiceError::MarketData(
-                format!("获取K线HTTP错误 {}: {}", status, text)
-            )));
+            return Err(DomainError::Service(ServiceError::MarketData(format!(
+                "获取K线HTTP错误 {}: {}",
+                status, text
+            ))));
         }
 
         // Binance返回的是二维数组 [[open_time, open, high, low, close, volume, close_time, ...]]
         let raw: Vec<Vec<serde_json::Value>> = serde_json::from_str(&text)
             .map_err(|e| ServiceError::MarketData(format!("解析K线JSON失败: {}", e)))?;
 
-        let klines: Vec<KlineData> = raw.iter().filter_map(|k| {
-            if k.len() < 11 { return None; }
-            Some(KlineData {
-                open_time: k[0].as_u64()?,
-                open: k[1].as_str()?.parse().ok()?,
-                high: k[2].as_str()?.parse().ok()?,
-                low: k[3].as_str()?.parse().ok()?,
-                close: k[4].as_str()?.parse().ok()?,
-                volume: k[5].as_str()?.parse().ok()?,
-                close_time: k[6].as_u64()?,
-                trades_count: k[8].as_u64()?,
-                taker_buy_volume: k[9].as_str()?.parse().ok()?,
+        let klines: Vec<KlineData> = raw
+            .iter()
+            .filter_map(|k| {
+                if k.len() < 11 {
+                    return None;
+                }
+                Some(KlineData {
+                    open_time: k[0].as_u64()?,
+                    open: k[1].as_str()?.parse().ok()?,
+                    high: k[2].as_str()?.parse().ok()?,
+                    low: k[3].as_str()?.parse().ok()?,
+                    close: k[4].as_str()?.parse().ok()?,
+                    volume: k[5].as_str()?.parse().ok()?,
+                    close_time: k[6].as_u64()?,
+                    trades_count: k[8].as_u64()?,
+                    taker_buy_volume: k[9].as_str()?.parse().ok()?,
+                })
             })
-        }).collect();
+            .collect();
 
         Ok(klines)
     }
@@ -635,7 +721,8 @@ impl BinanceClient {
         let query = self.build_signed_query(&params);
         let url = format!("{}/api/v3/order/test?{}", self.base_url, query);
 
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("X-MBX-APIKEY", &self.api_key)
             .send()
@@ -667,7 +754,7 @@ mod tests {
         // 签名应该是确定性的
         let signature1 = client.sign("symbol=BTCUSDT&side=BUY&type=LIMIT");
         let signature2 = client.sign("symbol=BTCUSDT&side=BUY&type=LIMIT");
-        
+
         assert_eq!(signature1, signature2);
         assert_eq!(signature1.len(), 64); // SHA256 hex 长度
     }
@@ -685,7 +772,7 @@ mod tests {
         params.insert("side".to_string(), "BUY".to_string());
 
         let query = client.build_signed_query(&params);
-        
+
         assert!(query.contains("symbol=BTCUSDT"));
         assert!(query.contains("side=BUY"));
         assert!(query.contains("timestamp="));
@@ -703,7 +790,7 @@ mod tests {
 
         let ts1 = client.timestamp();
         let ts2 = client.timestamp();
-        
+
         // 两次调用应该非常接近（毫秒级）
         assert!((ts2 - ts1) < 100);
     }

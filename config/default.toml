@@ -25,7 +25,7 @@ testnet = false
 [strategy]
 # 交易对
 symbol = "BTCUSDT"
-# 每笔交易数量 (BTC) - 按服务器实盘可用USDT 161.9345、BTC价约62170重配，接近全额投入并保留约2U滑点缓冲
+# 每笔交易数量 (BTC) - 动态仓位启用后作为回测基准和单笔数量上限，实盘BUY会按可用USDT自动下调
 quantity_per_trade = 0.00256
 # 硬止盈上限
 # 追踪止损为主，硬止盈只作为极端趋势保护
@@ -104,7 +104,7 @@ entry_score_threshold = 75
 # 多品种交易对配置
 [[trading_pairs]]
 symbol = "BTCUSDT"
-quantity_per_trade = 0.00256   # 按当前可用USDT约161.93U重配，单笔约159U，接近全额使用
+quantity_per_trade = 0.00256   # 动态仓位启用后作为上限，实盘按可用USDT和BTC价格自动下调
 allow_short = false
 
 # ETH/SOL在当前熊市不盈利，暂停交易
@@ -125,6 +125,10 @@ max_position_usdt = 215.0
 max_single_order_usdt = 175.0
 # 日亏损上限 (USDT) - 全仓后最多承受约2次常规止损
 max_daily_loss_usdt = 4.0
+# 动态仓位资金使用率：按可用USDT的98.5%与最小缓冲共同约束，避免价格上涨后资金不足
+position_allocation_pct = 0.985
+# 最小USDT缓冲：即使接近全仓，也至少保留该金额用于滑点/价格波动
+min_usdt_reserve = 2.0
 # 最小下单间隔 (秒)
 min_order_interval_secs = 10
 

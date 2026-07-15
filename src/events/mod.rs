@@ -1,21 +1,21 @@
 //! 事件定义模块
-//! 
+//!
 //! 包含系统中所有领域事件的定义
 
-mod market_events;
-mod trading_events;
 mod account_events;
-mod strategy_events;
+mod market_events;
 mod risk_events;
+mod strategy_events;
+mod trading_events;
 
-pub use market_events::*;
-pub use trading_events::*;
 pub use account_events::*;
-pub use strategy_events::*;
+pub use market_events::*;
 pub use risk_events::*;
+pub use strategy_events::*;
+pub use trading_events::*;
 
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// 事件元数据 - 每个事件都包含的通用信息
@@ -60,7 +60,7 @@ pub enum DomainEvent {
     AggTrade(AggTradeEvent),
     /// 最优买卖价
     BookTicker(BookTickerEvent),
-    
+
     // ========== 交易事件 ==========
     /// 订单提交
     OrderSubmitted(OrderSubmittedEvent),
@@ -70,17 +70,17 @@ pub enum DomainEvent {
     OrderCancelled(OrderCancelledEvent),
     /// 订单拒绝
     OrderRejected(OrderRejectedEvent),
-    
+
     // ========== 账户事件 ==========
     /// 余额更新
     BalanceUpdate(BalanceUpdateEvent),
     /// 持仓变动
     PositionChange(PositionChangeEvent),
-    
+
     // ========== 策略事件 ==========
     /// 交易信号
     TradingSignal(TradingSignalEvent),
-    
+
     // ========== 风控事件 ==========
     /// 风控检查
     RiskCheck(RiskCheckEvent),

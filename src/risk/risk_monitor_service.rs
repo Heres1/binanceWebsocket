@@ -2,14 +2,14 @@
 //!
 //! 实时监控风险指标，发布风控事件
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
+use crate::config::RiskConfig;
+use crate::error::EventBusError;
 use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
 use crate::events::DomainEvent;
-use crate::error::EventBusError;
 use crate::risk::rules::RiskRules;
-use crate::config::RiskConfig;
 
 /// 风控监控服务
 pub struct RiskMonitorService {
@@ -42,11 +42,10 @@ impl RiskMonitorService {
         available_balance: f64,
         current_position: f64,
     ) -> Result<(), crate::events::RiskAlertEvent> {
-        let result = self.rules.pre_trade_check(
-            order_amount,
-            available_balance,
-            current_position,
-        ).await;
+        let result = self
+            .rules
+            .pre_trade_check(order_amount, available_balance, current_position)
+            .await;
 
         match result {
             Ok(_) => Ok(()),
@@ -56,10 +55,15 @@ impl RiskMonitorService {
                 if let Err(e) = self.event_bus.publish(event).await {
                     log::error!("发布风控告警事件失败: {}", e);
                 }
-                
+
                 Err(alert)
             }
         }
+    }
+
+    /// 获取风控配置快照
+    pub fn config(&self) -> RiskConfig {
+        self.rules.config().clone()
     }
 
     /// 记录订单
@@ -91,7 +95,7 @@ impl EventHandler for RiskMonitorService {
                     balance_event.locked_balance
                 );
             }
-            
+
             // 监听订单成交
             DomainEvent::OrderFilled(fill_event) => {
                 log::debug!(
@@ -100,10 +104,10 @@ impl EventHandler for RiskMonitorService {
                     fill_event.fill_price,
                     fill_event.fill_qty
                 );
-                
+
                 // TODO: 计算盈亏并更新风控状态
             }
-            
+
             // 监听持仓变动
             DomainEvent::PositionChange(position_event) => {
                 log::debug!(
@@ -112,16 +116,16 @@ impl EventHandler for RiskMonitorService {
                     position_event.quantity,
                     position_event.unrealized_pnl
                 );
-                
+
                 // 更新持仓
                 self.update_position(position_event.quantity).await;
             }
-            
+
             _ => {
                 // 忽略不感兴趣的事件
             }
         }
-        
+
         Ok(())
     }
 
@@ -147,10 +151,12 @@ mod tests {
             max_single_order_usdt: 100.0,
             max_daily_loss_usdt: 50.0,
             min_order_interval_secs: 10,
+            position_allocation_pct: 0.985,
+            min_usdt_reserve: 2.0,
         };
-        
+
         let service = RiskMonitorService::new(config, event_bus);
-        
+
         // 验证服务创建成功
         assert!(service.rules.get_state().await.daily_order_count == 0);
     }
@@ -163,10 +169,12 @@ mod tests {
             max_single_order_usdt: 100.0,
             max_daily_loss_usdt: 50.0,
             min_order_interval_secs: 10,
+            position_allocation_pct: 0.985,
+            min_usdt_reserve: 2.0,
         };
-        
+
         let service = RiskMonitorService::new(config, event_bus);
-        
+
         // 正常情况应该通过
         let result = service.pre_trade_check(50.0, 500.0, 200.0).await;
         assert!(result.is_ok());

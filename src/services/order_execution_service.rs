@@ -210,26 +210,138 @@ impl OrderExecutionService {
 
     /// 执行交易信号 - 使用市价单快速成交
     pub async fn execute_signal(&self, signal: &TradingSignalEvent) -> Result<(), DomainError> {
-        // 1. 计算订单金额
-        let quantity = signal
-            .suggested_quantity
-            .ok_or_else(|| ServiceError::Order("交易信号缺少数量".to_string()))?;
-
-        let order_amount = quantity * signal.suggested_price;
-
-        // 2. 判断是否为平仓操作（SELL/COVER不需要USDT，只需持有资产）
+        // 1. 判断交易方向与是否为平仓操作
         let is_exit = signal.signal_type == "SELL" || signal.signal_type == "COVER";
-        // SELL=卖出资产(平多), COVER=买回资产(平空)
-        // 只有SELL需要检查资产余额，COVER需要的是USDT
+        let side = if signal.signal_type == "BUY" || signal.signal_type == "COVER" {
+            "BUY"
+        } else {
+            "SELL"
+        };
+        // SELL=卖出资产(平多)，只有SELL需要检查资产余额
         let needs_asset_check = signal.signal_type == "SELL";
+
+        let risk_config = self.risk_service.config();
+        let (available_balance, current_position) = {
+            let bal = self.balance.lock().await;
+            (
+                bal.available_usdt,
+                bal.position_value(signal.suggested_price),
+            )
+        };
+
+        let mut quantity = match signal.suggested_quantity {
+            Some(q) if q > 0.0 => q,
+            _ if signal.signal_type == "BUY" => {
+                let alloc_cap = available_balance * risk_config.position_allocation_pct;
+                let reserve_cap = (available_balance - risk_config.min_usdt_reserve).max(0.0);
+                let deployable_usdt = alloc_cap
+                    .min(reserve_cap)
+                    .min(risk_config.max_single_order_usdt);
+                if deployable_usdt <= 0.0 || signal.suggested_price <= 0.0 {
+                    return Err(ServiceError::Order(format!(
+                        "动态仓位无法下单: 可用 {:.2} USDT，缓冲 {:.2} USDT，价格 {:.2}",
+                        available_balance, risk_config.min_usdt_reserve, signal.suggested_price
+                    ))
+                    .into());
+                }
+                let dynamic_qty = deployable_usdt / signal.suggested_price;
+                log::info!(
+                    "动态仓位计算 | {} | 可用:{:.2}U 使用率:{:.1}% 缓冲:{:.2}U 可投:{:.2}U 价格:{:.2} 数量:{:.6}",
+                    signal.symbol,
+                    available_balance,
+                    risk_config.position_allocation_pct * 100.0,
+                    risk_config.min_usdt_reserve,
+                    deployable_usdt,
+                    signal.suggested_price,
+                    dynamic_qty
+                );
+                dynamic_qty
+            }
+            _ => return Err(ServiceError::Order("交易信号缺少数量".to_string()).into()),
+        };
+
+        if signal.signal_type == "BUY" {
+            let alloc_cap = available_balance * risk_config.position_allocation_pct;
+            let reserve_cap = (available_balance - risk_config.min_usdt_reserve).max(0.0);
+            let deployable_usdt = alloc_cap
+                .min(reserve_cap)
+                .min(risk_config.max_single_order_usdt);
+            let max_affordable_qty = if signal.suggested_price > 0.0 {
+                deployable_usdt / signal.suggested_price
+            } else {
+                0.0
+            };
+            if quantity > max_affordable_qty {
+                log::info!(
+                    "动态仓位下调 | {} | 信号量:{:.6} -> 可负担量:{:.6} | 可用:{:.2}U 可投:{:.2}U",
+                    signal.symbol,
+                    quantity,
+                    max_affordable_qty,
+                    available_balance,
+                    deployable_usdt
+                );
+                quantity = max_affordable_qty;
+            }
+        }
+
+        // 2. 对卖出平仓(SELL)，使用实际持有量（扣除手续费后的真实余额）
+        let actual_quantity = if needs_asset_check {
+            let bal = self.balance.lock().await;
+            let asset_free = match signal.symbol.as_str() {
+                "BTCUSDT" => bal.btc_free,
+                "ETHUSDT" => bal.eth_free,
+                "SOLUSDT" => bal.sol_free,
+                _ => quantity,
+            };
+            drop(bal);
+            let q = quantity.min(asset_free);
+            if q < quantity * 0.5 {
+                log::error!(
+                    "平仓异常 | {} | 信号量: {:.6} | 实际持有: {:.6}，跳过",
+                    signal.symbol,
+                    quantity,
+                    asset_free
+                );
+                return Err(ServiceError::Order(format!(
+                    "持有量不足: 需要 {:.6}，实际 {:.6}",
+                    quantity, asset_free
+                ))
+                .into());
+            }
+            let rounded = round_step_size(q, &signal.symbol);
+            if rounded <= 0.0 {
+                log::error!(
+                    "平仓异常 | {} | 取整后数量为0 | 原始: {:.6}",
+                    signal.symbol,
+                    q
+                );
+                return Err(ServiceError::Order(format!("取整后数量为0: 原始 {:.6}", q)).into());
+            }
+            if rounded < q {
+                log::info!(
+                    "平仓量调整 | {} | {:.6} -> {:.6} (LOT_SIZE取整)",
+                    signal.symbol,
+                    q,
+                    rounded
+                );
+            }
+            rounded
+        } else {
+            let rounded = round_step_size(quantity, &signal.symbol);
+            if rounded <= 0.0 {
+                return Err(ServiceError::Order(format!(
+                    "下单数量过小: 原始 {:.8}，取整后为0",
+                    quantity
+                ))
+                .into());
+            }
+            rounded
+        };
+
+        let order_amount = actual_quantity * signal.suggested_price;
 
         // 3. 仅对开仓操作做风控检查（平仓操作跳过，确保能及时止损/止盈）
         if !is_exit {
-            let bal = self.balance.lock().await;
-            let available_balance = bal.available_usdt;
-            let current_position = bal.position_value(signal.suggested_price);
-            drop(bal);
-
             log::debug!(
                 "风控检查: 余额={:.2} USDT, 持仓={:.2} USDT, 订单={:.2} USDT",
                 available_balance,
@@ -271,64 +383,7 @@ impl OrderExecutionService {
             }
         }
 
-        // 4. 对卖出平仓(SELL)，使用实际持有量（扣除手续费后的真实余额）
-        // 注意：COVER(平空=买回)不需要资产余额检查，它需要的是USDT
-        let actual_quantity = if needs_asset_check {
-            let bal = self.balance.lock().await;
-            let asset_free = match signal.symbol.as_str() {
-                "BTCUSDT" => bal.btc_free,
-                "ETHUSDT" => bal.eth_free,
-                "SOLUSDT" => bal.sol_free,
-                _ => quantity,
-            };
-            drop(bal);
-            // 使用 min(信号数量, 实际持有量)，避免超出余额
-            let q = quantity.min(asset_free);
-            if q < quantity * 0.5 {
-                // 如果实际持有量不到信号数量的一半，说明余额异常
-                log::error!(
-                    "平仓异常 | {} | 信号量: {:.6} | 实际持有: {:.6}，跳过",
-                    signal.symbol,
-                    quantity,
-                    asset_free
-                );
-                return Err(ServiceError::Order(format!(
-                    "持有量不足: 需要 {:.6}，实际 {:.6}",
-                    quantity, asset_free
-                ))
-                .into());
-            }
-            // 按交易对 LOT_SIZE stepSize 向下取整，确保符合交易所精度要求
-            let rounded = round_step_size(q, &signal.symbol);
-            if rounded <= 0.0 {
-                log::error!(
-                    "平仓异常 | {} | 取整后数量为0 | 原始: {:.6}",
-                    signal.symbol,
-                    q
-                );
-                return Err(ServiceError::Order(format!("取整后数量为0: 原始 {:.6}", q)).into());
-            }
-            if rounded < q {
-                log::info!(
-                    "平仓量调整 | {} | {:.6} -> {:.6} (LOT_SIZE取整)",
-                    signal.symbol,
-                    q,
-                    rounded
-                );
-            }
-            rounded
-        } else {
-            // 开仓也需要取整
-            round_step_size(quantity, &signal.symbol)
-        };
-
-        // 5. 调用 API 下单 - 使用市价单快速成交
-        // BUY/COVER(买入) vs SELL/SHORT(卖出)
-        let side = if signal.signal_type == "BUY" || signal.signal_type == "COVER" {
-            "BUY"
-        } else {
-            "SELL"
-        };
+        // 4. 调用 API 下单 - 使用市价单快速成交
 
         let order_result = self
             .client
@@ -404,9 +459,13 @@ impl OrderExecutionService {
         // 8. 发布订单成交事件（市价单立即成交）
         let fill_event = DomainEvent::OrderFilled(OrderFilledEvent {
             order_id: order_result.order_id.to_string(),
+            signal_id: signal.signal_id.clone(),
+            symbol: order_result.symbol.clone(),
+            side: side.to_string(),
             fill_id: format!("fill_{}", order_result.order_id),
             fill_price,
             fill_qty,
+            actual_quote_qty,
             commission,
             commission_asset: commission_asset.clone(),
             is_maker: false,
@@ -443,11 +502,14 @@ impl EventHandler for OrderExecutionService {
             }
 
             log::info!(
-                "→ 执行信号: {} | {} @ {:.2} | 数量: {:.6}",
+                "→ 执行信号: {} | {} @ {:.2} | 数量: {}",
                 signal.signal_type,
                 signal.symbol,
                 signal.suggested_price,
-                signal.suggested_quantity.unwrap_or(0.0)
+                signal
+                    .suggested_quantity
+                    .map(|q| format!("{:.6}", q))
+                    .unwrap_or_else(|| "动态".to_string())
             );
 
             if let Err(e) = self.execute_signal(signal).await {

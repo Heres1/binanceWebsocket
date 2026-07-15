@@ -146,22 +146,42 @@ impl BacktestReport {
         };
 
         // 平均持仓时间
-        let avg_hold_seconds = trades.iter().map(|t| t.hold_seconds as f64).sum::<f64>()
-            / total_trades as f64;
+        let avg_hold_seconds =
+            trades.iter().map(|t| t.hold_seconds as f64).sum::<f64>() / total_trades as f64;
 
         // 最大回撤
         let max_drawdown_pct = Self::calc_max_drawdown(&trades, initial_capital);
 
         // 盈亏比
         let avg_win: f64 = {
-            let wins: Vec<f64> = trades.iter().filter(|t| t.pnl_pct > 0.0).map(|t| t.pnl_pct).collect();
-            if wins.is_empty() { 0.0 } else { wins.iter().sum::<f64>() / wins.len() as f64 }
+            let wins: Vec<f64> = trades
+                .iter()
+                .filter(|t| t.pnl_pct > 0.0)
+                .map(|t| t.pnl_pct)
+                .collect();
+            if wins.is_empty() {
+                0.0
+            } else {
+                wins.iter().sum::<f64>() / wins.len() as f64
+            }
         };
         let avg_loss: f64 = {
-            let losses: Vec<f64> = trades.iter().filter(|t| t.pnl_pct < 0.0).map(|t| t.pnl_pct.abs()).collect();
-            if losses.is_empty() { 0.0 } else { losses.iter().sum::<f64>() / losses.len() as f64 }
+            let losses: Vec<f64> = trades
+                .iter()
+                .filter(|t| t.pnl_pct < 0.0)
+                .map(|t| t.pnl_pct.abs())
+                .collect();
+            if losses.is_empty() {
+                0.0
+            } else {
+                losses.iter().sum::<f64>() / losses.len() as f64
+            }
         };
-        let profit_loss_ratio = if avg_loss > 0.0 { avg_win / avg_loss } else { 0.0 };
+        let profit_loss_ratio = if avg_loss > 0.0 {
+            avg_win / avg_loss
+        } else {
+            0.0
+        };
 
         // 夏普比率（日收益的标准差）
         let sharpe_ratio = Self::calc_sharpe(&trades, backtest_days);
@@ -170,8 +190,14 @@ impl BacktestReport {
         let max_consecutive_losses = Self::calc_max_consecutive_losses(&trades);
 
         // 最大单笔
-        let max_profit_pct = trades.iter().map(|t| t.pnl_pct).fold(f64::NEG_INFINITY, f64::max);
-        let max_loss_pct = trades.iter().map(|t| t.pnl_pct).fold(f64::INFINITY, f64::min);
+        let max_profit_pct = trades
+            .iter()
+            .map(|t| t.pnl_pct)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let max_loss_pct = trades
+            .iter()
+            .map(|t| t.pnl_pct)
+            .fold(f64::INFINITY, f64::min);
 
         Self {
             initial_capital,
@@ -224,7 +250,8 @@ impl BacktestReport {
 
         let returns: Vec<f64> = trades.iter().map(|t| t.pnl_pct / 100.0).collect();
         let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+        let variance =
+            returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
         let std_dev = variance.sqrt();
 
         if std_dev == 0.0 {
@@ -266,8 +293,10 @@ impl BacktestReport {
         println!("   最终资金:       {:.2} USDT", self.final_capital);
         println!("   总收益率:       {:.2}%", self.total_return_pct);
         println!("   年化收益率:     {:.2}%", self.annual_return_pct);
-        println!("   胜率:           {:.1}% ({}/{})",
-            self.win_rate, self.winning_trades, self.total_trades);
+        println!(
+            "   胜率:           {:.1}% ({}/{})",
+            self.win_rate, self.winning_trades, self.total_trades
+        );
         println!("   最大回撤:       {:.2}%", self.max_drawdown_pct);
         println!("   总交易次数:     {}", self.total_trades);
         println!("   平均持仓:       {:.0}秒", self.avg_hold_seconds);
@@ -287,22 +316,40 @@ impl BacktestReport {
         // 逐笔明细（显示前20笔+后5笔）
         if !self.trades.is_empty() {
             println!("\n📝 交易明细 (共{}笔):", self.trades.len());
-            println!("   {:<4} {:<12} {:<12} {:<10} {:<10} {:<8} {:<8}",
-                "#", "入场价", "出场价", "盈亏%", "盈亏USDT", "持仓秒", "原因");
+            println!(
+                "   {:<4} {:<12} {:<12} {:<10} {:<10} {:<8} {:<8}",
+                "#", "入场价", "出场价", "盈亏%", "盈亏USDT", "持仓秒", "原因"
+            );
             println!("   {}", "-".repeat(70));
 
             let show_count = self.trades.len().min(20);
             for t in &self.trades[..show_count] {
-                println!("   {:<4} {:<12.2} {:<12.2} {:<10.3} {:<10.4} {:<8} {:<8}",
-                    t.id, t.entry_price, t.exit_price, t.pnl_pct, t.pnl_usdt, t.hold_seconds, t.exit_reason);
+                println!(
+                    "   {:<4} {:<12.2} {:<12.2} {:<10.3} {:<10.4} {:<8} {:<8}",
+                    t.id,
+                    t.entry_price,
+                    t.exit_price,
+                    t.pnl_pct,
+                    t.pnl_usdt,
+                    t.hold_seconds,
+                    t.exit_reason
+                );
             }
 
             if self.trades.len() > 25 {
                 let omitted = self.trades.len().saturating_sub(25);
                 println!("   ... 省略 {} 笔 ...", omitted);
-                for t in &self.trades[self.trades.len()-5..] {
-                    println!("   {:<4} {:<12.2} {:<12.2} {:<10.3} {:<10.4} {:<8} {:<8}",
-                        t.id, t.entry_price, t.exit_price, t.pnl_pct, t.pnl_usdt, t.hold_seconds, t.exit_reason);
+                for t in &self.trades[self.trades.len() - 5..] {
+                    println!(
+                        "   {:<4} {:<12.2} {:<12.2} {:<10.3} {:<10.4} {:<8} {:<8}",
+                        t.id,
+                        t.entry_price,
+                        t.exit_price,
+                        t.pnl_pct,
+                        t.pnl_usdt,
+                        t.hold_seconds,
+                        t.exit_reason
+                    );
                 }
             }
         }

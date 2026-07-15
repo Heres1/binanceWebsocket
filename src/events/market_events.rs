@@ -1,5 +1,5 @@
 //! 市场数据事件
-//! 
+//!
 //! 包含价格更新、K 线完成、订单簿更新等事件
 
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,7 @@ mod tests {
             price_change_pct_24h: 2.5,
             timestamp: 1234567890000,
         };
-        
+
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("BTCUSDT"));
         assert!(json.contains("50000"));
@@ -123,7 +123,7 @@ mod tests {
             is_closed: true,
             trades_count: 500,
         };
-        
+
         assert_eq!(event.symbol, "ETHUSDT");
         assert_eq!(event.interval, "1h");
         assert_eq!(event.close, 3020.0);

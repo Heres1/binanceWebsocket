@@ -1,5 +1,5 @@
 //! 交易事件
-//! 
+//!
 //! 包含订单提交、成交、取消、拒绝等事件
 
 use serde::{Deserialize, Serialize};
@@ -52,17 +52,25 @@ impl OrderSubmittedEvent {
 pub struct OrderFilledEvent {
     /// 订单 ID
     pub order_id: String,
+    /// 关联的策略信号 ID
+    pub signal_id: String,
+    /// 交易对符号
+    pub symbol: String,
+    /// 订单方向：BUY/SELL
+    pub side: String,
     /// 成交 ID
     pub fill_id: String,
     /// 成交价格
     pub fill_price: f64,
     /// 成交数量
     pub fill_qty: f64,
+    /// 实际成交金额（报价资产，如USDT）
+    pub actual_quote_qty: f64,
     /// 手续费
     pub commission: f64,
     /// 手续费资产
     pub commission_asset: String,
-    /// 是否卖方
+    /// 是否maker成交
     pub is_maker: bool,
     /// 时间戳（毫秒）
     pub timestamp: u64,
@@ -109,7 +117,7 @@ mod tests {
             Some(50000.0),
             0.001,
         );
-        
+
         assert_eq!(event.symbol, "BTCUSDT");
         assert_eq!(event.side, "BUY");
         assert!(!event.order_id.is_empty());
@@ -119,15 +127,19 @@ mod tests {
     fn test_order_filled_serialization() {
         let event = OrderFilledEvent {
             order_id: "order_123".to_string(),
+            signal_id: "signal_123".to_string(),
+            symbol: "BTCUSDT".to_string(),
+            side: "BUY".to_string(),
             fill_id: "fill_456".to_string(),
             fill_price: 50000.0,
             fill_qty: 0.001,
+            actual_quote_qty: 50.0,
             commission: 0.5,
             commission_asset: "USDT".to_string(),
             is_maker: false,
             timestamp: 1234567890000,
         };
-        
+
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("order_123"));
         assert!(json.contains("50000"));

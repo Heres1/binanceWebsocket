@@ -1,5 +1,5 @@
 //! 账户事件
-//! 
+//!
 //! 包含余额更新、持仓变动等事件
 
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn test_balance_update_creation() {
         let event = BalanceUpdateEvent::new("USDT".to_string(), 10000.0, 500.0);
-        
+
         assert_eq!(event.asset, "USDT");
         assert_eq!(event.available_balance, 10000.0);
         assert_eq!(event.locked_balance, 500.0);
@@ -78,7 +78,7 @@ mod tests {
             leverage: 10,
             timestamp: 1234567890000,
         };
-        
+
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("BTCUSDT"));
         assert!(json.contains("LONG"));

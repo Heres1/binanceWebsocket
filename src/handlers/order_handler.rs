@@ -4,7 +4,6 @@ use crate::events::DomainEvent;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-
 /// 订单处理器
 ///
 /// 负责处理订单相关事件：
@@ -27,7 +26,11 @@ impl OrderHandler {
     async fn handle_order_submitted(&self, event: &crate::events::OrderSubmittedEvent) {
         log::debug!(
             "订单已提交: order_id={}, symbol={}, side={}, price={:?}, qty={}",
-            event.order_id, event.symbol, event.side, event.price, event.quantity
+            event.order_id,
+            event.symbol,
+            event.side,
+            event.price,
+            event.quantity
         );
         // TODO: 持久化到数据库、更新订单状态等
     }
@@ -35,11 +38,15 @@ impl OrderHandler {
     /// 处理订单成交事件
     async fn handle_order_filled(&self, event: &crate::events::OrderFilledEvent) {
         log::debug!(
-            "订单已成交: order_id={}, fill_id={}, price={}, qty={}, commission={} {}",
+            "订单已成交: order_id={}, signal_id={}, symbol={}, side={}, fill_id={}, price={}, qty={}, amount={}, commission={} {}",
             event.order_id,
+            event.signal_id,
+            event.symbol,
+            event.side,
             event.fill_id,
             event.fill_price,
             event.fill_qty,
+            event.actual_quote_qty,
             event.commission,
             event.commission_asset
         );
@@ -50,7 +57,9 @@ impl OrderHandler {
     async fn handle_order_cancelled(&self, event: &crate::events::OrderCancelledEvent) {
         log::debug!(
             "订单已取消: order_id={}, symbol={}, reason={}",
-            event.order_id, event.symbol, event.reason
+            event.order_id,
+            event.symbol,
+            event.reason
         );
         // TODO: 更新订单状态、释放冻结资金等
     }
@@ -59,7 +68,9 @@ impl OrderHandler {
     async fn handle_order_rejected(&self, event: &crate::events::OrderRejectedEvent) {
         log::warn!(
             "订单被拒绝: order_id={:?}, symbol={}, reason={:?}",
-            event.order_id, event.symbol, event.reason
+            event.order_id,
+            event.symbol,
+            event.reason
         );
         // TODO: 记录错误、通知用户、触发风控等
     }
@@ -89,4 +100,3 @@ impl EventHandler for OrderHandler {
         ]
     }
 }
-
