@@ -169,6 +169,42 @@ impl EngineState {
         self.kline_1m_count >= 21 && self.kline_5m_count >= 50
     }
 
+    fn is_bearish_continuation(&self, lookback: usize) -> bool {
+        if lookback < 2 || self.recent_highs.len() <= lookback || self.recent_lows.len() <= lookback
+        {
+            return false;
+        }
+
+        let high_start = self.recent_highs.len() - lookback - 1;
+        let low_start = self.recent_lows.len() - lookback - 1;
+        let highs = &self.recent_highs[high_start..];
+        let lows = &self.recent_lows[low_start..];
+        let lower_highs = highs.windows(2).filter(|pair| pair[1] < pair[0]).count();
+        let lower_lows = lows.windows(2).filter(|pair| pair[1] < pair[0]).count();
+        let required = lookback.saturating_sub(1).max(1);
+
+        lower_highs >= required && lower_lows >= required
+    }
+
+    fn has_bullish_reversal_confirmation(
+        &self,
+        current_price: f64,
+        lookback: usize,
+        min_break_pct: f64,
+    ) -> bool {
+        if lookback == 0 || self.recent_highs.len() < lookback {
+            return false;
+        }
+
+        let start = self.recent_highs.len() - lookback;
+        let recent_high = self.recent_highs[start..]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        recent_high.is_finite() && current_price > recent_high * (1.0 + min_break_pct / 100.0)
+    }
+
     fn check_daily_reset(&mut self, timestamp_ms: u64) {
         let day = (timestamp_ms / 86400000) as u32;
         if day != self.last_day {
@@ -548,8 +584,16 @@ impl BacktestEngine {
                 // === ADX过滤 ===
                 let adx_val = state.adx_5m.value().unwrap_or(0.0);
                 let adx_ready = state.adx_5m.is_ready();
+                let plus_di = state.adx_5m.plus_di();
+                let minus_di = state.adx_5m.minus_di();
                 let adx_above_threshold =
                     !adx_ready || adx_val >= self.config.strategy.adx_min_threshold;
+                let long_di_direction_ok = !adx_ready
+                    || (plus_di > minus_di
+                        && (plus_di - minus_di) >= self.config.strategy.min_adx_di_diff);
+                let short_di_direction_ok = !adx_ready
+                    || (minus_di > plus_di
+                        && (minus_di - plus_di) >= self.config.strategy.min_adx_di_diff);
 
                 // === 波动率政权过滤 ===
                 let atr_pct = state.atr_5m.percentile();
@@ -587,11 +631,21 @@ impl BacktestEngine {
                 } else {
                     0.0
                 };
+                let long_structure_ok = !state
+                    .is_bearish_continuation(self.config.strategy.downtrend_filter_lookback)
+                    || state.has_bullish_reversal_confirmation(
+                        kline.close,
+                        self.config.strategy.downtrend_filter_lookback,
+                        self.config.strategy.min_reversal_break_pct,
+                    );
+
                 let long_trend_env_ok = ema_trend > 0.0
                     && price_above_ema50_pct > 0.15
                     && price_above_ema50_pct < self.config.strategy.max_ema50_distance_pct
                     && ema21_slope > self.config.strategy.mean_revert_min_slope
-                    && ema50_macro_rising;
+                    && ema50_macro_rising
+                    && long_di_direction_ok
+                    && long_structure_ok;
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
                 let trend_strength = if ema_slow_5m > 0.0 {
@@ -617,7 +671,7 @@ impl BacktestEngine {
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
                     breakout_pct > 0.05
                         && vol_ratio > self.config.strategy.volume_ratio_threshold
-                        && rsi < 65.0
+                        && rsi < self.config.strategy.breakout_max_rsi
                 } else {
                     false
                 };
@@ -676,7 +730,7 @@ impl BacktestEngine {
                         .copied()
                         .fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
-                    drop_pct > 1.2
+                    drop_pct > self.config.strategy.mean_revert_min_drop_pct
                         && rsi < 38.0
                         && vol_ratio > 2.5
                         && bid_support
@@ -684,6 +738,8 @@ impl BacktestEngine {
                         && ema_trend > 0.0
                         && kline.close >= ema_trend
                         && ema50_macro_rising
+                        && long_di_direction_ok
+                        && long_structure_ok
                         && volatility_normal // 波动率过滤也应用于均值回归
                 } else {
                     false
@@ -752,6 +808,7 @@ impl BacktestEngine {
 
                     let short_signal = short_trend_env_ok
                         && adx_above_threshold
+                        && short_di_direction_ok
                         && ((breakdown_signal && trend_down && short_trend_strong)
                             || (trend_down
                                 && short_trend_strong
@@ -1616,7 +1673,13 @@ impl BacktestEngine {
                 // === ADX过滤 ===
                 let adx_val = state.adx_5m.value().unwrap_or(0.0);
                 let adx_ready = state.adx_5m.is_ready();
+                let plus_di = state.adx_5m.plus_di();
+                let minus_di = state.adx_5m.minus_di();
                 let adx_above_threshold = !adx_ready || adx_val >= strategy.adx_min_threshold;
+                let long_di_direction_ok = !adx_ready
+                    || (plus_di > minus_di && (plus_di - minus_di) >= strategy.min_adx_di_diff);
+                let short_di_direction_ok = !adx_ready
+                    || (minus_di > plus_di && (minus_di - plus_di) >= strategy.min_adx_di_diff);
 
                 // === 波动率政权过滤 ===
                 let atr_pct = state.atr_5m.percentile();
@@ -1650,11 +1713,21 @@ impl BacktestEngine {
                 } else {
                     0.0
                 };
+                let long_structure_ok = !state
+                    .is_bearish_continuation(strategy.downtrend_filter_lookback)
+                    || state.has_bullish_reversal_confirmation(
+                        kline.close,
+                        strategy.downtrend_filter_lookback,
+                        strategy.min_reversal_break_pct,
+                    );
+
                 let long_trend_env_ok = ema_trend > 0.0
                     && price_above_ema50_pct > 0.15
                     && price_above_ema50_pct < strategy.max_ema50_distance_pct
                     && ema21_slope > strategy.mean_revert_min_slope
-                    && ema50_macro_rising;
+                    && ema50_macro_rising
+                    && long_di_direction_ok
+                    && long_structure_ok;
 
                 let trend_up = ema_fast_5m > ema_slow_5m;
                 let trend_strength = if ema_slow_5m > 0.0 {
@@ -1676,7 +1749,9 @@ impl BacktestEngine {
                         .copied()
                         .fold(f64::NEG_INFINITY, f64::max);
                     let breakout_pct = (kline.close - lookback_high) / lookback_high * 100.0;
-                    breakout_pct > 0.05 && vol_ratio > strategy.volume_ratio_threshold && rsi < 65.0
+                    breakout_pct > 0.05
+                        && vol_ratio > strategy.volume_ratio_threshold
+                        && rsi < strategy.breakout_max_rsi
                 } else {
                     false
                 };
@@ -1732,7 +1807,7 @@ impl BacktestEngine {
                         .copied()
                         .fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
-                    drop_pct > 1.2
+                    drop_pct > strategy.mean_revert_min_drop_pct
                         && rsi < 38.0
                         && vol_ratio > 2.5
                         && bid_support
@@ -1740,6 +1815,8 @@ impl BacktestEngine {
                         && ema_trend > 0.0
                         && kline.close >= ema_trend
                         && ema50_macro_rising
+                        && long_di_direction_ok
+                        && long_structure_ok
                         && volatility_normal
                 } else {
                     false
@@ -1806,6 +1883,7 @@ impl BacktestEngine {
 
                     let short_signal = short_trend_env_ok
                         && adx_above_threshold
+                        && short_di_direction_ok
                         && ((breakdown_signal && trend_down && short_trend_strong)
                             || (trend_down
                                 && short_trend_strong

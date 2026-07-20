@@ -1,4 +1,5 @@
 use hmac::{Hmac, Mac};
+use reqwest::header;
 use rust_binance_event_driven::config::AppConfig;
 use serde::Deserialize;
 use sha2::Sha256;
@@ -69,6 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|_| std::env::var("HTTP_PROXY"))
         .ok();
     let mut client_builder = reqwest::Client::builder();
+    if base_url.contains("localhost") {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            header::HeaderValue::from_static("api.binance.com"),
+        );
+        client_builder = client_builder
+            .danger_accept_invalid_certs(true)
+            .default_headers(headers);
+    }
     if let Some(proxy_url) = proxy_url.as_deref() {
         client_builder = client_builder.proxy(reqwest::Proxy::all(proxy_url)?);
     }

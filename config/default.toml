@@ -88,16 +88,26 @@ use_atr_stops = true
 adx_min_threshold = 20.0
 # 强趋势阈值 (ADX>此值=入场评分加分)
 adx_strong_trend = 30.0
+# +DI/-DI方向差最低门槛：避免ADX强但方向偏空时做多弱反弹
+min_adx_di_diff = 1.2
 
 # === 波动率政权过滤 ===
-# ATR百分位下限 (禁用: 0.0)
-atr_percentile_low = 0.0
-# ATR百分位上限 (禁用: 100.0)
-atr_percentile_high = 100.0
+# ATR百分位下限：过滤极低波动震荡噪声
+atr_percentile_low = 5.0
+# ATR百分位上限：过滤极高波动插针行情
+atr_percentile_high = 95.0
 
 # === 多因子评分入场 ===
 # 入场最低分数(满分100，低于此值不入场)：只做更高共振信号
 entry_score_threshold = 75
+# 突破路径RSI上限：防止反弹末端追高
+breakout_max_rsi = 60.0
+# 均值回归最小回撤：过滤浅跌假反弹，只接更充分的回踩
+mean_revert_min_drop_pct = 1.5
+# 下跌中继检测窗口：最近N根1m高低点连续下移时禁止做多弱反弹
+downtrend_filter_lookback = 4
+# 连续下移结构中的反转确认幅度：必须重新突破最近高点才允许做多
+min_reversal_break_pct = 0.05
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 

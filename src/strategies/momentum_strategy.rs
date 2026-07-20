@@ -328,6 +328,42 @@ impl StrategyState {
         self.kline_1m_count >= 21 && self.kline_5m_count >= 50
     }
 
+    fn is_bearish_continuation(&self, lookback: usize) -> bool {
+        if lookback < 2 || self.recent_highs.len() <= lookback || self.recent_lows.len() <= lookback
+        {
+            return false;
+        }
+
+        let high_start = self.recent_highs.len() - lookback - 1;
+        let low_start = self.recent_lows.len() - lookback - 1;
+        let highs = &self.recent_highs[high_start..];
+        let lows = &self.recent_lows[low_start..];
+        let lower_highs = highs.windows(2).filter(|pair| pair[1] < pair[0]).count();
+        let lower_lows = lows.windows(2).filter(|pair| pair[1] < pair[0]).count();
+        let required = lookback.saturating_sub(1).max(1);
+
+        lower_highs >= required && lower_lows >= required
+    }
+
+    fn has_bullish_reversal_confirmation(
+        &self,
+        current_price: f64,
+        lookback: usize,
+        min_break_pct: f64,
+    ) -> bool {
+        if lookback == 0 || self.recent_highs.len() < lookback {
+            return false;
+        }
+
+        let start = self.recent_highs.len() - lookback;
+        let recent_high = self.recent_highs[start..]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        recent_high.is_finite() && current_price > recent_high * (1.0 + min_break_pct / 100.0)
+    }
+
     /// 重置每日统计
     fn check_daily_reset(&mut self, timestamp_ms: u64) {
         let day = (timestamp_ms / 86400000) as u32;
@@ -993,7 +1029,13 @@ impl MomentumStrategy {
             // === ADX过滤 ===
             let adx_val = state.adx_5m.value().unwrap_or(0.0);
             let adx_ready = state.adx_5m.is_ready();
+            let plus_di = state.adx_5m.plus_di();
+            let minus_di = state.adx_5m.minus_di();
             let adx_above_threshold = !adx_ready || adx_val >= self.config.adx_min_threshold;
+            let long_di_direction_ok = !adx_ready
+                || (plus_di > minus_di && (plus_di - minus_di) >= self.config.min_adx_di_diff);
+            let short_di_direction_ok = !adx_ready
+                || (minus_di > plus_di && (minus_di - plus_di) >= self.config.min_adx_di_diff);
 
             // === 波动率政权过滤 ===
             let atr_pct = state.atr_5m.percentile();
@@ -1025,11 +1067,21 @@ impl MomentumStrategy {
             } else {
                 0.0
             };
+            let long_structure_ok = !state
+                .is_bearish_continuation(self.config.downtrend_filter_lookback)
+                || state.has_bullish_reversal_confirmation(
+                    current_price,
+                    self.config.downtrend_filter_lookback,
+                    self.config.min_reversal_break_pct,
+                );
+
             let long_trend_env_ok = ema_trend > 0.0
                 && price_above_ema50_pct > 0.15  // 至少高于EMA50 0.15%，避免边缘试探
                 && price_above_ema50_pct < self.config.max_ema50_distance_pct  // 趋势过度延伸过滤
                 && ema21_slope > self.config.mean_revert_min_slope  // 使用配置化斜率门槛，便于回测同步优化
-                && ema50_macro_rising; // EMA50宏观方向必须上升
+                && ema50_macro_rising  // EMA50宏观方向必须上升
+                && long_di_direction_ok
+                && long_structure_ok; // 过滤连续高低点下移中的弱反弹
 
             // 条件1: 5分钟趋势向上 + 趋势强度过滤
             let trend_up = ema_fast_5m > ema_slow_5m;
@@ -1058,8 +1110,10 @@ impl MomentumStrategy {
                     .copied()
                     .fold(f64::NEG_INFINITY, f64::max);
                 let breakout_pct = (state.best_ask - lookback_high) / lookback_high * 100.0;
-                // RSI < 65: 防止在RSI高位追高（RSI>=65时的突破信号可靠性差）
-                breakout_pct > 0.05 && vol_ratio > self.config.volume_ratio_threshold && rsi < 65.0
+                // RSI < 配置上限: 防止在反弹末端追高
+                breakout_pct > 0.05
+                    && vol_ratio > self.config.volume_ratio_threshold
+                    && rsi < self.config.breakout_max_rsi
             } else {
                 false
             };
@@ -1118,8 +1172,8 @@ impl MomentumStrategy {
                     .copied()
                     .fold(f64::NEG_INFINITY, f64::max);
                 let drop_pct = (recent_high - current_price) / recent_high * 100.0;
-                // 从20bar高点跌>1.2% + RSI<38 + VR>2.5(强买盘) + 盘口支撑 + 上升趋势保护 + 波动率过滤
-                drop_pct > 1.2
+                // 从20bar高点跌幅达标 + RSI<38 + VR>2.5(强买盘) + 盘口支撑 + 上升趋势保护 + 波动率过滤
+                drop_pct > self.config.mean_revert_min_drop_pct
                     && rsi < 38.0
                     && vol_ratio > 2.5
                     && bid_support
@@ -1127,6 +1181,8 @@ impl MomentumStrategy {
                     && ema_trend > 0.0
                     && current_price >= ema_trend
                     && ema50_macro_rising
+                    && long_di_direction_ok
+                    && long_structure_ok
                     && volatility_normal
             } else {
                 false
@@ -1154,13 +1210,13 @@ impl MomentumStrategy {
 
                 let sl_dist_pct = (entry_price - sl_price) / entry_price * 100.0;
                 let tp_dist_pct = (tp_price - entry_price) / entry_price * 100.0;
-                log::info!("🟢 [开多] {} @ {:.2} | 路径:{} | 评分:{}/100 | RSI:{:.1} | 量比:{:.2} | ADX:{:.1} | ATR:{:.1} | 斜率:{:+.3}% | 距EMA50:{:+.3}% | SL:{:.2}(-{:.2}%) | TP:{:.2}(+{:.2}%) | 今日第{}笔",
-                    self.config.symbol, entry_price, entry_path, entry_score, rsi, vol_ratio, adx_val, current_atr,
+                log::info!("🟢 [开多] {} @ {:.2} | 路径:{} | 评分:{}/100 | RSI:{:.1} | 量比:{:.2} | ADX:{:.1} +DI:{:.1} -DI:{:.1} | ATR:{:.1} | 斜率:{:+.3}% | 距EMA50:{:+.3}% | SL:{:.2}(-{:.2}%) | TP:{:.2}(+{:.2}%) | 今日第{}笔",
+                    self.config.symbol, entry_price, entry_path, entry_score, rsi, vol_ratio, adx_val, plus_di, minus_di, current_atr,
                     ema21_slope, price_above_ema50_pct, sl_price, sl_dist_pct, tp_price, tp_dist_pct,
                     state.daily_trades + 1);
-                log::info!("📊 [入场因子] trend↑:{} 强度:{:.3}% ADX:{:.1}≥{:.0} rsi_recover:{} RSI未过热:{} 量比:{:.2}≥{:.1} 买盘支撑:{} 斜率正:{} 波动率正常:{} | ema50宏观上升:{} 趋势环境:{}",
+                log::info!("📊 [入场因子] trend↑:{} 强度:{:.3}% ADX:{:.1}≥{:.0} DI方向:{} 结构:{} rsi_recover:{} RSI未过热:{} 量比:{:.2}≥{:.1} 买盘支撑:{} 斜率正:{} 波动率正常:{} | ema50宏观上升:{} 趋势环境:{}",
                     trend_up, trend_strength, adx_val, self.config.adx_min_threshold,
-                    rsi_recovering, rsi_bounce_not_late, vol_ratio, self.config.volume_ratio_threshold,
+                    long_di_direction_ok, long_structure_ok, rsi_recovering, rsi_bounce_not_late, vol_ratio, self.config.volume_ratio_threshold,
                     bid_support, slope_positive, volatility_normal,
                     ema50_macro_rising, long_trend_env_ok);
                 state.entry_score = entry_score;
@@ -1230,6 +1286,7 @@ impl MomentumStrategy {
 
                 let short_signal = short_trend_env_ok
                     && adx_above_threshold
+                    && short_di_direction_ok
                     && ((breakdown_signal && trend_down && short_trend_strong)
                         || (trend_down
                             && short_trend_strong
@@ -1253,8 +1310,8 @@ impl MomentumStrategy {
 
                     let sl_dist_pct = (sl_price - entry_price) / entry_price * 100.0;
                     let tp_dist_pct = (entry_price - tp_price) / entry_price * 100.0;
-                    log::info!("🟡 [开空] {} @ {:.2} | 路径:{} | RSI:{:.1} | 量比:{:.2} | ADX:{:.1} | ATR:{:.1} | 斜率:{:+.3}% | 距EMA50:-{:.3}% | SL:{:.2}(+{:.2}%) | TP:{:.2}(-{:.2}%) | 今日第{}笔",
-                        self.config.symbol, entry_price, short_path, rsi, vol_ratio, adx_val, current_atr,
+                    log::info!("🟡 [开空] {} @ {:.2} | 路径:{} | RSI:{:.1} | 量比:{:.2} | ADX:{:.1} +DI:{:.1} -DI:{:.1} | ATR:{:.1} | 斜率:{:+.3}% | 距EMA50:-{:.3}% | SL:{:.2}(+{:.2}%) | TP:{:.2}(-{:.2}%) | 今日第{}笔",
+                        self.config.symbol, entry_price, short_path, rsi, vol_ratio, adx_val, plus_di, minus_di, current_atr,
                         ema21_slope, price_below_ema50_pct, sl_price, sl_dist_pct, tp_price, tp_dist_pct,
                         state.daily_trades + 1);
                     state.entry_score = 0;

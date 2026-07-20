@@ -101,6 +101,8 @@ pub struct StrategyConfig {
     pub adx_min_threshold: f64, // ADX最低门槛(低于=震荡市)
     #[serde(default = "default_adx_strong_trend")]
     pub adx_strong_trend: f64, // 强趋势阈值(入场加分)
+    #[serde(default = "default_min_adx_di_diff")]
+    pub min_adx_di_diff: f64, // +DI/-DI方向差最低门槛，避免ADX强但方向反的弱反弹入场
     // 波动率政权过滤
     #[serde(default = "default_atr_percentile_low")]
     pub atr_percentile_low: f64, // ATR百分位下限
@@ -109,6 +111,14 @@ pub struct StrategyConfig {
     // 多因子评分
     #[serde(default = "default_entry_score_threshold")]
     pub entry_score_threshold: u32, // 入场最低分数(满分100)
+    #[serde(default = "default_breakout_max_rsi")]
+    pub breakout_max_rsi: f64, // 突破路径RSI上限，防止反弹末端追高
+    #[serde(default = "default_mean_revert_min_drop_pct")]
+    pub mean_revert_min_drop_pct: f64, // 均值回归最小回撤幅度，过滤浅跌假反弹
+    #[serde(default = "default_downtrend_filter_lookback")]
+    pub downtrend_filter_lookback: usize, // 下跌中继结构检测窗口
+    #[serde(default = "default_min_reversal_break_pct")]
+    pub min_reversal_break_pct: f64, // 连续下移结构中的反转突破确认幅度
 }
 
 fn default_strategy_type() -> String {
@@ -183,6 +193,10 @@ fn default_adx_strong_trend() -> f64 {
     30.0
 }
 
+fn default_min_adx_di_diff() -> f64 {
+    1.2
+}
+
 fn default_atr_percentile_low() -> f64 {
     20.0
 }
@@ -193,6 +207,22 @@ fn default_atr_percentile_high() -> f64 {
 
 fn default_entry_score_threshold() -> u32 {
     55
+}
+
+fn default_breakout_max_rsi() -> f64 {
+    60.0
+}
+
+fn default_mean_revert_min_drop_pct() -> f64 {
+    1.5
+}
+
+fn default_downtrend_filter_lookback() -> usize {
+    4
+}
+
+fn default_min_reversal_break_pct() -> f64 {
+    0.05
 }
 
 /// 做空配置
@@ -314,6 +344,33 @@ impl AppConfig {
         if self.strategy.volume_ratio_threshold <= 0.0 {
             return Err(DomainError::Infrastructure(
                 InfrastructureError::config_with_context("量比阈值", "必须大于0".to_string()),
+            ));
+        }
+
+        if self.strategy.breakout_max_rsi <= 0.0 || self.strategy.breakout_max_rsi > 100.0 {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "突破RSI上限",
+                    "必须在0到100之间".to_string(),
+                ),
+            ));
+        }
+
+        if self.strategy.mean_revert_min_drop_pct <= 0.0 {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "均值回归最小回撤",
+                    "必须大于0".to_string(),
+                ),
+            ));
+        }
+
+        if self.strategy.downtrend_filter_lookback < 2 {
+            return Err(DomainError::Infrastructure(
+                InfrastructureError::config_with_context(
+                    "下跌中继检测窗口",
+                    "必须至少为2".to_string(),
+                ),
             ));
         }
 
