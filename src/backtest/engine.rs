@@ -651,6 +651,7 @@ impl BacktestEngine {
 
                 // 突破路径额外要求斜率>配置值
                 let breakout_slope_ok = ema21_slope > self.config.strategy.breakout_min_slope;
+                let rsi_bounce_not_late = rsi < 55.0;
 
                 // 趋势入场：评分达标 + 趋势环境确认
                 // RSI反弹路径额外要求RSI<55，避免实盘中RSI接近60时追入反弹末端
@@ -661,7 +662,7 @@ impl BacktestEngine {
                         && rsi_recovering
                         && rsi_bounce_vr_ok
                         && bid_support
-                        && rsi < 55.0)
+                        && rsi_bounce_not_late)
                         || (breakout_signal
                             && trend_up
                             && trend_strong_enough
@@ -1708,6 +1709,7 @@ impl BacktestEngine {
                 }
 
                 let breakout_slope_ok = ema21_slope > strategy.breakout_min_slope;
+                let rsi_bounce_not_late = rsi < 55.0;
 
                 let trend_entry_signal = long_trend_env_ok
                     && entry_score >= strategy.entry_score_threshold
@@ -1716,7 +1718,7 @@ impl BacktestEngine {
                         && rsi_recovering
                         && rsi_bounce_vr_ok
                         && bid_support
-                        && rsi < 55.0)
+                        && rsi_bounce_not_late)
                         || (breakout_signal
                             && trend_up
                             && trend_strong_enough

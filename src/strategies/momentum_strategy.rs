@@ -1068,6 +1068,7 @@ impl MomentumStrategy {
             // 突破路径额外要求斜率>配置值（更强的趋势确认）
             let breakout_slope_ok = ema21_slope > self.config.breakout_min_slope;
             let slope_positive = ema21_slope > 0.03;
+            let rsi_bounce_not_late = rsi < 55.0;
 
             // === 多因子评分系统 ===
             let mut entry_score: u32 = 0;
@@ -1105,7 +1106,7 @@ impl MomentumStrategy {
                     && rsi_recovering
                     && rsi_bounce_vr_ok
                     && bid_support
-                    && rsi < 55.0)
+                    && rsi_bounce_not_late)
                     || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
 
             // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
@@ -1157,9 +1158,9 @@ impl MomentumStrategy {
                     self.config.symbol, entry_price, entry_path, entry_score, rsi, vol_ratio, adx_val, current_atr,
                     ema21_slope, price_above_ema50_pct, sl_price, sl_dist_pct, tp_price, tp_dist_pct,
                     state.daily_trades + 1);
-                log::info!("📊 [入场因子] trend↑:{} 强度:{:.3}% ADX:{:.1}≥{:.0} rsi_recover:{} 量比:{:.2}≥{:.1} 买盘支撑:{} 斜率正:{} 波动率正常:{} | ema50宏观上升:{} 趋势环境:{}",
+                log::info!("📊 [入场因子] trend↑:{} 强度:{:.3}% ADX:{:.1}≥{:.0} rsi_recover:{} RSI未过热:{} 量比:{:.2}≥{:.1} 买盘支撑:{} 斜率正:{} 波动率正常:{} | ema50宏观上升:{} 趋势环境:{}",
                     trend_up, trend_strength, adx_val, self.config.adx_min_threshold,
-                    rsi_recovering, vol_ratio, self.config.volume_ratio_threshold,
+                    rsi_recovering, rsi_bounce_not_late, vol_ratio, self.config.volume_ratio_threshold,
                     bid_support, slope_positive, volatility_normal,
                     ema50_macro_rising, long_trend_env_ok);
                 state.entry_score = entry_score;

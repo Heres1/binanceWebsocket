@@ -429,7 +429,7 @@ impl OrderExecutionService {
             (fill_qty * fill_price * 0.001, "USDT".to_string())
         };
 
-        // 7. 更新本地余额缓存（使用实际成交金额，按品种更新对应资产）
+        // 7. 更新本地余额缓存（使用实际成交金额，按品种更新对应资产，并扣除实际手续费）
         {
             let mut bal = self.balance.lock().await;
             if side == "BUY" {
@@ -449,6 +449,17 @@ impl OrderExecutionService {
                     _ => {}
                 }
             }
+
+            if commission > 0.0 {
+                match commission_asset.as_str() {
+                    "USDT" => bal.available_usdt -= commission,
+                    "BTC" => bal.btc_free = (bal.btc_free - commission).max(0.0),
+                    "ETH" => bal.eth_free = (bal.eth_free - commission).max(0.0),
+                    "SOL" => bal.sol_free = (bal.sol_free - commission).max(0.0),
+                    _ => {}
+                }
+            }
+
             // 安全下限保护
             if bal.available_usdt < 0.0 {
                 log::warn!("本地余额缓存异常: USDT={:.4}，强制置0", bal.available_usdt);
