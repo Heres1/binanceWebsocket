@@ -4,4 +4,4 @@
 
 pub mod binance_client;
 
-pub use binance_client::BinanceClient;
+pub use binance_client::{BinanceClient, BinanceTrade, HistoricalOrder};

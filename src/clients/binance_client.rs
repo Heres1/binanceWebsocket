@@ -70,6 +70,65 @@ pub struct OrderFill {
     pub trade_id: Option<u64>,
 }
 
+/// Binance 历史成交记录（GET /api/v3/myTrades）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BinanceTrade {
+    pub symbol: String,
+    pub id: u64,
+    #[serde(rename = "orderId")]
+    pub order_id: u64,
+    #[serde(rename = "orderListId")]
+    pub order_list_id: Option<i64>,
+    pub price: String,
+    pub qty: String,
+    #[serde(rename = "quoteQty")]
+    pub quote_qty: String,
+    pub commission: String,
+    #[serde(rename = "commissionAsset")]
+    pub commission_asset: String,
+    pub time: u64,
+    #[serde(rename = "isBuyer")]
+    pub is_buyer: bool,
+    #[serde(rename = "isMaker")]
+    pub is_maker: bool,
+    #[serde(rename = "isBestMatch")]
+    pub is_best_match: Option<bool>,
+}
+
+/// Binance 历史订单记录（GET /api/v3/allOrders）
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HistoricalOrder {
+    pub symbol: String,
+    #[serde(rename = "orderId")]
+    pub order_id: u64,
+    #[serde(rename = "orderListId")]
+    pub order_list_id: Option<i64>,
+    #[serde(rename = "clientOrderId")]
+    pub client_order_id: String,
+    pub price: String,
+    #[serde(rename = "origQty")]
+    pub orig_qty: String,
+    #[serde(rename = "executedQty")]
+    pub executed_qty: String,
+    #[serde(rename = "cummulativeQuoteQty")]
+    pub cummulative_quote_qty: String,
+    pub status: String,
+    #[serde(rename = "timeInForce")]
+    pub time_in_force: Option<String>,
+    #[serde(rename = "type")]
+    pub order_type: String,
+    pub side: String,
+    #[serde(rename = "stopPrice")]
+    pub stop_price: Option<String>,
+    #[serde(rename = "icebergQty")]
+    pub iceberg_qty: Option<String>,
+    pub time: u64,
+    #[serde(rename = "updateTime")]
+    pub update_time: Option<u64>,
+    #[serde(rename = "isWorking")]
+    pub is_working: Option<bool>,
+}
+
 /// 撤单响应
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CancelOrderResponse {
@@ -584,6 +643,56 @@ impl BinanceClient {
             .map_err(|e| ServiceError::Order(format!("解析订单查询响应失败: {}", e)))?;
 
         Ok(order)
+    }
+
+    /// 查询历史订单（只读，用于补全实盘日志证据链）
+    pub async fn get_all_orders(
+        &self,
+        symbol: &str,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
+        limit: Option<u16>,
+    ) -> Result<Vec<HistoricalOrder>, DomainError> {
+        let mut params = HashMap::new();
+        params.insert("symbol".to_string(), symbol.to_string());
+        if let Some(start) = start_time {
+            params.insert("startTime".to_string(), start.to_string());
+        }
+        if let Some(end) = end_time {
+            params.insert("endTime".to_string(), end.to_string());
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".to_string(), limit.min(1000).to_string());
+        }
+
+        let response = self.get("/allOrders", &params).await?;
+        serde_json::from_value(response)
+            .map_err(|e| ServiceError::Order(format!("解析历史订单失败: {}", e)).into())
+    }
+
+    /// 查询账户历史成交（只读，用于和本地日志交叉验证）
+    pub async fn get_my_trades(
+        &self,
+        symbol: &str,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
+        limit: Option<u16>,
+    ) -> Result<Vec<BinanceTrade>, DomainError> {
+        let mut params = HashMap::new();
+        params.insert("symbol".to_string(), symbol.to_string());
+        if let Some(start) = start_time {
+            params.insert("startTime".to_string(), start.to_string());
+        }
+        if let Some(end) = end_time {
+            params.insert("endTime".to_string(), end.to_string());
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".to_string(), limit.min(1000).to_string());
+        }
+
+        let response = self.get("/myTrades", &params).await?;
+        serde_json::from_value(response)
+            .map_err(|e| ServiceError::Order(format!("解析历史成交失败: {}", e)).into())
     }
 
     /// 查询账户信息

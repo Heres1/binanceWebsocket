@@ -10,7 +10,9 @@ use tokio::sync::Mutex;
 use crate::clients::BinanceClient;
 use crate::error::{DomainError, EventBusError, ServiceError};
 use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
-use crate::events::{DomainEvent, OrderFilledEvent, OrderRejectedEvent, TradingSignalEvent};
+use crate::events::{
+    DomainEvent, OrderFilledEvent, OrderRejectedEvent, OrderSubmittedEvent, TradingSignalEvent,
+};
 use crate::risk::RiskMonitorService;
 
 /// 账户余额缓存
@@ -384,6 +386,18 @@ impl OrderExecutionService {
         }
 
         // 4. 调用 API 下单 - 使用市价单快速成交
+        let submit_event = DomainEvent::OrderSubmitted(OrderSubmittedEvent {
+            order_id: signal.signal_id.clone(),
+            symbol: signal.symbol.clone(),
+            side: side.to_string(),
+            order_type: "MARKET".to_string(),
+            price: None,
+            quantity: actual_quantity,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        });
+        if let Err(e) = self.event_bus.publish(submit_event).await {
+            log::warn!("订单提交证据事件发布失败: {}", e);
+        }
 
         let order_result = self
             .client
