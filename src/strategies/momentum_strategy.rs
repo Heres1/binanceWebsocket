@@ -192,9 +192,82 @@ struct StrategyState {
     entry_score: u32,   // 入场评分快照
     entry_path: String, // 入场路径("突破"/"RSI反弹"/"均值回归"/"击穿"/"RSI超买")
     entry_atr: f64,     // 入场时ATR快照（用于止损计算时取max防止ATR收缩导致止损过早触发）
+
+    // 虚拟做空仓位跟踪（现货模式纯日志研究，为合约多空积累经验）
+    virtual_short: Option<VirtualShort>,
+    virtual_short_trades: u32, // 今日虚拟做空笔数
+    virtual_short_wins: u32,   // 今日虚拟做空盈利笔数
+    virtual_short_pnl: f64,    // 今日虚拟做空累计净盈亏%
+}
+
+/// 虚拟做空仓位（仅日志跟踪，不实际交易）
+#[derive(Debug, Clone)]
+struct VirtualShort {
+    entry_price: f64,
+    entry_time_ms: u64,
+    atr: f64, // 入场时ATR（用于虚拟止损）
 }
 
 impl StrategyState {
+    fn current_day() -> u32 {
+        (chrono::Utc::now().timestamp_millis() as u64 / 86400000) as u32
+    }
+
+    fn reset_daily_stats(&mut self) {
+        self.daily_trades = 0;
+        self.daily_pnl = 0.0;
+        self.daily_wins = 0;
+        self.daily_losses = 0;
+        self.daily_pnl_usdt = 0.0;
+        self.consecutive_stop_losses = 0;
+        self.loss_cooldown_until = 0;
+        self.virtual_short_trades = 0;
+        self.virtual_short_wins = 0;
+        self.virtual_short_pnl = 0.0;
+    }
+
+    fn display_price(value: f64) -> String {
+        if value.is_finite() && value > 0.0 && value < f64::MAX / 2.0 {
+            format!("{:.2}", value)
+        } else {
+            "N/A".to_string()
+        }
+    }
+
+    fn sanitize_position_state(&mut self) {
+        match self.position {
+            Position::None => {
+                self.entry_price = 0.0;
+                self.entry_quantity = 0.0;
+                self.entry_time = 0;
+                self.highest_since_entry = 0.0;
+                self.lowest_since_entry = f64::MAX;
+                self.trailing_active = false;
+                self.breakeven_active = false;
+                self.entry_score = 0;
+                self.entry_path.clear();
+                self.entry_atr = 0.0;
+            }
+            Position::Long => {
+                if self.highest_since_entry <= 0.0 || !self.highest_since_entry.is_finite() {
+                    self.highest_since_entry = self.entry_price;
+                }
+                self.lowest_since_entry = f64::MAX;
+            }
+            Position::Short => {
+                if self.lowest_since_entry <= 0.0
+                    || !self.lowest_since_entry.is_finite()
+                    || self.lowest_since_entry >= f64::MAX / 2.0
+                {
+                    self.lowest_since_entry = self.entry_price;
+                }
+                if self.highest_since_entry < 0.0 || !self.highest_since_entry.is_finite() {
+                    self.highest_since_entry = 0.0;
+                }
+            }
+        }
+    }
+
     fn new(state_file: &str) -> Self {
         // 尝试从文件恢复持仓状态
         let persisted = PersistentState::load(state_file);
@@ -245,6 +318,10 @@ impl StrategyState {
             entry_score: 0,
             entry_path: String::new(),
             entry_atr: 0.0,
+            virtual_short: None,
+            virtual_short_trades: 0,
+            virtual_short_wins: 0,
+            virtual_short_pnl: 0.0,
         };
 
         // 恢复持久化状态（含合法性校验）
@@ -276,12 +353,29 @@ impl StrategyState {
                 state.entry_quantity = ps.entry_quantity;
                 state.entry_time = ps.entry_time;
                 state.last_trade_time = ps.last_trade_time;
-                state.daily_trades = ps.daily_trades;
-                state.daily_pnl = ps.daily_pnl;
-                state.daily_wins = ps.daily_wins;
-                state.daily_losses = ps.daily_losses;
-                state.daily_pnl_usdt = ps.daily_pnl_usdt;
-                state.last_day = ps.last_day;
+                let current_day = Self::current_day();
+                if ps.last_day == current_day {
+                    state.daily_trades = ps.daily_trades;
+                    state.daily_pnl = ps.daily_pnl;
+                    state.daily_wins = ps.daily_wins;
+                    state.daily_losses = ps.daily_losses;
+                    state.daily_pnl_usdt = ps.daily_pnl_usdt;
+                    state.last_day = ps.last_day;
+                } else {
+                    state.last_day = current_day;
+                    if ps.daily_trades > 0 || ps.daily_wins > 0 || ps.daily_losses > 0 {
+                        log::warn!(
+                            "丢弃过期日统计 | 保存日:{} 当前日:{} | 旧统计:{}笔 {}胜{}负 净:{:+.3}%({:+.2}U)",
+                            ps.last_day,
+                            current_day,
+                            ps.daily_trades,
+                            ps.daily_wins,
+                            ps.daily_losses,
+                            ps.daily_pnl,
+                            ps.daily_pnl_usdt
+                        );
+                    }
+                }
                 state.entry_score = ps.entry_score;
                 state.entry_path = ps.entry_path;
                 state.entry_atr = ps.entry_atr;
@@ -290,8 +384,14 @@ impl StrategyState {
                 state.lowest_since_entry = ps.lowest_since_entry;
                 state.trailing_active = ps.trailing_active;
                 state.breakeven_active = ps.breakeven_active;
-                log::info!("  └─ 追踪止损状态: trailing_active={} breakeven_active={} 最高价:{:.2} 最低价:{:.2}",
-                    ps.trailing_active, ps.breakeven_active, ps.highest_since_entry, ps.lowest_since_entry);
+                state.sanitize_position_state();
+                log::info!(
+                    "  └─ 追踪止损状态: trailing_active={} breakeven_active={} 最高价:{} 最低价:{}",
+                    state.trailing_active,
+                    state.breakeven_active,
+                    Self::display_price(state.highest_since_entry),
+                    Self::display_price(state.lowest_since_entry)
+                );
             }
         }
 
@@ -388,13 +488,7 @@ impl StrategyState {
                 );
             }
             self.last_day = day;
-            self.daily_trades = 0;
-            self.daily_pnl = 0.0;
-            self.daily_wins = 0;
-            self.daily_losses = 0;
-            self.daily_pnl_usdt = 0.0;
-            self.consecutive_stop_losses = 0;
-            self.loss_cooldown_until = 0;
+            self.reset_daily_stats();
         }
     }
 }
@@ -441,8 +535,7 @@ impl MomentumStrategy {
             log::error!("⚠️ 状态文件异常: 恢复出空头持仓但当前为现货模式(allow_short=false)，丢弃该状态 | {} @ {:.2}",
                 config.symbol, state.entry_price);
             state.position = Position::None;
-            state.entry_price = 0.0;
-            state.entry_time = 0;
+            state.sanitize_position_state();
         }
 
         Self {
@@ -573,9 +666,247 @@ impl MomentumStrategy {
                     if state.ema50_history.len() > 20 {
                         state.ema50_history.remove(0);
                     }
+
+                    // === 趋势判断日志（为合约多空积累经验） ===
+                    if self.config.log_trend_snapshot && state.is_warmed_up() {
+                        self.log_trend_snapshot(&state, event.close);
+                    }
+                    if self.config.log_virtual_short
+                        && !self.config.allow_short
+                        && state.is_warmed_up()
+                    {
+                        self.track_virtual_short(&mut state, event);
+                    }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 打印趋势环境快照（多空对称指标，为合约多空积累经验）
+    fn log_trend_snapshot(&self, state: &StrategyState, close: f64) {
+        let ema_fast_5m = state.ema_fast_5m.value().unwrap_or(0.0);
+        let ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
+        let ema_trend = state.ema_trend_5m.value().unwrap_or(0.0);
+        let rsi = state.rsi_1m.value().unwrap_or(50.0);
+        let vol_ratio = state.volume_ratio.ratio();
+        let adx_val = state.adx_5m.value().unwrap_or(0.0);
+        let plus_di = state.adx_5m.plus_di();
+        let minus_di = state.adx_5m.minus_di();
+        let atr = state.atr_5m.value().unwrap_or(0.0);
+        let atr_pct_str = state
+            .atr_5m
+            .percentile()
+            .map(|p| format!("{:.0}%", p))
+            .unwrap_or_else(|| "N/A".to_string());
+
+        let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
+            (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
+        } else {
+            0.0
+        };
+        let dist_ema50 = if ema_trend > 0.0 {
+            (close - ema_trend) / ema_trend * 100.0
+        } else {
+            0.0
+        };
+        // EMA50宏观方向（6根≈30分钟变化）
+        let ema50_macro_pct = if state.ema50_history.len() >= 6 {
+            let old = state.ema50_history[state.ema50_history.len() - 6];
+            if old > 0.0 {
+                (ema_trend - old) / old * 100.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let trend_up = ema_fast_5m > ema_slow_5m;
+        let trend_down = ema_fast_5m < ema_slow_5m;
+        let trend_strength = if ema_slow_5m > 0.0 {
+            (ema_fast_5m - ema_slow_5m).abs() / ema_slow_5m * 100.0
+        } else {
+            0.0
+        };
+
+        // 多空环境判定（与入场/做空条件的环境部分对称）
+        let long_env = trend_up
+            && trend_strength >= self.config.min_trend_strength_pct
+            && dist_ema50 >= self.config.min_price_above_ema50_pct
+            && ema50_macro_pct >= 0.0;
+        let short_env = trend_down
+            && trend_strength >= self.config.min_trend_strength_pct
+            && dist_ema50 <= -0.15
+            && ema21_slope < -0.03
+            && ema50_macro_pct <= 0.05;
+        let env_label = if long_env {
+            "多头"
+        } else if short_env {
+            "空头"
+        } else {
+            "震荡"
+        };
+
+        log::info!(
+            "📐 趋势快照 | {} | 价:{:.2}({:+.2}%vs50) | EMA7/21/50:{:.0}/{:.0}/{:.0} 斜率:{:+.3}% 宏观:{:+.3}% | RSI:{:.1} VR:{:.2} | ADX:{:.1} +DI:{:.1} -DI:{:.1} 差:{:+.1} | ATR:{:.2}({}) | 环境:{} | 持仓:{:?}{}",
+            self.config.symbol,
+            close,
+            dist_ema50,
+            ema_fast_5m,
+            ema_slow_5m,
+            ema_trend,
+            ema21_slope,
+            ema50_macro_pct,
+            rsi,
+            vol_ratio,
+            adx_val,
+            plus_di,
+            minus_di,
+            plus_di - minus_di,
+            atr,
+            atr_pct_str,
+            env_label,
+            state.position,
+            if state.virtual_short.is_some() {
+                " 虚拟🈳中"
+            } else {
+                ""
+            },
+        );
+    }
+
+    /// 虚拟做空信号评估与仓位跟踪（现货模式纯日志，为合约多空积累经验）
+    fn track_virtual_short(&self, state: &mut StrategyState, event: &KlineCompletedEvent) {
+        let close = event.close;
+
+        // 已有虚拟仓位：出场判定
+        if let Some(vs) = state.virtual_short.clone() {
+            let virtual_sl = vs.entry_price + self.config.atr_stop_multiplier * vs.atr;
+            let virtual_tp = vs.entry_price * (1.0 - self.config.take_profit_pct / 100.0);
+            let hold_hours =
+                (event.close_time.saturating_sub(vs.entry_time_ms)) as f64 / 3_600_000.0;
+            let pnl_pct = (vs.entry_price - close) / vs.entry_price * 100.0;
+            let net_pnl = pnl_pct - 0.15; // 双边费率估算（BNB抵扣0.075%×2）
+
+            let exit_reason = if event.high >= virtual_sl {
+                Some("虚拟止损")
+            } else if event.low <= virtual_tp {
+                Some("虚拟止盈")
+            } else if hold_hours >= self.config.max_hold_seconds as f64 / 3600.0 {
+                Some("虚拟超时")
+            } else {
+                // 趋势反转：多头环境回归提前退出
+                let ema_fast = state.ema_fast_5m.value().unwrap_or(0.0);
+                let ema_slow = state.ema_slow_5m.value().unwrap_or(0.0);
+                let ema_trend = state.ema_trend_5m.value().unwrap_or(0.0);
+                if ema_fast > ema_slow && ema_trend > 0.0 && close > ema_trend {
+                    Some("趋势反转")
+                } else {
+                    None
+                }
+            };
+
+            if let Some(reason) = exit_reason {
+                state.virtual_short_trades += 1;
+                state.virtual_short_pnl += net_pnl;
+                if net_pnl > 0.0 {
+                    state.virtual_short_wins += 1;
+                }
+                log::info!(
+                    "🈳 虚拟做空平仓 | {} | {} | 入场: {:.2} → 当前: {:.2} | 持仓: {:.1}h | 净盈亏: {:+.2}% | 今日虚拟: {}笔 胜率 {:.0}% 累计 {:+.2}%",
+                    self.config.symbol,
+                    reason,
+                    vs.entry_price,
+                    close,
+                    hold_hours,
+                    net_pnl,
+                    state.virtual_short_trades,
+                    state.virtual_short_wins as f64 / state.virtual_short_trades as f64 * 100.0,
+                    state.virtual_short_pnl,
+                );
+                state.virtual_short = None;
+            } else {
+                log::info!(
+                    "🈳 虚拟做空持仓 | {} | 入场: {:.2} | 当前: {:.2} | 浮盈: {:+.2}% | 持仓: {:.1}h",
+                    self.config.symbol, vs.entry_price, close, pnl_pct, hold_hours
+                );
+            }
+            return;
+        }
+
+        // 无虚拟仓位：开仓评估（实际持仓期间不评估，避免噪音）
+        if state.position != Position::None {
+            return;
+        }
+        let ema_fast_5m = state.ema_fast_5m.value().unwrap_or(0.0);
+        let ema_slow_5m = state.ema_slow_5m.value().unwrap_or(0.0);
+        let ema_trend = state.ema_trend_5m.value().unwrap_or(0.0);
+        let rsi = state.rsi_1m.value().unwrap_or(50.0);
+        let vol_ratio = state.volume_ratio.ratio();
+        let atr = state.atr_5m.value().unwrap_or(0.0);
+        let adx_val = state.adx_5m.value().unwrap_or(0.0);
+        let adx_ready = state.adx_5m.is_ready();
+        let plus_di = state.adx_5m.plus_di();
+        let minus_di = state.adx_5m.minus_di();
+
+        let trend_down = ema_fast_5m < ema_slow_5m;
+        let trend_strength = if ema_slow_5m > 0.0 {
+            (ema_slow_5m - ema_fast_5m) / ema_slow_5m * 100.0
+        } else {
+            0.0
+        };
+        let ema21_slope = if state.prev_ema_slow_5m > 0.0 {
+            (ema_slow_5m - state.prev_ema_slow_5m) / state.prev_ema_slow_5m * 100.0
+        } else {
+            0.0
+        };
+        let below_ema50_pct = if ema_trend > 0.0 {
+            (ema_trend - close) / ema_trend * 100.0
+        } else {
+            0.0
+        };
+
+        // 与回测做空信号对称的条件
+        let short_trend_env_ok = ema_trend > 0.0
+            && below_ema50_pct > 0.15
+            && ema21_slope < -0.03
+            && trend_down
+            && trend_strength >= self.config.min_trend_strength_pct;
+        let adx_ok = !adx_ready || adx_val >= self.config.adx_min_threshold;
+        let di_ok = !adx_ready
+            || (minus_di > plus_di && (minus_di - plus_di) >= self.config.min_adx_di_diff);
+
+        let recent_low = state.recent_lows.iter().cloned().fold(f64::MAX, f64::min);
+        let breakdown_signal = recent_low < f64::MAX
+            && close < recent_low * 0.9995
+            && vol_ratio < 1.0 / self.config.volume_ratio_threshold
+            && rsi > 40.0;
+        let overbought_reject = rsi > 70.0 && vol_ratio < 1.0 / self.config.volume_ratio_threshold;
+
+        if short_trend_env_ok && adx_ok && di_ok && (breakdown_signal || overbought_reject) {
+            let path = if breakdown_signal {
+                "跌破"
+            } else {
+                "超买回落"
+            };
+            state.virtual_short = Some(VirtualShort {
+                entry_price: close,
+                entry_time_ms: event.close_time,
+                atr,
+            });
+            log::info!(
+                "🈳 虚拟做空开仓 | {} | 路径: {} | @ {:.2} | RSI: {:.1} | VR: {:.2} | ADX: {:.1} -DI优势: +{:.1} | 跌破EMA50: {:.2}% | 强度: {:.3}% | 若合约模式此时可做空",
+                self.config.symbol,
+                path,
+                close,
+                rsi,
+                vol_ratio,
+                adx_val,
+                minus_di - plus_di,
+                below_ema50_pct,
+                trend_strength,
+            );
         }
     }
 
@@ -1076,7 +1407,7 @@ impl MomentumStrategy {
                 );
 
             let long_trend_env_ok = ema_trend > 0.0
-                && price_above_ema50_pct > 0.15  // 至少高于EMA50 0.15%，避免边缘试探
+                && price_above_ema50_pct > self.config.min_price_above_ema50_pct  // 至少高于EMA50配置值，避免边缘试探
                 && price_above_ema50_pct < self.config.max_ema50_distance_pct  // 趋势过度延伸过滤
                 && ema21_slope > self.config.mean_revert_min_slope  // 使用配置化斜率门槛，便于回测同步优化
                 && ema50_macro_rising  // EMA50宏观方向必须上升
@@ -1097,11 +1428,12 @@ impl MomentumStrategy {
                 && rsi > (self.config.rsi_oversold + 5.0)
                 && rsi < self.config.rsi_overbought;
 
-            // 条件3: RSI反弹路径需要更高VR门槛（回测验证VR≥2.5过滤弱反弹）
-            let rsi_bounce_vr_ok = vol_ratio > 2.5;
+            // 条件3: RSI反弹路径VR门槛（与配置量比阈值一致，路线B松绑）
+            let rsi_bounce_vr_ok = vol_ratio > self.config.volume_ratio_threshold;
 
-            // 条件4: 盘口有买盘支撑
-            let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
+            // 条件4: 盘口买盘支撑（默认作为软加分而非硬条件，require_bid_support可开启）
+            let bid_support_raw = state.best_bid_qty > state.best_ask_qty * 1.5;
+            let bid_support_ok = bid_support_raw || !self.config.require_bid_support;
 
             // 突破入场条件：价格突破最近N根K线最高价
             let breakout_signal = if state.recent_highs.len() >= 10 {
@@ -1122,7 +1454,7 @@ impl MomentumStrategy {
             // 突破路径额外要求斜率>配置值（更强的趋势确认）
             let breakout_slope_ok = ema21_slope > self.config.breakout_min_slope;
             let slope_positive = ema21_slope > 0.03;
-            let rsi_bounce_not_late = rsi < 55.0;
+            let rsi_bounce_not_late = rsi < self.config.rsi_bounce_max_rsi;
 
             // === 多因子评分系统 ===
             let mut entry_score: u32 = 0;
@@ -1141,7 +1473,7 @@ impl MomentumStrategy {
             if vol_ratio > self.config.volume_ratio_threshold {
                 entry_score += 15;
             }
-            if bid_support {
+            if bid_support_raw {
                 entry_score += 10;
             }
             if slope_positive {
@@ -1159,12 +1491,15 @@ impl MomentumStrategy {
                     && trend_strong_enough
                     && rsi_recovering
                     && rsi_bounce_vr_ok
-                    && bid_support
+                    && bid_support_ok
                     && rsi_bounce_not_late)
                     || (breakout_signal && trend_up && trend_strong_enough && breakout_slope_ok));
 
             // === 均值回归入场信号（超跌反弹，不需要趋势确认） ===
             // 加速下跌保护：斜率 > 配置值 时才允许均值回归
+            // 深跌反弹允许价格短暂跌破EMA50（默认不要求在EMA50上方，mean_revert_require_above_ema50可开启）
+            let above_ema50_ok =
+                !self.config.mean_revert_require_above_ema50 || current_price >= ema_trend;
             let mean_revert_signal = if state.recent_highs.len() >= 20 {
                 let recent_high = state
                     .recent_highs
@@ -1172,14 +1507,14 @@ impl MomentumStrategy {
                     .copied()
                     .fold(f64::NEG_INFINITY, f64::max);
                 let drop_pct = (recent_high - current_price) / recent_high * 100.0;
-                // 从20bar高点跌幅达标 + RSI<38 + VR>2.5(强买盘) + 盘口支撑 + 上升趋势保护 + 波动率过滤
+                // 从20bar高点跌幅达标 + RSI超卖 + VR达标(买盘) + 盘口支撑(可关) + 上升趋势保护 + 波动率过滤
                 drop_pct > self.config.mean_revert_min_drop_pct
-                    && rsi < 38.0
-                    && vol_ratio > 2.5
-                    && bid_support
+                    && rsi < self.config.rsi_oversold
+                    && vol_ratio > self.config.volume_ratio_threshold
+                    && bid_support_ok
                     && ema21_slope > self.config.mean_revert_min_slope
                     && ema_trend > 0.0
-                    && current_price >= ema_trend
+                    && above_ema50_ok
                     && ema50_macro_rising
                     && long_di_direction_ok
                     && long_structure_ok
@@ -1195,7 +1530,7 @@ impl MomentumStrategy {
                 // 优先判断RSI反弹路径：两种条件同时满足时RSI反弹更具体
                 let entry_path = if mean_revert_signal {
                     "均值回归"
-                } else if trend_up && rsi_recovering && rsi_bounce_vr_ok && bid_support {
+                } else if trend_up && rsi_recovering && rsi_bounce_vr_ok && bid_support_ok {
                     "RSI反弹"
                 } else {
                     "突破"
@@ -1217,7 +1552,7 @@ impl MomentumStrategy {
                 log::info!("📊 [入场因子] trend↑:{} 强度:{:.3}% ADX:{:.1}≥{:.0} DI方向:{} 结构:{} rsi_recover:{} RSI未过热:{} 量比:{:.2}≥{:.1} 买盘支撑:{} 斜率正:{} 波动率正常:{} | ema50宏观上升:{} 趋势环境:{}",
                     trend_up, trend_strength, adx_val, self.config.adx_min_threshold,
                     long_di_direction_ok, long_structure_ok, rsi_recovering, rsi_bounce_not_late, vol_ratio, self.config.volume_ratio_threshold,
-                    bid_support, slope_positive, volatility_normal,
+                    bid_support_raw, slope_positive, volatility_normal,
                     ema50_macro_rising, long_trend_env_ok);
                 state.entry_score = entry_score;
                 state.entry_path = entry_path.to_string();

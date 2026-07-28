@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+use crate::clients::binance_client::OrderResponse;
 use crate::clients::BinanceClient;
 use crate::error::{DomainError, EventBusError, ServiceError};
 use crate::event_bus::{EventBus, EventHandler, EventType, TokioEventBus};
@@ -55,6 +56,22 @@ pub struct OrderExecutionService {
     event_bus: Arc<TokioEventBus>,
     symbols: Vec<String>,
     balance: Arc<Mutex<AccountBalance>>,
+    // 成本端突破：限价单入场配置
+    use_limit_entry: bool,         // 开仓BUY限价单优先，超时撤单转市价
+    limit_entry_offset_pct: f64,   // 挂单价低于信号价的百分比
+    limit_entry_wait_seconds: u64, // 限价单最长等待秒数
+}
+
+/// 按交易对 tickSize 向下取整价格（限价单挂单价必须符合 PRICE_FILTER）
+fn round_price_tick(price: f64, symbol: &str) -> f64 {
+    let decimals: u32 = match symbol {
+        "BTCUSDT" => 2, // tick = 0.01
+        "ETHUSDT" => 2, // tick = 0.01
+        "SOLUSDT" => 3, // tick = 0.001
+        _ => 2,
+    };
+    let factor = 10_f64.powi(decimals as i32);
+    ((price * factor) + 1e-9).floor() / factor
 }
 
 /// 按交易对的 LOT_SIZE stepSize 向下取整
@@ -77,6 +94,9 @@ impl OrderExecutionService {
         risk_service: RiskMonitorService,
         event_bus: Arc<TokioEventBus>,
         symbols: Vec<String>,
+        use_limit_entry: bool,
+        limit_entry_offset_pct: f64,
+        limit_entry_wait_seconds: u64,
     ) -> Self {
         Self {
             client,
@@ -84,7 +104,182 @@ impl OrderExecutionService {
             event_bus,
             symbols,
             balance: Arc::new(Mutex::new(AccountBalance::new())),
+            use_limit_entry,
+            limit_entry_offset_pct,
+            limit_entry_wait_seconds,
         }
+    }
+
+    /// 发布订单提交证据事件
+    async fn publish_submit_event(
+        &self,
+        signal: &TradingSignalEvent,
+        side: &str,
+        order_type: &str,
+        quantity: f64,
+        price: Option<f64>,
+    ) {
+        let submit_event = DomainEvent::OrderSubmitted(OrderSubmittedEvent {
+            order_id: signal.signal_id.clone(),
+            symbol: signal.symbol.clone(),
+            side: side.to_string(),
+            order_type: order_type.to_string(),
+            price,
+            quantity,
+            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        });
+        if let Err(e) = self.event_bus.publish(submit_event).await {
+            log::warn!("订单提交证据事件发布失败: {}", e);
+        }
+    }
+
+    /// 限价单优先 + 超时撤单转市价兜底（成本端突破：省去市价单滑点）
+    /// 返回合成 OrderResponse：混合成交时合并限价段与市价段的数量/金额，供下游统一解析
+    async fn place_limit_then_market(
+        &self,
+        signal: &TradingSignalEvent,
+        quantity: f64,
+    ) -> Result<OrderResponse, DomainError> {
+        let limit_price = round_price_tick(
+            signal.suggested_price * (1.0 - self.limit_entry_offset_pct / 100.0),
+            &signal.symbol,
+        );
+
+        self.publish_submit_event(signal, "BUY", "LIMIT", quantity, Some(limit_price))
+            .await;
+        let placed = self
+            .client
+            .place_order(
+                &signal.symbol,
+                "BUY",
+                "LIMIT",
+                quantity,
+                Some(limit_price),
+                Some("GTC"),
+            )
+            .await?;
+        log::info!(
+            "📥 限价买单已挂 | {} | #{} @ {:.2} | 数量: {:.5} | 等待≤{}s",
+            signal.symbol,
+            placed.order_id,
+            limit_price,
+            quantity,
+            self.limit_entry_wait_seconds
+        );
+
+        // 价格穿越导致立即成交：直接返回（响应含fills佣金）
+        if placed.status == "FILLED" {
+            log::info!(
+                "✅ 限价单立即成交 @ {:.2}（省滑点≈{:.3}%）",
+                limit_price,
+                self.limit_entry_offset_pct
+            );
+            return Ok(placed);
+        }
+
+        // 轮询等待成交
+        let wait_secs = self.limit_entry_wait_seconds;
+        let poll_interval = 3u64;
+        let mut waited = 0u64;
+        while waited < wait_secs {
+            tokio::time::sleep(Duration::from_secs(poll_interval)).await;
+            waited += poll_interval;
+            match self
+                .client
+                .query_order(&signal.symbol, Some(placed.order_id), None)
+                .await
+            {
+                Ok(q) if q.status == "FILLED" => {
+                    log::info!(
+                        "✅ 限价单成交 | {} | #{} @ {:.2}（等待{}s，省滑点≈{:.3}%）",
+                        signal.symbol,
+                        placed.order_id,
+                        limit_price,
+                        waited,
+                        self.limit_entry_offset_pct
+                    );
+                    return Ok(q);
+                }
+                Ok(q)
+                    if q.status == "CANCELED"
+                        || q.status == "EXPIRED"
+                        || q.status == "REJECTED" =>
+                {
+                    log::warn!("限价单状态异常: {}，转市价兜底", q.status);
+                    break;
+                }
+                Ok(_) => {} // NEW / PARTIALLY_FILLED 继续等待
+                Err(e) => {
+                    log::warn!("限价单查询失败: {}，继续等待", e);
+                }
+            }
+        }
+
+        // 超时未完全成交：撤单
+        log::info!(
+            "⏱️ 限价单{}s未完全成交，撤单转市价 | {} | #{}",
+            wait_secs,
+            signal.symbol,
+            placed.order_id
+        );
+        if let Err(e) = self
+            .client
+            .cancel_order(&signal.symbol, Some(placed.order_id), None)
+            .await
+        {
+            log::warn!("限价单撤单失败: {}（可能撤单瞬间已成交）", e);
+        }
+        // 撤单后确认限价段实际成交量
+        let final_state = self
+            .client
+            .query_order(&signal.symbol, Some(placed.order_id), None)
+            .await
+            .ok();
+        let limit_filled_qty = final_state
+            .as_ref()
+            .and_then(|q| q.executed_qty.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let limit_quote = final_state
+            .as_ref()
+            .and_then(|q| q.cummulative_quote_qty.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let remaining = round_step_size(quantity - limit_filled_qty, &signal.symbol);
+        if remaining <= 0.0 {
+            log::info!("✅ 撤单时限价单已完全成交 @ {:.2}", limit_price);
+            return Ok(final_state.unwrap_or(placed));
+        }
+
+        // 剩余数量转市价
+        self.publish_submit_event(signal, "BUY", "MARKET", remaining, None)
+            .await;
+        let market = self
+            .client
+            .place_order(&signal.symbol, "BUY", "MARKET", remaining, None, None)
+            .await?;
+
+        // 合并两笔成交
+        let market_qty = market.executed_qty.parse::<f64>().unwrap_or(remaining);
+        let market_quote = market.cummulative_quote_qty.parse::<f64>().unwrap_or(0.0);
+        let total_qty = limit_filled_qty + market_qty;
+        let total_quote = limit_quote + market_quote;
+        log::info!(
+            "🔀 混合成交 | 限价 {:.5} @ {:.2} + 市价 {:.5} @ {:.2} | 总量: {:.5}",
+            limit_filled_qty,
+            limit_price,
+            market_qty,
+            if market_qty > 0.0 {
+                market_quote / market_qty
+            } else {
+                0.0
+            },
+            total_qty
+        );
+        // 以市价响应为载体合并总量；fills 仅含市价段，限价段佣金由下游按BNB费率补估
+        let mut merged = market;
+        merged.executed_qty = total_qty.to_string();
+        merged.cummulative_quote_qty = total_quote.to_string();
+        Ok(merged)
     }
 
     /// 启动时同步账户余额
@@ -385,31 +580,36 @@ impl OrderExecutionService {
             }
         }
 
-        // 4. 调用 API 下单 - 使用市价单快速成交
-        let submit_event = DomainEvent::OrderSubmitted(OrderSubmittedEvent {
-            order_id: signal.signal_id.clone(),
-            symbol: signal.symbol.clone(),
-            side: side.to_string(),
-            order_type: "MARKET".to_string(),
-            price: None,
-            quantity: actual_quantity,
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
-        });
-        if let Err(e) = self.event_bus.publish(submit_event).await {
-            log::warn!("订单提交证据事件发布失败: {}", e);
-        }
-
-        let order_result = self
-            .client
-            .place_order(
-                &signal.symbol,
-                side,
-                "MARKET", // 市价单快速成交
-                actual_quantity,
-                None, // 市价单不需要价格
-                None, // 市价单不需要TIF
-            )
-            .await?;
+        // 4. 调用 API 下单
+        // 开仓BUY且启用限价模式：限价单优先（省滑点），超时未成交撤单转市价兜底；
+        // 平仓SELL始终市价单（止损止盈时效优先）
+        let use_limit = side == "BUY" && !is_exit && self.use_limit_entry;
+        let order_result = if use_limit {
+            match self.place_limit_then_market(&signal, actual_quantity).await {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("限价优先下单失败，回退市价单: {}", e);
+                    self.publish_submit_event(&signal, side, "MARKET", actual_quantity, None)
+                        .await;
+                    self.client
+                        .place_order(&signal.symbol, side, "MARKET", actual_quantity, None, None)
+                        .await?
+                }
+            }
+        } else {
+            self.publish_submit_event(&signal, side, "MARKET", actual_quantity, None)
+                .await;
+            self.client
+                .place_order(
+                    &signal.symbol,
+                    side,
+                    "MARKET", // 市价单快速成交
+                    actual_quantity,
+                    None, // 市价单不需要价格
+                    None, // 市价单不需要TIF
+                )
+                .await?
+        };
 
         // 5. 记录订单到风控
         self.risk_service.record_order(order_amount).await;
@@ -428,6 +628,8 @@ impl OrderExecutionService {
         };
 
         // 从API返回的fills中获取实际手续费
+        // 注意：混合成交时fills仅含市价段，限价段佣金按BNB抵扣费率0.075%补估；
+        // 限价单等待成交后query_order不含fills，同样按BNB费率估算
         let (commission, commission_asset) = if let Some(ref fills) = order_result.fills {
             let total_commission: f64 = fills
                 .iter()
@@ -437,10 +639,27 @@ impl OrderExecutionService {
                 .first()
                 .map(|f| f.commission_asset.clone())
                 .unwrap_or_else(|| "USDT".to_string());
-            (total_commission, asset)
+            // fills覆盖的成交额，差额部分（限价段）按BNB费率补估
+            let fills_quote: f64 = fills
+                .iter()
+                .filter_map(|f| {
+                    let p = f.price.parse::<f64>().ok()?;
+                    let q = f.qty.parse::<f64>().ok()?;
+                    Some(p * q)
+                })
+                .sum();
+            let missing_quote = (actual_quote_qty - fills_quote).max(0.0);
+            if missing_quote > 0.01 {
+                log::info!(
+                    "限价段佣金按BNB费率补估: 未覆盖成交额 {:.2} U → +{:.4} U",
+                    missing_quote,
+                    missing_quote * 0.00075
+                );
+            }
+            (total_commission + missing_quote * 0.00075, asset)
         } else {
-            // 备用：用默认0.1%估算
-            (fill_qty * fill_price * 0.001, "USDT".to_string())
+            // 无fills（限价单轮询成交）：按BNB抵扣费率0.075%估算
+            (fill_qty * fill_price * 0.00075, "USDT".to_string())
         };
 
         // 7. 更新本地余额缓存（使用实际成交金额，按品种更新对应资产，并扣除实际手续费）
@@ -569,6 +788,9 @@ impl Clone for OrderExecutionService {
             event_bus: self.event_bus.clone(),
             symbols: self.symbols.clone(),
             balance: self.balance.clone(),
+            use_limit_entry: self.use_limit_entry,
+            limit_entry_offset_pct: self.limit_entry_offset_pct,
+            limit_entry_wait_seconds: self.limit_entry_wait_seconds,
         }
     }
 }

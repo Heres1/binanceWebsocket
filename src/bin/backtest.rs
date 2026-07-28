@@ -2,6 +2,7 @@
 //!
 //! 使用方式：
 //!   cargo run --bin backtest -- --mode kline --days 7 --symbol BTCUSDT
+//!   cargo run --bin backtest -- --mode walkforward --config config/default.toml
 //!   cargo run --bin backtest -- --mode optimize --symbol BTCUSDT
 //!   cargo run --bin backtest -- --mode replay --file data/recorded/BTCUSDT_20260320.jsonl
 
@@ -23,6 +24,9 @@ struct Args {
     symbol: String,       // 交易对
     file: Option<String>, // 录制文件路径（replay模式）
     capital: f64,         // 初始资金
+    config: String,       // 配置文件路径
+    spread: f64,          // 模拟买卖点差%（全额）
+    slippage: f64,        // 模拟市价单滑点%（单边）
 }
 
 impl Args {
@@ -34,6 +38,9 @@ impl Args {
             symbol: "BTCUSDT".to_string(),
             file: None,
             capital: 200.0,
+            config: "config/default.toml".to_string(),
+            spread: 0.02,
+            slippage: 0.03,
         };
 
         let mut i = 1;
@@ -69,17 +76,38 @@ impl Args {
                         i += 1;
                     }
                 }
+                "--config" => {
+                    if i + 1 < args.len() {
+                        result.config = args[i + 1].clone();
+                        i += 1;
+                    }
+                }
+                "--spread" => {
+                    if i + 1 < args.len() {
+                        result.spread = args[i + 1].parse().unwrap_or(0.02);
+                        i += 1;
+                    }
+                }
+                "--slippage" => {
+                    if i + 1 < args.len() {
+                        result.slippage = args[i + 1].parse().unwrap_or(0.03);
+                        i += 1;
+                    }
+                }
                 "--help" | "-h" => {
                     println!("回测系统 - 动量短线策略回测工具");
                     println!();
                     println!("用法: cargo run --bin backtest -- [OPTIONS]");
                     println!();
                     println!("选项:");
-                    println!("  --mode <MODE>       回测模式: kline(默认) / optimize / optimize_v2 / compare / replay");
+                    println!("  --mode <MODE>       回测模式: kline(默认) / walkforward / optimize / optimize_v2 / compare / replay");
                     println!("  --days <N>          K线模式回测天数 (默认: 7)");
                     println!("  --symbol <SYMBOL>   交易对 (默认: BTCUSDT)");
                     println!("  --file <PATH>       Replay模式的录制文件路径");
                     println!("  --capital <USDT>    初始资金 (默认: 200)");
+                    println!("  --config <PATH>     配置文件路径 (默认: config/default.toml)");
+                    println!("  --spread <PCT>      模拟买卖点差%全额 (默认: 0.02)");
+                    println!("  --slippage <PCT>    模拟市价单滑点%单边 (默认: 0.03)");
                     println!("  --help              显示帮助");
                     std::process::exit(0);
                 }
@@ -102,7 +130,7 @@ async fn main() {
     println!();
 
     // 加载配置
-    let config = match AppConfig::load("config/default.toml") {
+    let config = match AppConfig::load(&args.config) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("加载配置失败: {}", e);
@@ -117,9 +145,11 @@ async fn main() {
         symbol: args.symbol.clone(),
         initial_capital: args.capital,
         strategy: strategy_config,
-        commission_rate: 0.0005, // 0.05%/侧 = 0.1%往返 (BUY免费+SELL 0.1%)
+        commission_rate: 0.00075, // BNB抵扣口径 0.075%/侧 = 0.15%往返（需账户开启BNB抵扣）
         position_allocation_pct: config.risk.position_allocation_pct,
         min_usdt_reserve: config.risk.min_usdt_reserve,
+        spread_pct: args.spread,
+        slippage_pct: args.slippage,
     };
 
     let engine = BacktestEngine::new(backtest_config, data_dir);
@@ -143,7 +173,7 @@ async fn main() {
         "optimize" => {
             // 参数优化模式
             ensure_data(&engine, &args, &config).await;
-            run_optimization(&engine, &config.strategy);
+            run_optimization(&engine, &config.strategy, args.spread, args.slippage);
         }
         "optimize_v2" => {
             // V2多策略结构性优化
@@ -153,7 +183,18 @@ async fn main() {
         "compare" => {
             // A/B对比测试：策略优化方案对比
             ensure_data(&engine, &args, &config).await;
-            run_comparison(&config.strategy, args.capital);
+            run_comparison(&config.strategy, args.capital, args.spread, args.slippage);
+        }
+        "walkforward" => {
+            // Walk-Forward 样本外验证：前2/3数据训练，后1/3数据验证
+            ensure_data(&engine, &args, &config).await;
+            run_walkforward(
+                &config.strategy,
+                args.capital,
+                0.00075, // BNB抵扣口径
+                args.spread,
+                args.slippage,
+            );
         }
         "replay" => {
             let file_path = match &args.file {
@@ -176,7 +217,7 @@ async fn main() {
         }
         other => {
             eprintln!(
-                "未知模式: {} (可选: kline, optimize, optimize_v2, compare, replay)",
+                "未知模式: {} (可选: kline, walkforward, optimize, optimize_v2, compare, replay)",
                 other
             );
             std::process::exit(1);
@@ -230,7 +271,12 @@ async fn ensure_data(engine: &BacktestEngine, args: &Args, config: &AppConfig) {
 }
 
 /// 参数优化器
-fn run_optimization(engine: &BacktestEngine, base: &StrategyConfig) {
+fn run_optimization(
+    engine: &BacktestEngine,
+    base: &StrategyConfig,
+    spread_pct: f64,
+    slippage_pct: f64,
+) {
     println!("🔧 开始参数优化...");
     println!(
         "   基准配置: TP={:.2}% SL={:.2}% Hold={}s CD={}s RSI={:.0}/{:.0} VR={:.1}",
@@ -351,7 +397,13 @@ fn run_optimization(engine: &BacktestEngine, base: &StrategyConfig) {
                                             strategy.cooldown_seconds = cd;
 
                                             if let Ok(report) = BacktestEngine::run_backtest_on_data(
-                                                &klines_1m, &klines_5m, &strategy, 200.0, 0.00075,
+                                                &klines_1m,
+                                                &klines_5m,
+                                                &strategy,
+                                                200.0,
+                                                0.00075,
+                                                spread_pct,
+                                                slippage_pct,
                                             ) {
                                                 if report.total_trades >= 5 {
                                                     if report.total_return_pct > 0.0 {
@@ -736,7 +788,7 @@ fn run_optimization_v2(base: &StrategyConfig, capital: f64) {
 }
 
 /// 多时段稳定性测试：将数据分段回测，验证策略在不同市况下的表现
-fn run_comparison(base: &StrategyConfig, capital: f64) {
+fn run_comparison(base: &StrategyConfig, capital: f64, spread_pct: f64, slippage_pct: f64) {
     println!("\n\u{1f52c} 多时段稳定性测试 - 验证策略在不同市况下的稳健性");
     println!("   当前配置: SL=8.5x ATR | TR=3.0x/2.0x ATR | TP=3.0%");
     println!("   目标: 确认策略在不同时段均有正收益且胜率稳定");
@@ -758,7 +810,7 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
         }
     };
 
-    let commission_rate = 0.0005;
+    let commission_rate = 0.00075; // BNB抵扣口径
     let total_1m = klines_1m.len();
     let total_5m = klines_5m.len();
 
@@ -853,6 +905,8 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
             base,
             capital,
             commission_rate,
+            spread_pct,
+            slippage_pct,
         ) {
             Ok(report) => {
                 println!(
@@ -948,4 +1002,135 @@ fn run_comparison(base: &StrategyConfig, capital: f64) {
     println!("   [✓] 做空路径: 已禁用(allow_short=false)，不影响实盘");
     println!("   [✓] 多因子评分: 回测与实盘完全一致(8因子满分100)");
     println!("   [∗] daily_pnl差异: 回测用毛盈亏累加，实盘用净盈亏(差异0.1%/笔，影响可忽略)");
+}
+
+/// Walk-Forward 样本外验证：前2/3数据为训练段（样本内），后1/3为验证段（样本外）
+///
+/// 训练段与验证段表现差异过大 = 过拟合信号，参数不稳健
+fn run_walkforward(
+    base: &StrategyConfig,
+    capital: f64,
+    commission_rate: f64,
+    spread_pct: f64,
+    slippage_pct: f64,
+) {
+    println!("\n🔬 Walk-Forward 样本外验证");
+    println!("   前 2/3 数据 = 训练段（样本内，调参依据）");
+    println!("   后 1/3 数据 = 验证段（样本外，检验过拟合）");
+    println!(
+        "   成本模型: 佣金 {:.3}%/边 + 点差 {:.2}% + 滑点 {:.2}%/边",
+        commission_rate * 100.0,
+        spread_pct,
+        slippage_pct
+    );
+    println!();
+
+    let loader = DataLoader::new("data");
+    let klines_1m = match loader.load_klines(&base.symbol, "1m") {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("加载1m数据失败: {}", e);
+            return;
+        }
+    };
+    let klines_5m = match loader.load_klines(&base.symbol, "5m") {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("加载5m数据失败: {}", e);
+            return;
+        }
+    };
+
+    let split_1m = klines_1m.len() * 2 / 3;
+    let split_5m = klines_5m.len() * 2 / 3;
+    let train_1m = &klines_1m[..split_1m];
+    let train_5m = &klines_5m[..split_5m];
+    let test_1m = &klines_1m[split_1m..];
+    let test_5m = &klines_5m[split_5m..];
+
+    println!(
+        "   训练段: {} 根 1m K线 | 验证段: {} 根 1m K线",
+        train_1m.len(),
+        test_1m.len()
+    );
+
+    println!("\n━━━ 训练段（样本内，前 2/3）━━━");
+    let train_report = match BacktestEngine::run_backtest_on_data(
+        train_1m,
+        train_5m,
+        base,
+        capital,
+        commission_rate,
+        spread_pct,
+        slippage_pct,
+    ) {
+        Ok(r) => {
+            r.print_summary();
+            r
+        }
+        Err(e) => {
+            eprintln!("训练段回测失败: {}", e);
+            return;
+        }
+    };
+
+    println!("\n━━━ 验证段（样本外，后 1/3）━━━");
+    let test_report = match BacktestEngine::run_backtest_on_data(
+        test_1m,
+        test_5m,
+        base,
+        capital,
+        commission_rate,
+        spread_pct,
+        slippage_pct,
+    ) {
+        Ok(r) => {
+            r.print_summary();
+            r
+        }
+        Err(e) => {
+            eprintln!("验证段回测失败: {}", e);
+            return;
+        }
+    };
+
+    // 对比小结
+    println!("\n━━━ Walk-Forward 对比小结 ━━━");
+    println!(
+        "   {:<10} {:<10} {:<10} {:<8} {:<6} {:<10} {:<12}",
+        "时段", "总收益%", "年化%", "胜率%", "笔数", "盈亏比", "期望值U/笔"
+    );
+    println!("   {}", "-".repeat(72));
+    for (name, r) in [("训练段", &train_report), ("验证段", &test_report)] {
+        println!(
+            "   {:<10} {:<10.2} {:<10.2} {:<8.1} {:<6} {:<10.2} {:<12.4}",
+            name,
+            r.total_return_pct,
+            r.annual_return_pct,
+            r.win_rate,
+            r.total_trades,
+            r.profit_loss_ratio,
+            r.expectancy_usdt
+        );
+    }
+    println!();
+
+    if train_report.annual_return_pct > 0.0 && test_report.annual_return_pct <= 0.0 {
+        println!("   ❌ 训练段盈利但验证段亏损 → 明显过拟合，参数不可用于实盘");
+    } else if train_report.annual_return_pct > 0.0 && test_report.annual_return_pct > 0.0 {
+        let decay = (1.0 - test_report.annual_return_pct / train_report.annual_return_pct) * 100.0;
+        if decay > 50.0 {
+            println!(
+                "   ⚠️ 验证段年化较训练段衰减 {:.0}%（>50%）→ 存在过拟合倾向，建议降低参数敏感度",
+                decay
+            );
+        } else {
+            println!(
+                "   ✅ 验证段年化衰减 {:.0}%（<50%）→ 参数稳健性可接受",
+                decay
+            );
+        }
+    } else {
+        println!("   ⚠️ 训练段本身未盈利 → 当前参数无正期望，先解决策略逻辑再谈稳健性");
+    }
 }

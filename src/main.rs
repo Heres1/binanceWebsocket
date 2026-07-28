@@ -174,6 +174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         risk_service.clone(),
         event_bus.clone(),
         symbols.clone(),
+        config.strategy.use_limit_entry,
+        config.strategy.limit_entry_offset_pct,
+        config.strategy.limit_entry_wait_seconds,
     ));
     // 启动时同步真实账户余额
     order_execution.sync_balance().await?;

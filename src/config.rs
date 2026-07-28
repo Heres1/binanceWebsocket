@@ -119,6 +119,29 @@ pub struct StrategyConfig {
     pub downtrend_filter_lookback: usize, // 下跌中继结构检测窗口
     #[serde(default = "default_min_reversal_break_pct")]
     pub min_reversal_break_pct: f64, // 连续下移结构中的反转突破确认幅度
+    // === 入场过滤开关（路线B：松绑过滤、用风控替代过滤） ===
+    #[serde(default = "default_require_bid_support")]
+    pub require_bid_support: bool, // 是否要求盘口买一量>1.5倍卖一量（实盘订单簿条件，K线回测无法精确模拟，默认关闭）
+    #[serde(default = "default_rsi_bounce_max_rsi")]
+    pub rsi_bounce_max_rsi: f64, // RSI反弹路径RSI上限（防止追入反弹末端）
+    #[serde(default = "default_min_price_above_ema50_pct")]
+    pub min_price_above_ema50_pct: f64, // 做多要求价格在EMA50上方的最小百分比
+    #[serde(default = "default_mean_revert_require_above_ema50")]
+    pub mean_revert_require_above_ema50: bool, // 均值回归是否要求价格仍在EMA50上方（默认关闭：深跌反弹允许短暂跌破）
+
+    // === 执行层（成本端突破：限价单省滑点） ===
+    #[serde(default = "default_use_limit_entry")]
+    pub use_limit_entry: bool, // 开仓BUY限价单优先（挂低于信号价的买单），超时未成交撤单转市价
+    #[serde(default = "default_limit_entry_offset_pct")]
+    pub limit_entry_offset_pct: f64, // 限价挂单价低于信号价的百分比（默认0.05≈典型点差）
+    #[serde(default = "default_limit_entry_wait_seconds")]
+    pub limit_entry_wait_seconds: u64, // 限价单最长等待秒数，超时撤单转市价兑底
+
+    // === 趋势判断日志（为合约多空积累经验） ===
+    #[serde(default = "default_log_trend_snapshot")]
+    pub log_trend_snapshot: bool, // 每根5m K线收盘打印趋势环境快照（多空对称指标）
+    #[serde(default = "default_log_virtual_short")]
+    pub log_virtual_short: bool, // 现货模式下评估并跟踪虚拟做空信号（纯日志不交易）
 }
 
 fn default_strategy_type() -> String {
@@ -223,6 +246,42 @@ fn default_downtrend_filter_lookback() -> usize {
 
 fn default_min_reversal_break_pct() -> f64 {
     0.05
+}
+
+fn default_require_bid_support() -> bool {
+    false
+}
+
+fn default_rsi_bounce_max_rsi() -> f64 {
+    60.0
+}
+
+fn default_min_price_above_ema50_pct() -> f64 {
+    0.05
+}
+
+fn default_mean_revert_require_above_ema50() -> bool {
+    false
+}
+
+fn default_use_limit_entry() -> bool {
+    true
+}
+
+fn default_limit_entry_offset_pct() -> f64 {
+    0.05
+}
+
+fn default_limit_entry_wait_seconds() -> u64 {
+    30
+}
+
+fn default_log_trend_snapshot() -> bool {
+    true
+}
+
+fn default_log_virtual_short() -> bool {
+    true
 }
 
 /// 做空配置

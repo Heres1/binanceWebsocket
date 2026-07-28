@@ -48,6 +48,15 @@ pub struct BacktestConfig {
     pub commission_rate: f64, // 手续费率，默认0.001 (0.1%)
     pub position_allocation_pct: f64,
     pub min_usdt_reserve: f64,
+    pub spread_pct: f64,   // 模拟买卖点差%(全额)，入场/出场各承担一半
+    pub slippage_pct: f64, // 模拟市价单滑点%(单边)
+}
+
+impl BacktestConfig {
+    /// 单边成交成本%(点差一半 + 滑点)，用于把理想成交价修正为实际成交均价
+    pub fn cost_per_side_pct(&self) -> f64 {
+        self.spread_pct / 2.0 + self.slippage_pct
+    }
 }
 
 /// 内部持仓状态
@@ -427,6 +436,8 @@ impl BacktestEngine {
                         (kline.close, "RSI超买")
                     };
 
+                    // 滑点/点差成本：卖出实际成交均价低于理想价
+                    let exit_price = exit_price * (1.0 - self.config.cost_per_side_pct() / 100.0);
                     let pnl_pct = (exit_price - state.entry_price) / state.entry_price * 100.0;
                     let quantity = state.entry_quantity;
                     let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
@@ -532,6 +543,8 @@ impl BacktestEngine {
                         (kline.close, "空超时")
                     };
 
+                    // 滑点/点差成本：买入平空实际成交均价高于理想价
+                    let exit_price = exit_price * (1.0 + self.config.cost_per_side_pct() / 100.0);
                     let pnl_pct = (state.entry_price - exit_price) / state.entry_price * 100.0;
                     let quantity = state.entry_quantity;
                     let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
@@ -640,7 +653,7 @@ impl BacktestEngine {
                     );
 
                 let long_trend_env_ok = ema_trend > 0.0
-                    && price_above_ema50_pct > 0.15
+                    && price_above_ema50_pct > self.config.strategy.min_price_above_ema50_pct
                     && price_above_ema50_pct < self.config.strategy.max_ema50_distance_pct
                     && ema21_slope > self.config.strategy.mean_revert_min_slope
                     && ema50_macro_rising
@@ -658,8 +671,10 @@ impl BacktestEngine {
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (self.config.strategy.rsi_oversold + 5.0)
                     && rsi < self.config.strategy.rsi_overbought;
-                let rsi_bounce_vr_ok = vol_ratio > 2.5;
-                let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
+                let rsi_bounce_vr_ok = vol_ratio > self.config.strategy.volume_ratio_threshold;
+                // 盘口支撑：K线回测无法精确模拟实盘订单簿，默认不作为硬条件（配置可开启）
+                let bid_support_raw = state.best_bid_qty > state.best_ask_qty * 1.5;
+                let bid_support_ok = bid_support_raw || !self.config.strategy.require_bid_support;
                 let slope_positive = ema21_slope > 0.03;
 
                 // 突破入场条件
@@ -693,7 +708,7 @@ impl BacktestEngine {
                 if vol_ratio > self.config.strategy.volume_ratio_threshold {
                     entry_score += 15;
                 }
-                if bid_support {
+                if bid_support_raw {
                     entry_score += 10;
                 }
                 if slope_positive {
@@ -705,17 +720,16 @@ impl BacktestEngine {
 
                 // 突破路径额外要求斜率>配置值
                 let breakout_slope_ok = ema21_slope > self.config.strategy.breakout_min_slope;
-                let rsi_bounce_not_late = rsi < 55.0;
+                let rsi_bounce_not_late = rsi < self.config.strategy.rsi_bounce_max_rsi;
 
                 // 趋势入场：评分达标 + 趋势环境确认
-                // RSI反弹路径额外要求RSI<55，避免实盘中RSI接近60时追入反弹末端
                 let trend_entry_signal = long_trend_env_ok
                     && entry_score >= self.config.strategy.entry_score_threshold
                     && ((trend_up
                         && trend_strong_enough
                         && rsi_recovering
                         && rsi_bounce_vr_ok
-                        && bid_support
+                        && bid_support_ok
                         && rsi_bounce_not_late)
                         || (breakout_signal
                             && trend_up
@@ -730,13 +744,16 @@ impl BacktestEngine {
                         .copied()
                         .fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
+                    // 深跌反弹允许短暂跌破EMA50（原“必须仍在EMA50上方”与深跌条件自相矛盾，配置可恢复）
+                    let above_ema50_ok = !self.config.strategy.mean_revert_require_above_ema50
+                        || kline.close >= ema_trend;
                     drop_pct > self.config.strategy.mean_revert_min_drop_pct
-                        && rsi < 38.0
-                        && vol_ratio > 2.5
-                        && bid_support
+                        && rsi < self.config.strategy.rsi_oversold
+                        && vol_ratio > self.config.strategy.volume_ratio_threshold
+                        && bid_support_ok
                         && ema21_slope > self.config.strategy.mean_revert_min_slope
                         && ema_trend > 0.0
-                        && kline.close >= ema_trend
+                        && above_ema50_ok
                         && ema50_macro_rising
                         && long_di_direction_ok
                         && long_structure_ok
@@ -759,10 +776,12 @@ impl BacktestEngine {
                         continue;
                     }
                     state.position = Position::Long;
-                    state.entry_price = kline.close;
+                    // 滑点/点差成本：买入实际成交均价高于理想价
+                    state.entry_price =
+                        kline.close * (1.0 + self.config.cost_per_side_pct() / 100.0);
                     state.entry_quantity = entry_quantity;
                     state.entry_time = timestamp;
-                    state.highest_since_entry = kline.close;
+                    state.highest_since_entry = state.entry_price;
                     state.trailing_active = false;
                     state.breakeven_active = false;
                     state.rsi_was_oversold = false;
@@ -827,10 +846,12 @@ impl BacktestEngine {
                             continue;
                         }
                         state.position = Position::Short;
-                        state.entry_price = kline.close;
+                        // 滑点/点差成本：做空卖出开仓实际成交均价低于理想价
+                        state.entry_price =
+                            kline.close * (1.0 - self.config.cost_per_side_pct() / 100.0);
                         state.entry_quantity = entry_quantity;
                         state.entry_time = timestamp;
-                        state.lowest_since_entry = kline.close;
+                        state.lowest_since_entry = state.entry_price;
                         state.trailing_active = false;
                         state.breakeven_active = false;
                         state.rsi_was_oversold = false;
@@ -846,7 +867,12 @@ impl BacktestEngine {
         // 如果回测结束时还有持仓，强制平仓
         if state.position == Position::Long || state.position == Position::Short {
             if let Some((last_kline, _)) = events.last() {
-                let current_price = last_kline.close;
+                // 强制平仓同样承担滑点/点差成本
+                let current_price = if state.position == Position::Long {
+                    last_kline.close * (1.0 - self.config.cost_per_side_pct() / 100.0)
+                } else {
+                    last_kline.close * (1.0 + self.config.cost_per_side_pct() / 100.0)
+                };
                 let pnl_pct = if state.position == Position::Long {
                     (current_price - state.entry_price) / state.entry_price * 100.0
                 } else {
@@ -1174,7 +1200,9 @@ impl BacktestEngine {
                             && rsi > (self.config.strategy.rsi_oversold + 5.0)
                             && rsi < self.config.strategy.rsi_overbought;
                         let buy_dominant = vol_ratio > self.config.strategy.volume_ratio_threshold;
-                        let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
+                        let bid_support_raw = state.best_bid_qty > state.best_ask_qty * 1.5;
+                        let bid_support =
+                            bid_support_raw || !self.config.strategy.require_bid_support;
 
                         // 突破入场（replay模式用best_ask作为当前价）
                         let breakout_signal = if state.recent_highs.len() >= 10 {
@@ -1187,7 +1215,7 @@ impl BacktestEngine {
                             // RSI < 65: 防止在RSI高位追高
                             breakout_pct > 0.05
                                 && vol_ratio > self.config.strategy.volume_ratio_threshold
-                                && rsi < 65.0
+                                && rsi < self.config.strategy.breakout_max_rsi
                         } else {
                             false
                         };
@@ -1351,6 +1379,8 @@ impl BacktestEngine {
             strategy,
             self.config.initial_capital,
             self.config.commission_rate,
+            self.config.spread_pct,
+            self.config.slippage_pct,
         )
     }
 
@@ -1361,7 +1391,11 @@ impl BacktestEngine {
         strategy: &StrategyConfig,
         initial_capital: f64,
         commission_rate: f64,
+        spread_pct: f64,
+        slippage_pct: f64,
     ) -> Result<BacktestReport, crate::error::DomainError> {
+        // 单边成交成本%(点差一半 + 滑点)，用于把理想成交价修正为实际成交均价
+        let cost_pct = spread_pct / 2.0 + slippage_pct;
         let mut events: Vec<(&BacktestKline, bool)> = Vec::new();
         for k in klines_1m {
             events.push((k, true));
@@ -1522,6 +1556,8 @@ impl BacktestEngine {
                         (kline.close, "RSI超买")
                     };
 
+                    // 滑点/点差成本：卖出实际成交均价低于理想价
+                    let exit_price = exit_price * (1.0 - cost_pct / 100.0);
                     let pnl_pct = (exit_price - state.entry_price) / state.entry_price * 100.0;
                     let quantity = state.entry_quantity;
                     let pnl_usdt = quantity * state.entry_price * pnl_pct / 100.0;
@@ -1621,6 +1657,8 @@ impl BacktestEngine {
                         (kline.close, "空超时")
                     };
 
+                    // 滑点/点差成本：买回实际成交均价高于理想价
+                    let exit_price = exit_price * (1.0 + cost_pct / 100.0);
                     // 做空盈亏: (入场价 - 出场价) / 入场价
                     let pnl_pct = (state.entry_price - exit_price) / state.entry_price * 100.0;
                     let quantity = state.entry_quantity;
@@ -1722,7 +1760,7 @@ impl BacktestEngine {
                     );
 
                 let long_trend_env_ok = ema_trend > 0.0
-                    && price_above_ema50_pct > 0.15
+                    && price_above_ema50_pct > strategy.min_price_above_ema50_pct
                     && price_above_ema50_pct < strategy.max_ema50_distance_pct
                     && ema21_slope > strategy.mean_revert_min_slope
                     && ema50_macro_rising
@@ -1739,8 +1777,10 @@ impl BacktestEngine {
                 let rsi_recovering = state.rsi_was_oversold
                     && rsi > (strategy.rsi_oversold + 5.0)
                     && rsi < strategy.rsi_overbought;
-                let rsi_bounce_vr_ok = vol_ratio > 2.5;
-                let bid_support = state.best_bid_qty > state.best_ask_qty * 1.5;
+                let rsi_bounce_vr_ok = vol_ratio > strategy.volume_ratio_threshold;
+                // 盘口支撑：K线回测无法精确模拟实盘订单簿，默认不作为硬条件（配置可开启）
+                let bid_support_raw = state.best_bid_qty > state.best_ask_qty * 1.5;
+                let bid_support_ok = bid_support_raw || !strategy.require_bid_support;
                 let slope_positive = ema21_slope > 0.03;
 
                 let breakout_signal = if state.recent_highs.len() >= 10 {
@@ -1773,7 +1813,7 @@ impl BacktestEngine {
                 if vol_ratio > strategy.volume_ratio_threshold {
                     entry_score += 15;
                 }
-                if bid_support {
+                if bid_support_raw {
                     entry_score += 10;
                 }
                 if slope_positive {
@@ -1784,7 +1824,7 @@ impl BacktestEngine {
                 }
 
                 let breakout_slope_ok = ema21_slope > strategy.breakout_min_slope;
-                let rsi_bounce_not_late = rsi < 55.0;
+                let rsi_bounce_not_late = rsi < strategy.rsi_bounce_max_rsi;
 
                 let trend_entry_signal = long_trend_env_ok
                     && entry_score >= strategy.entry_score_threshold
@@ -1792,7 +1832,7 @@ impl BacktestEngine {
                         && trend_strong_enough
                         && rsi_recovering
                         && rsi_bounce_vr_ok
-                        && bid_support
+                        && bid_support_ok
                         && rsi_bounce_not_late)
                         || (breakout_signal
                             && trend_up
@@ -1800,6 +1840,9 @@ impl BacktestEngine {
                             && breakout_slope_ok));
 
                 // 均值回归入场信号
+                // 深跌反弹允许价格短暂跌破EMA50（默认不要求在EMA50上方，配置可开启）
+                let above_ema50_ok =
+                    !strategy.mean_revert_require_above_ema50 || kline.close >= ema_trend;
                 let mean_revert_signal = if state.recent_highs.len() >= 20 {
                     let recent_high = state
                         .recent_highs
@@ -1808,12 +1851,12 @@ impl BacktestEngine {
                         .fold(f64::NEG_INFINITY, f64::max);
                     let drop_pct = (recent_high - kline.close) / recent_high * 100.0;
                     drop_pct > strategy.mean_revert_min_drop_pct
-                        && rsi < 38.0
-                        && vol_ratio > 2.5
-                        && bid_support
+                        && rsi < strategy.rsi_oversold
+                        && vol_ratio > strategy.volume_ratio_threshold
+                        && bid_support_ok
                         && ema21_slope > strategy.mean_revert_min_slope
                         && ema_trend > 0.0
-                        && kline.close >= ema_trend
+                        && above_ema50_ok
                         && ema50_macro_rising
                         && long_di_direction_ok
                         && long_structure_ok
@@ -1836,10 +1879,11 @@ impl BacktestEngine {
                         continue;
                     }
                     state.position = Position::Long;
-                    state.entry_price = kline.close;
+                    // 滑点/点差成本：买入实际成交均价高于理想价
+                    state.entry_price = kline.close * (1.0 + cost_pct / 100.0);
                     state.entry_quantity = entry_quantity;
                     state.entry_time = timestamp;
-                    state.highest_since_entry = kline.close;
+                    state.highest_since_entry = state.entry_price;
                     state.trailing_active = false;
                     state.breakeven_active = false;
                     state.rsi_was_oversold = false;
@@ -1902,10 +1946,11 @@ impl BacktestEngine {
                             continue;
                         }
                         state.position = Position::Short;
-                        state.entry_price = kline.close;
+                        // 滑点/点差成本：卖空实际成交均价低于理想价
+                        state.entry_price = kline.close * (1.0 - cost_pct / 100.0);
                         state.entry_quantity = entry_quantity;
                         state.entry_time = timestamp;
-                        state.lowest_since_entry = kline.close;
+                        state.lowest_since_entry = state.entry_price;
                         state.trailing_active = false;
                         state.breakeven_active = false;
                         state.rsi_was_oversold = false;
@@ -1921,7 +1966,12 @@ impl BacktestEngine {
         // 回测结束强制平仓
         if state.position == Position::Long || state.position == Position::Short {
             if let Some((last_kline, _)) = events.last() {
-                let current_price = last_kline.close;
+                // 强制平仓同样承担点差/滑点成本
+                let current_price = if state.position == Position::Long {
+                    last_kline.close * (1.0 - cost_pct / 100.0)
+                } else {
+                    last_kline.close * (1.0 + cost_pct / 100.0)
+                };
                 let pnl_pct = if state.position == Position::Long {
                     (current_price - state.entry_price) / state.entry_price * 100.0
                 } else {

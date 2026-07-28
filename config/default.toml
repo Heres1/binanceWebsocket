@@ -52,8 +52,8 @@ breakeven_trigger_pct = 0.5
 trailing_trigger_pct = 0.8
 # 追踪止损回撒距离
 trailing_distance_pct = 0.5
-# 往返手续费% (BUY免费+SELL 0.1% = 0.1%往返，用于保本止损和净盈亏计算)
-round_trip_fee_pct = 0.1
+# 往返手续费% (BNB抵扣口径 0.075%/侧 = 0.15%往返，用于保本止损和净盈亏计算；需账户开启BNB抵扣)
+round_trip_fee_pct = 0.15
 # 是否允许做空 (现货模式下必须为false！现货API不支持裸卖空，仅在连接合约API fapi.binance.com时可启用)
 allow_short = false
 # 策略类型
@@ -64,8 +64,8 @@ stale_exit_seconds = 999999
 stale_pnl_threshold_pct = 0.3
 # EMA趋势强度最低门槛(%)：提高趋势质量，过滤弱趋势小盈利/假信号
 min_trend_strength_pct = 0.06
-# 价格距离EMA50最大百分比：基于实盘亏损收紧，过滤反弹末端追高
-max_ema50_distance_pct = 0.56
+# 价格距离EMA50最大百分比：放宽至1.2%（原0.56%），过滤反弹末端追高的同时不误杀正常趋势单
+max_ema50_distance_pct = 1.2
 # 止损后延长冷却时间(秒) - 止损后暂停更久，避免弱势环境连续追反弹
 post_stoploss_cooldown_seconds = 1800
 # 均值回归最低斜率门槛(%) - 只允许上升动能中的回踩，不在下跌中接飞刀
@@ -98,16 +98,38 @@ atr_percentile_low = 5.0
 atr_percentile_high = 95.0
 
 # === 多因子评分入场 ===
-# 入场最低分数(满分100，低于此值不入场)：只做更高共振信号
-entry_score_threshold = 75
+# 入场最低分数(满分100，低于此值不入场)：降至50（原75），路线B松绑过滤、用风控替代过滤
+entry_score_threshold = 50
 # 突破路径RSI上限：防止反弹末端追高
 breakout_max_rsi = 60.0
-# 均值回归最小回撤：过滤浅跌假反弹，只接更充分的回踩
-mean_revert_min_drop_pct = 1.5
+# 均值回归最小回撤：过滤浅跌假反弹（原1.5%，降至1.0%提高频率）
+mean_revert_min_drop_pct = 1.0
 # 下跌中继检测窗口：最近N根1m高低点连续下移时禁止做多弱反弹
 downtrend_filter_lookback = 4
 # 连续下移结构中的反转确认幅度：必须重新突破最近高点才允许做多
 min_reversal_break_pct = 0.05
+
+# === 入场过滤开关（路线B：松绑过滤、用风控替代过滤） ===
+# 是否要求盘口买一量>1.5倍卖一量（实盘订单簿条件，K线回测无法精确模拟，默认关闭；旧行为=true）
+require_bid_support = false
+# RSI反弹路径RSI上限（防止追入反弹末端；旧值=55.0）
+rsi_bounce_max_rsi = 60.0
+# 做多要求价格在EMA50上方的最小百分比（旧值=0.15）
+min_price_above_ema50_pct = 0.05
+# 均值回归是否要求价格仍在EMA50上方（默认关闭：深跌反弹允许短暂跌破；旧行为=true）
+mean_revert_require_above_ema50 = false
+
+# === 执行层（成本端突破：限价单省滑点） ===
+# 开仓BUY限价单优先：挂低于信号价 limit_entry_offset_pct% 的买单，等待≤limit_entry_wait_seconds秒，未成交撤单转市价兑底
+use_limit_entry = true
+limit_entry_offset_pct = 0.05
+limit_entry_wait_seconds = 30
+
+# === 趋势判断日志（为合约多空积累经验） ===
+# 每根5m K线收盘打印多空对称指标快照（EMA/斜率/ADX/±DI/ATR/环境判定）
+log_trend_snapshot = true
+# 现货模式下评估并跟踪虚拟做空信号（纯日志不交易，含虚拟开平仓与胜率统计）
+log_virtual_short = true
 
 # 注意: 做空使用与做多相同的TP/SL/追踪参数（对称策略）
 

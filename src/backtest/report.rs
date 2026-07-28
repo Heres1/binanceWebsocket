@@ -71,6 +71,10 @@ pub struct BacktestReport {
     pub max_profit_pct: f64,
     /// 最大单笔亏损(%)
     pub max_loss_pct: f64,
+    /// 盈利因子（总盈利/总亏损，>1为盈利系统）
+    pub profit_factor: f64,
+    /// 单笔期望值(USDT，扣手续费后)
+    pub expectancy_usdt: f64,
 
     // === 时间信息 ===
     /// 回测起始时间
@@ -114,6 +118,8 @@ impl BacktestReport {
                 total_commission: 0.0,
                 max_profit_pct: 0.0,
                 max_loss_pct: 0.0,
+                profit_factor: 0.0,
+                expectancy_usdt: 0.0,
                 start_time,
                 end_time,
                 backtest_days,
@@ -199,6 +205,26 @@ impl BacktestReport {
             .map(|t| t.pnl_pct)
             .fold(f64::INFINITY, f64::min);
 
+        // 盈利因子与单笔期望值
+        let gross_profit: f64 = trades
+            .iter()
+            .filter(|t| t.pnl_usdt > 0.0)
+            .map(|t| t.pnl_usdt)
+            .sum();
+        let gross_loss: f64 = trades
+            .iter()
+            .filter(|t| t.pnl_usdt < 0.0)
+            .map(|t| t.pnl_usdt.abs())
+            .sum();
+        let profit_factor = if gross_loss > 0.0 {
+            gross_profit / gross_loss
+        } else if gross_profit > 0.0 {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+        let expectancy_usdt = (total_pnl - total_commission) / total_trades as f64;
+
         Self {
             initial_capital,
             final_capital,
@@ -217,6 +243,8 @@ impl BacktestReport {
             total_commission,
             max_profit_pct,
             max_loss_pct,
+            profit_factor,
+            expectancy_usdt,
             start_time,
             end_time,
             backtest_days,
@@ -309,9 +337,25 @@ impl BacktestReport {
         println!("   累计手续费:     {:.4} USDT", self.total_commission);
         println!("   最大单笔盈利:   {:.3}%", self.max_profit_pct);
         println!("   最大单笔亏损:   {:.3}%", self.max_loss_pct);
+        if self.profit_factor.is_infinite() {
+            println!("   盈利因子:       ∞ (无亏损单)");
+        } else {
+            println!("   盈利因子:       {:.2}", self.profit_factor);
+        }
+        println!("   单笔期望值:     {:.4} USDT", self.expectancy_usdt);
 
         println!("\n📅 时间范围:");
         println!("   回测天数:       {:.1}天", self.backtest_days);
+
+        // 样本量统计意义检查：小样本指标不可信
+        if self.total_trades > 0 && self.total_trades < 30 {
+            println!("\n⚠️  样本警告:");
+            println!(
+                "   仅 {} 笔交易（<30笔），胜率/盈亏比/期望值等指标统计意义有限，",
+                self.total_trades
+            );
+            println!("   结论可能因个别交易而大幅波动，请谨慎据此调参！");
+        }
 
         // 逐笔明细（显示前20笔+后5笔）
         if !self.trades.is_empty() {
