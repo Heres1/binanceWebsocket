@@ -119,6 +119,13 @@ min_price_above_ema50_pct = 0.05
 # 均值回归是否要求价格仍在EMA50上方（默认关闭：深跌反弹允许短暂跌破；旧行为=true）
 mean_revert_require_above_ema50 = false
 
+# === 收益端结构优化（修复小赢大亏） ===
+# 分批止盈第一目标位%：触达后卖出50%仓位锁定盈利，剩余仓位保本+继续奔跑（0=禁用）
+partial_take_profit_pct = 0.0
+partial_take_profit_ratio = 0.5
+# 趋势破坏提前认亏：浮亏>0.3%且5m EMA死叉+跌破EMA50时立即出场，不等硬止损
+trend_break_exit = false
+
 # === 执行层（成本端突破：限价单省滑点） ===
 # 开仓BUY限价单优先：挂低于信号价 limit_entry_offset_pct% 的买单，等待≤limit_entry_wait_seconds秒，未成交撤单转市价兑底
 use_limit_entry = true

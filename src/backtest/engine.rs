@@ -119,6 +119,9 @@ struct EngineState {
     // 止损后延长冷却
     last_exit_was_stoploss: bool,
 
+    // 分批止盈状态（收益端结构优化）
+    partial_tp_done: bool, // 本笔是否已执行分批止盈
+
     // ATR/ADX指标
     atr_5m: ATR,
     adx_5m: ADX,
@@ -166,6 +169,7 @@ impl EngineState {
             prev_ema_trend_5m: 0.0,
             ema50_history: Vec::with_capacity(20),
             last_exit_was_stoploss: false,
+            partial_tp_done: false,
             atr_5m: ATR::new(14, 100),
             adx_5m: ADX::new(14),
             entry_atr: 0.0,
@@ -351,6 +355,48 @@ impl BacktestEngine {
                 let highest_pnl_pct =
                     (state.highest_since_entry - state.entry_price) / state.entry_price * 100.0;
 
+                // === 分批止盈：触达第一目标位卖出部分仓位锁定盈利，剩余仓位保本继续奔跑 ===
+                if !state.partial_tp_done
+                    && self.config.strategy.partial_take_profit_pct > 0.0
+                    && self.config.strategy.partial_take_profit_ratio > 0.0
+                {
+                    let partial_tp_price = state.entry_price
+                        * (1.0 + self.config.strategy.partial_take_profit_pct / 100.0);
+                    if kline.high >= partial_tp_price {
+                        let sell_qty =
+                            state.entry_quantity * self.config.strategy.partial_take_profit_ratio;
+                        if sell_qty > 0.0 {
+                            let exit_price =
+                                partial_tp_price * (1.0 - self.config.cost_per_side_pct() / 100.0);
+                            let pnl_pct =
+                                (exit_price - state.entry_price) / state.entry_price * 100.0;
+                            let pnl_usdt = sell_qty * state.entry_price * pnl_pct / 100.0;
+                            let commission = sell_qty
+                                * (state.entry_price + exit_price)
+                                * self.config.commission_rate;
+                            trade_id += 1;
+                            trades.push(TradeRecord {
+                                id: trade_id,
+                                entry_time: state.entry_time,
+                                exit_time: timestamp,
+                                entry_price: state.entry_price,
+                                exit_price,
+                                quantity: sell_qty,
+                                pnl_pct,
+                                pnl_usdt,
+                                commission,
+                                hold_seconds: hold_secs,
+                                exit_reason: "分批止盈".to_string(),
+                            });
+                            state.entry_quantity -= sell_qty;
+                            state.available_capital += pnl_usdt - commission;
+                            state.daily_pnl += pnl_pct;
+                            state.partial_tp_done = true;
+                            state.breakeven_active = true; // 剩余仓位保本（整笔已锁定盈利）
+                        }
+                    }
+                }
+
                 // ATR动态止损计算（使用max(当前ATR, 入场ATR)防止收缩）
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
                 let effective_atr = current_atr.max(state.entry_atr);
@@ -370,7 +416,9 @@ impl BacktestEngine {
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
                         state.highest_since_entry - atr_trailing_dist
-                    } else if highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                    } else if state.breakeven_active
+                        || highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct
+                    {
                         state.breakeven_active = true;
                         state.entry_price
                     } else {
@@ -382,7 +430,9 @@ impl BacktestEngine {
                         state.trailing_active = true;
                         state.highest_since_entry
                             * (1.0 - self.config.strategy.trailing_distance_pct / 100.0)
-                    } else if highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                    } else if state.breakeven_active
+                        || highest_pnl_pct >= self.config.strategy.breakeven_trigger_pct
+                    {
                         state.breakeven_active = true;
                         state.entry_price
                     } else {
@@ -403,7 +453,20 @@ impl BacktestEngine {
                     && current_pnl < self.config.strategy.stale_pnl_threshold_pct
                     && !state.trailing_active;
 
-                let should_exit = sl_hit || tp_hit || timeout || rsi_exit || stale_exit;
+                // 趋势破坏提前认亏：浮亏且5m EMA死叉+跌破EMA50，立即出场不等硬止损
+                let ema_fast_val = state.ema_fast_5m.value().unwrap_or(0.0);
+                let ema_slow_val = state.ema_slow_5m.value().unwrap_or(0.0);
+                let ema_trend_val = state.ema_trend_5m.value().unwrap_or(0.0);
+                let trend_break = self.config.strategy.trend_break_exit
+                    && current_pnl < -0.3
+                    && !state.trailing_active
+                    && !state.partial_tp_done
+                    && ema_trend_val > 0.0
+                    && ema_fast_val < ema_slow_val
+                    && kline.close < ema_trend_val;
+
+                let should_exit =
+                    sl_hit || tp_hit || timeout || rsi_exit || stale_exit || trend_break;
 
                 if should_exit {
                     // 确定出场价和原因（SL优先于TP，保守估计）
@@ -428,6 +491,8 @@ impl BacktestEngine {
                             "止损"
                         };
                         (dynamic_sl, r)
+                    } else if trend_break {
+                        (kline.close, "趋势破坏")
                     } else if stale_exit {
                         (kline.close, "僵尸早退")
                     } else if timeout {
@@ -464,7 +529,8 @@ impl BacktestEngine {
                     state.available_capital += pnl_usdt - commission;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
-                    state.last_exit_was_stoploss = reason == "止损" || reason == "超时";
+                    state.last_exit_was_stoploss =
+                        reason == "止损" || reason == "超时" || reason == "趋势破坏";
                 }
             }
 
@@ -475,6 +541,48 @@ impl BacktestEngine {
                 state.lowest_since_entry = state.lowest_since_entry.min(kline.low);
                 let lowest_pnl_pct =
                     (state.entry_price - state.lowest_since_entry) / state.entry_price * 100.0;
+
+                // === 做空分批止盈（对称）：触达第一目标位买回部分仓位锁定盈利 ===
+                if !state.partial_tp_done
+                    && self.config.strategy.partial_take_profit_pct > 0.0
+                    && self.config.strategy.partial_take_profit_ratio > 0.0
+                {
+                    let partial_tp_price = state.entry_price
+                        * (1.0 - self.config.strategy.partial_take_profit_pct / 100.0);
+                    if kline.low <= partial_tp_price {
+                        let buy_qty =
+                            state.entry_quantity * self.config.strategy.partial_take_profit_ratio;
+                        if buy_qty > 0.0 {
+                            let exit_price =
+                                partial_tp_price * (1.0 + self.config.cost_per_side_pct() / 100.0);
+                            let pnl_pct =
+                                (state.entry_price - exit_price) / state.entry_price * 100.0;
+                            let pnl_usdt = buy_qty * state.entry_price * pnl_pct / 100.0;
+                            let commission = buy_qty
+                                * (state.entry_price + exit_price)
+                                * self.config.commission_rate;
+                            trade_id += 1;
+                            trades.push(TradeRecord {
+                                id: trade_id,
+                                entry_time: state.entry_time,
+                                exit_time: timestamp,
+                                entry_price: state.entry_price,
+                                exit_price,
+                                quantity: buy_qty,
+                                pnl_pct,
+                                pnl_usdt,
+                                commission,
+                                hold_seconds: hold_secs,
+                                exit_reason: "空分批止盈".to_string(),
+                            });
+                            state.entry_quantity -= buy_qty;
+                            state.available_capital += pnl_usdt - commission;
+                            state.daily_pnl += pnl_pct;
+                            state.partial_tp_done = true;
+                            state.breakeven_active = true;
+                        }
+                    }
+                }
 
                 let current_atr = state.atr_5m.value().unwrap_or(0.0);
                 let effective_atr = current_atr.max(state.entry_atr);
@@ -491,7 +599,9 @@ impl BacktestEngine {
                     if profit_amount >= atr_trailing_trigger {
                         state.trailing_active = true;
                         state.lowest_since_entry + atr_trailing_dist
-                    } else if lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                    } else if state.breakeven_active
+                        || lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct
+                    {
                         state.breakeven_active = true;
                         state.entry_price
                     } else {
@@ -502,7 +612,9 @@ impl BacktestEngine {
                         state.trailing_active = true;
                         state.lowest_since_entry
                             * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
-                    } else if lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct {
+                    } else if state.breakeven_active
+                        || lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct
+                    {
                         state.breakeven_active = true;
                         state.entry_price
                     } else {
@@ -521,7 +633,19 @@ impl BacktestEngine {
                     && current_pnl < self.config.strategy.stale_pnl_threshold_pct
                     && !state.trailing_active;
 
-                let should_exit = sl_hit || tp_hit || timeout || stale_exit;
+                // 做空趋势破坏提前认亏（对称）：浮亏且5m EMA金叉+站上EMA50
+                let ema_fast_val_s = state.ema_fast_5m.value().unwrap_or(0.0);
+                let ema_slow_val_s = state.ema_slow_5m.value().unwrap_or(0.0);
+                let ema_trend_val_s = state.ema_trend_5m.value().unwrap_or(0.0);
+                let trend_break = self.config.strategy.trend_break_exit
+                    && current_pnl < -0.3
+                    && !state.trailing_active
+                    && !state.partial_tp_done
+                    && ema_trend_val_s > 0.0
+                    && ema_fast_val_s > ema_slow_val_s
+                    && kline.close > ema_trend_val_s;
+
+                let should_exit = sl_hit || tp_hit || timeout || stale_exit || trend_break;
 
                 if should_exit {
                     let (exit_price, reason) = if sl_hit && !tp_hit {
@@ -537,6 +661,8 @@ impl BacktestEngine {
                         (tp_price, "空止盈")
                     } else if sl_hit && tp_hit {
                         (dynamic_sl, "空止损")
+                    } else if trend_break {
+                        (kline.close, "空趋势破坏")
                     } else if stale_exit {
                         (kline.close, "空僵尸早退")
                     } else {
@@ -570,7 +696,8 @@ impl BacktestEngine {
                     state.available_capital += pnl_usdt - commission;
                     state.daily_pnl += pnl_pct;
                     state.last_trade_time = timestamp;
-                    state.last_exit_was_stoploss = reason == "空止损" || reason == "空超时";
+                    state.last_exit_was_stoploss =
+                        reason == "空止损" || reason == "空超时" || reason == "空趋势破坏";
                 }
             }
 
@@ -784,6 +911,7 @@ impl BacktestEngine {
                     state.highest_since_entry = state.entry_price;
                     state.trailing_active = false;
                     state.breakeven_active = false;
+                    state.partial_tp_done = false;
                     state.rsi_was_oversold = false;
                     state.rsi_oversold_bars = 0;
                     state.last_trade_time = timestamp;
@@ -1245,6 +1373,7 @@ impl BacktestEngine {
                             state.highest_since_entry = state.best_ask;
                             state.trailing_active = false;
                             state.breakeven_active = false;
+                            state.partial_tp_done = false;
                             state.rsi_was_oversold = false;
                             state.rsi_oversold_bars = 0;
                             state.last_trade_time = *timestamp;
@@ -1886,6 +2015,7 @@ impl BacktestEngine {
                     state.highest_since_entry = state.entry_price;
                     state.trailing_active = false;
                     state.breakeven_active = false;
+                    state.partial_tp_done = false;
                     state.rsi_was_oversold = false;
                     state.rsi_oversold_bars = 0;
                     state.last_trade_time = timestamp;

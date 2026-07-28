@@ -142,6 +142,14 @@ pub struct StrategyConfig {
     pub log_trend_snapshot: bool, // 每根5m K线收盘打印趋势环境快照（多空对称指标）
     #[serde(default = "default_log_virtual_short")]
     pub log_virtual_short: bool, // 现货模式下评估并跟踪虚拟做空信号（纯日志不交易）
+
+    // === 收益端结构优化（修复小赢大亏） ===
+    #[serde(default = "default_partial_take_profit_pct")]
+    pub partial_take_profit_pct: f64, // 分批止盈第一目标位%：触达后卖出部分仓位锁定盈利（0=禁用）
+    #[serde(default = "default_partial_take_profit_ratio")]
+    pub partial_take_profit_ratio: f64, // 分批止盈卖出比例（剩余仓位保本+继续奔跑）
+    #[serde(default = "default_trend_break_exit")]
+    pub trend_break_exit: bool, // 趋势破坏提前认亏：浮亏且EMA死叉+跌破EMA50时立即出场，不等硬止损
 }
 
 fn default_strategy_type() -> String {
@@ -281,6 +289,18 @@ fn default_log_trend_snapshot() -> bool {
 }
 
 fn default_log_virtual_short() -> bool {
+    true
+}
+
+fn default_partial_take_profit_pct() -> f64 {
+    0.6
+}
+
+fn default_partial_take_profit_ratio() -> f64 {
+    0.5
+}
+
+fn default_trend_break_exit() -> bool {
     true
 }
 
