@@ -2,6 +2,12 @@
 # 动量短线交易系统 - 启动脚本
 
 set -e
+set -o pipefail
+
+# 非交互式 SSH 部署时 PATH 可能不含 cargo，显式加载
+if [ -f "$HOME/.cargo/env" ]; then
+    . "$HOME/.cargo/env"
+fi
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$PROJECT_DIR"
@@ -23,12 +29,10 @@ fi
 # 确保日志目录存在
 mkdir -p "$LOG_DIR"
 
-# 编译 release 版本
+# 编译 release 版本（pipefail 保证 cargo 失败不会被 tail 掩盖，防止带着旧二进制启动）
 echo "编译中..."
-cargo build --bin trading --release 2>&1 | tail -3
-
-if [ $? -ne 0 ]; then
-    echo "编译失败"
+if ! cargo build --bin trading --release 2>&1 | tail -3; then
+    echo "编译失败，已中止启动"
     exit 1
 fi
 
