@@ -196,3 +196,6 @@ check_interval_seconds = 14400
 min_usdt_value = 10.0
 # 干跑模式：true=只打印信号不下单（首次上线验证用），确认无误后改false
 dry_run = true
+# 首次运行（无状态文件时）是否立即按信号对齐仓位：true=启动后第一个检查点立即评估调仓
+# 仅对全新部署/状态文件被删除后生效一次，正常重启无影响
+rebalance_on_start = true

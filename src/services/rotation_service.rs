@@ -40,7 +40,20 @@ impl RotationState {
     }
     fn save(&self, path: &str) {
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, s);
+            // 确保父目录存在：服务器全新部署时 data/ 可能不存在（.gitignore忽略），
+            // 否则状态写入静默失败，重启后调仓计时无限重置
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // 原子写入：先写临时文件再重命名，避免写入中途被kill导致状态文件损坏
+            let tmp = format!("{}.tmp", path);
+            if let Err(e) = std::fs::write(&tmp, &s).and_then(|_| std::fs::rename(&tmp, path)) {
+                log::error!(
+                    "❌ 轮动状态保存失败({}): {}（重启后将丢失调仓计时）",
+                    path,
+                    e
+                );
+            }
         }
     }
 }
@@ -112,24 +125,32 @@ impl RotationService {
         let now = now_ms();
         let interval_ms = self.config.rebalance_interval_days * 86400 * 1000;
 
-        // 首次运行：识别当前实际持仓，不立即调仓，从下一周期开始
+        // 首次运行：识别当前实际持仓；默认等满一个周期再评估，
+        // rebalance_on_start=true 时直接落入下方调仓流程立即按信号对齐（全新部署时对齐仓位用）
         if state.last_rebalance_ms == 0 {
             state.current_holding = self.detect_current_holding().await?;
-            state.last_rebalance_ms = now; // 从启动时刻起一个完整周期后再评估
-            state.save(&self.state_file);
+            if !self.config.rebalance_on_start {
+                state.last_rebalance_ms = now; // 从启动时刻起一个完整周期后再评估
+                state.save(&self.state_file);
+                log::info!(
+                    "🔄 轮动服务初始化 | 当前持仓: {} | 首次调仓评估将于{}天后",
+                    state.current_holding.as_deref().unwrap_or("空仓(USDT)"),
+                    self.config.rebalance_interval_days
+                );
+                return Ok(());
+            }
             log::info!(
-                "🔄 轮动服务初始化 | 当前持仓: {} | 首次调仓评估将于{}天后",
-                state.current_holding.as_deref().unwrap_or("空仓(USDT)"),
-                self.config.rebalance_interval_days
+                "🔄 轮动服务初始化 | 当前持仓: {} | rebalance_on_start=true，立即执行首次信号对齐",
+                state.current_holding.as_deref().unwrap_or("空仓(USDT)")
             );
-            return Ok(());
         }
 
-        // 未到调仓时间
-        if now - state.last_rebalance_ms < interval_ms {
-            let remain_h = (interval_ms - (now - state.last_rebalance_ms)) / 3600_000;
-            log::debug!(
-                "🔄 距下次调仓评估还有 {}h | 当前: {}",
+        // 未到调仓时间（首次运行且rebalance_on_start=true时elapsed必然>=interval，直接通过）
+        let elapsed_ms = now.saturating_sub(state.last_rebalance_ms); // saturating_sub防时钟回拨下溢
+        if elapsed_ms < interval_ms {
+            let remain_h = (interval_ms - elapsed_ms) / 3600_000;
+            log::info!(
+                "🔄 距下次调仓评估还有约 {}h | 当前: {}",
                 remain_h,
                 state.current_holding.as_deref().unwrap_or("空仓")
             );
@@ -178,15 +199,26 @@ impl RotationService {
         let need = (lb + 2).max(ma_n + 1) as u16; // 需要的日线数量
 
         let mut best: Option<(String, f64)> = None;
+        let mut fetched = 0usize; // 成功获取有效数据的品种数
         for symbol in &self.config.symbols {
-            let klines = self
+            // 单品种拉取失败仅跳过（不中止整个调仓），全部失败时在下方统一报错
+            let klines = match self
                 .client
                 .get_klines(symbol, "1d", None, None, Some(need))
-                .await?;
-            if klines.len() < lb + 1 {
+                .await
+            {
+                Ok(k) => k,
+                Err(e) => {
+                    log::warn!("⚠️ {} 日线拉取失败，本次跳过: {}", symbol, e);
+                    continue;
+                }
+            };
+            // 需同时满足动量与均线的数据量要求，防止切片越界panic导致任务静默死亡
+            if klines.len() < lb + 1 || klines.len() < ma_n {
                 log::warn!("⚠️ {} 日线数据不足({}根)，跳过", symbol, klines.len());
                 continue;
             }
+            fetched += 1;
             let closes: Vec<f64> = klines.iter().map(|k| k.close).collect();
             let n = closes.len();
             let price = closes[n - 1];
@@ -209,6 +241,13 @@ impl RotationService {
                     best = Some((symbol.clone(), momentum));
                 }
             }
+        }
+        // 全部品种都无有效数据时中止本次调仓（防止"无数据→误判目标空仓→错误全卖"），下周期重试
+        if fetched == 0 {
+            return Err(ServiceError::MarketData(
+                "所有品种日线数据拉取失败，本次调仓中止".to_string(),
+            )
+            .into());
         }
         Ok(best.map(|(s, _)| s))
     }

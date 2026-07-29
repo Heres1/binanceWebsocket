@@ -37,6 +37,8 @@ pub struct RotationConfig {
     pub min_usdt_value: f64, // 低于此USDT价值视为无持仓
     #[serde(default = "default_rotation_dry_run")]
     pub dry_run: bool, // 干跑模式：只打印信号不下单
+    #[serde(default = "default_rotation_rebal_on_start")]
+    pub rebalance_on_start: bool, // 首次运行（无状态文件）是否立即按信号调仓对齐仓位，默认false等满一个周期
 }
 
 impl Default for RotationConfig {
@@ -49,6 +51,7 @@ impl Default for RotationConfig {
             check_interval_seconds: default_rotation_check(),
             min_usdt_value: default_rotation_min_usdt(),
             dry_run: default_rotation_dry_run(),
+            rebalance_on_start: default_rotation_rebal_on_start(),
         }
     }
 }
@@ -77,6 +80,9 @@ fn default_rotation_min_usdt() -> f64 {
 }
 fn default_rotation_dry_run() -> bool {
     true // 默认干跑，安全优先
+}
+fn default_rotation_rebal_on_start() -> bool {
+    false // 默认首次运行不立即调仓，等满一个周期
 }
 
 /// 交易对配置（多品种支持）
