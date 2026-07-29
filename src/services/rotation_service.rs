@@ -182,12 +182,14 @@ impl RotationService {
                 current.as_deref().unwrap_or("空仓"),
                 target.as_deref().unwrap_or("空仓")
             );
+            // 干跑不真实下单，状态保持实际持仓，避免心跳日志显示与真实账户不符
+            state.current_holding = current;
         } else {
             self.execute_rotation(current.as_deref(), target.as_deref())
                 .await?;
+            state.current_holding = target;
         }
 
-        state.current_holding = target;
         state.save(&self.state_file);
         Ok(())
     }
