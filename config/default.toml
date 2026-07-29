@@ -57,7 +57,7 @@ round_trip_fee_pct = 0.15
 # 是否允许做空 (现货模式下必须为false！现货API不支持裸卖空，仅在连接合约API fapi.binance.com时可启用)
 allow_short = false
 # 策略类型
-strategy_type = "Breakout"
+strategy_type = "MomentumRotation"
 # 僵尸仓位早退(秒)：禁用（回测验证关闭更优）
 stale_exit_seconds = 999999
 # 僵尸判定门槛(%)
@@ -183,3 +183,16 @@ min_order_interval_secs = 10
 connection_mode = "direct"
 # 代理 URL (仅在 proxy 模式下需要)
 # proxy_url = "http://127.0.0.1:7890"
+
+# === 日级动量轮动策略（strategy_type = "MomentumRotation" 时生效） ===
+# 3年跨周期回测验证（2023-03~2026-03）：年化+49.4%，仅17次调仓，熊市自动空仓
+# 逻辑：90日动量最高 + 价格>50日均线 → 全仓持有；否则空仓持USDT
+[rotation]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+momentum_lookback_days = 90
+ma_filter_days = 50
+rebalance_interval_days = 30
+check_interval_seconds = 14400
+min_usdt_value = 10.0
+# 干跑模式：true=只打印信号不下单（首次上线验证用），确认无误后改false
+dry_run = true

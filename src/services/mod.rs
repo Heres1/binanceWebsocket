@@ -9,6 +9,7 @@
 pub mod funding_rate_service;
 pub mod market_data_service;
 pub mod order_execution_service;
+pub mod rotation_service;
 // TODO: 用户数据流服务（需要在 BinanceClient 中添加 listen key 管理）
 // pub mod user_stream_service;
 
@@ -18,4 +19,5 @@ pub use funding_rate_service::{
 };
 pub use market_data_service::{ConnectionMode, MarketDataService};
 pub use order_execution_service::OrderExecutionService;
+pub use rotation_service::RotationService;
 // pub use user_stream_service::UserDataStreamService;

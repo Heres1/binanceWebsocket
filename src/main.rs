@@ -191,8 +191,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_bus.subscribe(order_handler);
 
     // ==========================================
-    // 7. 注册动量短线策略（多品种）
+    // 7. 注册动量短线策略（多品种）或轮动策略
     // ==========================================
+    let rotation_mode = config.strategy.strategy_type == "MomentumRotation";
+    if rotation_mode {
+        // 日级动量轮动模式：不注册5m事件策略，启动定时轮动服务
+        let rotation_service = Arc::new(rust_binance_event_driven::services::RotationService::new(
+            config.rotation.clone(),
+            binance_client.clone(),
+        ));
+        tokio::spawn(async move {
+            rotation_service.run().await;
+        });
+        println!("\n=========================================");
+        println!("  动量轮动交易系统已启动");
+        println!("  品种池: {:?}", config.rotation.symbols);
+        println!(
+            "  动量: {}日 | MA过滤: {}日 | 调仓间隔: {}天",
+            config.rotation.momentum_lookback_days,
+            config.rotation.ma_filter_days,
+            config.rotation.rebalance_interval_days
+        );
+        println!("  干跑模式: {}", config.rotation.dry_run);
+        println!("=========================================\n");
+        // 轮动模式不需要市场数据WS，阻塞主线程等待Ctrl+C
+        tokio::signal::ctrl_c().await?;
+        println!("\n收到退出信号，轮动服务停止");
+        return Ok(());
+    }
+
     // 资金费率过滤：启用时启动后台轮询并注入策略（合约情绪指标）
     let funding_cache = if config.strategy.use_funding_filter {
         let cache = rust_binance_event_driven::services::new_funding_cache();

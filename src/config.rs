@@ -16,6 +16,67 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[serde(default)]
     pub trading_pairs: Vec<TradingPairConfig>,
+    #[serde(default)]
+    pub rotation: RotationConfig,
+}
+
+/// 日级动量轮动策略配置（3年跨周期回测验证：年化+49.4%）
+#[derive(Deserialize, Clone, Debug)]
+pub struct RotationConfig {
+    #[serde(default = "default_rotation_symbols")]
+    pub symbols: Vec<String>, // 品种池
+    #[serde(default = "default_rotation_lookback")]
+    pub momentum_lookback_days: usize, // 动量回看天数
+    #[serde(default = "default_rotation_ma")]
+    pub ma_filter_days: usize, // 趋势过滤均线天数
+    #[serde(default = "default_rotation_rebal")]
+    pub rebalance_interval_days: u64, // 调仓间隔天数
+    #[serde(default = "default_rotation_check")]
+    pub check_interval_seconds: u64, // 定时检查间隔（秒）
+    #[serde(default = "default_rotation_min_usdt")]
+    pub min_usdt_value: f64, // 低于此USDT价值视为无持仓
+    #[serde(default = "default_rotation_dry_run")]
+    pub dry_run: bool, // 干跑模式：只打印信号不下单
+}
+
+impl Default for RotationConfig {
+    fn default() -> Self {
+        Self {
+            symbols: default_rotation_symbols(),
+            momentum_lookback_days: default_rotation_lookback(),
+            ma_filter_days: default_rotation_ma(),
+            rebalance_interval_days: default_rotation_rebal(),
+            check_interval_seconds: default_rotation_check(),
+            min_usdt_value: default_rotation_min_usdt(),
+            dry_run: default_rotation_dry_run(),
+        }
+    }
+}
+
+fn default_rotation_symbols() -> Vec<String> {
+    vec![
+        "BTCUSDT".to_string(),
+        "ETHUSDT".to_string(),
+        "SOLUSDT".to_string(),
+    ]
+}
+fn default_rotation_lookback() -> usize {
+    90
+}
+fn default_rotation_ma() -> usize {
+    50
+}
+fn default_rotation_rebal() -> u64 {
+    30
+}
+fn default_rotation_check() -> u64 {
+    14400 // 4小时
+}
+fn default_rotation_min_usdt() -> f64 {
+    10.0
+}
+fn default_rotation_dry_run() -> bool {
+    true // 默认干跑，安全优先
 }
 
 /// 交易对配置（多品种支持）

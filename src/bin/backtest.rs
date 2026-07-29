@@ -5,6 +5,7 @@
 //!   cargo run --bin backtest -- --mode walkforward --config config/default.toml
 //!   cargo run --bin backtest -- --mode optimize --symbol BTCUSDT
 //!   cargo run --bin backtest -- --mode replay --file data/recorded/BTCUSDT_20260320.jsonl
+//!   cargo run --bin backtest -- --mode rotation --days 1095
 
 use rust_binance_event_driven::backtest::data_loader::DataLoader;
 use rust_binance_event_driven::backtest::engine::{BacktestConfig, BacktestEngine};
@@ -14,6 +15,7 @@ use rust_binance_event_driven::backtest::strategy_v2::{
 use rust_binance_event_driven::clients::binance_client::BinanceClient;
 use rust_binance_event_driven::config::{AppConfig, StrategyConfig};
 
+use std::collections::HashMap;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -100,7 +102,7 @@ impl Args {
                     println!("用法: cargo run --bin backtest -- [OPTIONS]");
                     println!();
                     println!("选项:");
-                    println!("  --mode <MODE>       回测模式: kline(默认) / walkforward / optimize / optimize_v2 / compare / replay");
+                    println!("  --mode <MODE>       回测模式: kline(默认) / walkforward / optimize / optimize_v2 / compare / replay / rotation");
                     println!("  --days <N>          K线模式回测天数 (默认: 7)");
                     println!("  --symbol <SYMBOL>   交易对 (默认: BTCUSDT)");
                     println!("  --file <PATH>       Replay模式的录制文件路径");
@@ -215,9 +217,13 @@ async fn main() {
                 }
             }
         }
+        "rotation" => {
+            // 日级动量轮动回测（与RotationService实盘逻辑一致，交叉验证python结果）
+            run_rotation_backtest(&config, &args).await;
+        }
         other => {
             eprintln!(
-                "未知模式: {} (可选: kline, walkforward, optimize, optimize_v2, compare, replay)",
+                "未知模式: {} (可选: kline, walkforward, optimize, optimize_v2, compare, replay, rotation)",
                 other
             );
             std::process::exit(1);
@@ -1148,5 +1154,221 @@ fn run_walkforward(
         }
     } else {
         println!("   ⚠️ 训练段本身未盈利 → 当前参数无正期望，先解决策略逻辑再谈稳健性");
+    }
+}
+
+/// 毫秒时间戳 → YYYY-MM-DD（UTC）
+fn fmt_ymd(ms: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| format!("{}", ms))
+}
+
+/// 日级动量轮动回测（--mode rotation）
+///
+/// 与 RotationService 实盘逻辑完全一致：90日动量最高 + 价格>MA50 → 全仓持有，否则空仓。
+/// 手续费口径与 python 验证一致：单边 0.125%（往返 0.25%）。
+/// 交叉验证目标：3年 ≈ +233% / 年化 ≈ 49% / 调仓 ≈ 17 次。
+async fn run_rotation_backtest(config: &AppConfig, args: &Args) {
+    let rc = &config.rotation;
+    let loader = DataLoader::new("data");
+    // 轮动是日级策略，默认回测3年（--days 小于200时自动提升到1095天）
+    let days = if args.days < 200 { 1095 } else { args.days };
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let start_ms = now_ms - days * 86400 * 1000;
+
+    let base_url = if env::var("USE_SSH_TUNNEL").is_ok() {
+        "https://localhost:8443".to_string()
+    } else {
+        config.get_binance_base_url().to_string()
+    };
+    let client = BinanceClient::new(
+        config.binance.api_key.clone(),
+        config.binance.secret_key.clone(),
+        base_url,
+    );
+
+    println!(
+        "🔄 动量轮动回测 | 品种: {:?} | 动量{}d | MA{}d | 调仓{}d | 初始资金 {:.0} USDT",
+        rc.symbols,
+        rc.momentum_lookback_days,
+        rc.ma_filter_days,
+        rc.rebalance_interval_days,
+        args.capital
+    );
+    println!();
+
+    // 1. 加载各品种日线（缺失或不完整时自动下载）
+    let mut series: Vec<(String, HashMap<u64, f64>)> = Vec::new();
+    for symbol in &rc.symbols {
+        let incomplete = loader
+            .load_klines(symbol, "1d")
+            .map(|k| (k.len() as u64) + 5 < days)
+            .unwrap_or(true);
+        if incomplete {
+            if let Err(e) = loader
+                .download_klines(&client, symbol, "1d", start_ms, now_ms)
+                .await
+            {
+                eprintln!("下载 {} 日线失败: {}", symbol, e);
+                std::process::exit(1);
+            }
+        }
+        let klines = match loader.load_klines(symbol, "1d") {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("加载 {} 日线失败: {}", symbol, e);
+                std::process::exit(1);
+            }
+        };
+        println!("   {} 日线 {} 根", symbol, klines.len());
+        series.push((
+            symbol.clone(),
+            klines.iter().map(|k| (k.open_time, k.close)).collect(),
+        ));
+    }
+
+    // 2. 对齐时间轴（取所有品种共同交易日）
+    let mut timeline: Vec<u64> = series[0].1.keys().copied().collect();
+    timeline.sort_unstable();
+    timeline.retain(|t| series.iter().all(|(_, m)| m.contains_key(t)));
+    let n = timeline.len();
+
+    let lb = rc.momentum_lookback_days;
+    let ma_n = rc.ma_filter_days;
+    let rebal = rc.rebalance_interval_days as usize;
+    let fee = 0.00125_f64; // 单边手续费（往返0.25%，与python验证口径一致）
+    let start_idx = lb.max(ma_n.saturating_sub(1));
+
+    if n <= start_idx + 1 {
+        eprintln!(
+            "数据不足：{} 根日线，动量计算至少需要 {} 根",
+            n,
+            start_idx + 1
+        );
+        std::process::exit(1);
+    }
+
+    println!(
+        "   回测区间: {} → {} ({} 天)",
+        fmt_ymd(timeline[start_idx]),
+        fmt_ymd(timeline[n - 1]),
+        (timeline[n - 1] - timeline[start_idx]) / 86400_000
+    );
+    println!();
+
+    // 3. 模拟轮动（信号在调仓日收盘价上计算，按收盘价成交）
+    let mut cash = args.capital;
+    let mut holding: Option<usize> = None;
+    let mut qty = 0.0_f64;
+    let mut rotations = 0u32;
+    let mut next_rebal = start_idx;
+    let mut equity_curve: Vec<(u64, f64)> = Vec::with_capacity(n - start_idx);
+
+    println!("📋 调仓记录:");
+    for i in start_idx..n {
+        let t = timeline[i];
+        if i >= next_rebal {
+            // 计算目标品种：动量>0 且 价格>MA 中动量最高者
+            let mut best: Option<(usize, f64)> = None;
+            for (si, (_, map)) in series.iter().enumerate() {
+                let price = map[&timeline[i]];
+                let momentum = price / map[&timeline[i - lb]] - 1.0;
+                let ma: f64 = (0..ma_n).map(|j| map[&timeline[i - j]]).sum::<f64>() / ma_n as f64;
+                if momentum > 0.0 && price > ma && best.map_or(true, |(_, bm)| momentum > bm) {
+                    best = Some((si, momentum));
+                }
+            }
+            let target = best.map(|(si, _)| si);
+
+            if target != holding {
+                if let Some(h) = holding {
+                    cash = qty * series[h].1[&t] * (1.0 - fee); // 卖出旧仓
+                    qty = 0.0;
+                }
+                if let Some(s) = target {
+                    qty = cash * (1.0 - fee) / series[s].1[&t]; // 买入新仓
+                    cash = 0.0;
+                }
+                rotations += 1;
+                let eq = match target {
+                    Some(s) => qty * series[s].1[&t],
+                    None => cash,
+                };
+                let name_of = |o: Option<usize>| o.map(|s| series[s].0.as_str()).unwrap_or("空仓");
+                println!(
+                    "   #{} {} | {} → {} | 净值 {:.2}",
+                    rotations,
+                    fmt_ymd(t),
+                    name_of(holding),
+                    name_of(target),
+                    eq
+                );
+                holding = target;
+            }
+            next_rebal = i + rebal;
+        }
+        let eq = match holding {
+            Some(h) => qty * series[h].1[&t],
+            None => cash,
+        };
+        equity_curve.push((t, eq));
+    }
+
+    // 4. 统计输出
+    let initial = args.capital;
+    let final_eq = equity_curve.last().map(|(_, e)| *e).unwrap_or(initial);
+    let total_ret = final_eq / initial - 1.0;
+    let span_days = (timeline[n - 1] - timeline[start_idx]) as f64 / 86400_000.0;
+    let annualized = (final_eq / initial).powf(365.0 / span_days) - 1.0;
+
+    let mut peak = f64::MIN;
+    let mut max_dd = 0.0_f64;
+    for (_, e) in &equity_curve {
+        if *e > peak {
+            peak = *e;
+        }
+        let dd = 1.0 - e / peak;
+        if dd > max_dd {
+            max_dd = dd;
+        }
+    }
+
+    // 分年度收益（按每年最后一个交易日净值环比）
+    let mut year_last: Vec<(i32, f64)> = Vec::new();
+    for (t, e) in &equity_curve {
+        let y = fmt_ymd(*t)[..4].parse::<i32>().unwrap_or(0);
+        match year_last.last_mut() {
+            Some((ly, le)) if *ly == y => *le = *e,
+            _ => year_last.push((y, *e)),
+        }
+    }
+
+    println!();
+    println!("════════ 轮动回测结果 ════════");
+    println!("   期末净值: {:.2} USDT (初始 {:.2})", final_eq, initial);
+    println!(
+        "   总收益: {:+.1}% | 年化: {:+.1}% | 最大回撤: {:.1}%",
+        total_ret * 100.0,
+        annualized * 100.0,
+        max_dd * 100.0
+    );
+    println!("   调仓次数: {}", rotations);
+    println!();
+    println!("   分年度:");
+    let mut prev = initial;
+    for (y, e) in &year_last {
+        println!("     {} 年: {:+.1}%", y, (e / prev - 1.0) * 100.0);
+        prev = *e;
+    }
+    println!();
+    println!("   同期买入持有对照:");
+    for (sym, map) in &series {
+        let bh = map[&timeline[n - 1]] / map[&timeline[start_idx]] - 1.0;
+        println!("     {}: {:+.1}%", sym, bh * 100.0);
     }
 }
