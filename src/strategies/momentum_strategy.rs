@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::indicators::{VolumeRatio, ADX, ATR, EMA, RSI};
+use crate::services::FundingRateCache;
 
 /// 持仓状态
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -499,11 +500,17 @@ pub struct MomentumStrategy {
     event_bus: Arc<TokioEventBus>,
     state: Arc<Mutex<StrategyState>>,
     state_file: String,
+    /// 资金费率缓存（合约情绪过滤，None=不过滤）
+    funding_cache: Option<FundingRateCache>,
 }
 
 impl MomentumStrategy {
     /// 创建新的动量策略
-    pub fn new(config: StrategyConfig, event_bus: Arc<TokioEventBus>) -> Self {
+    pub fn new(
+        config: StrategyConfig,
+        event_bus: Arc<TokioEventBus>,
+        funding_cache: Option<FundingRateCache>,
+    ) -> Self {
         let state_file = format!("data/strategy_state_{}.json", config.symbol.to_lowercase());
         let direction = if config.allow_short {
             "多空"
@@ -543,6 +550,7 @@ impl MomentumStrategy {
             state_file,
             config,
             event_bus,
+            funding_cache,
         }
     }
 
@@ -1523,7 +1531,31 @@ impl MomentumStrategy {
                 false
             };
 
-            let entry_signal = trend_entry_signal || mean_revert_signal;
+            // 资金费率过滤（合约情绪）：费率 > 阈值 = 多头拥挤付费，禁止做多。
+            // 数据缺失/过期时放行（不冻结交易），仅提示。
+            let funding_ok = !self.config.use_funding_filter || {
+                match self
+                    .funding_cache
+                    .as_ref()
+                    .and_then(|c| crate::services::current_funding_rate(c, &self.config.symbol))
+                {
+                    Some(rate) => {
+                        let blocked = rate > self.config.funding_long_block_pct / 100.0;
+                        if blocked {
+                            log::debug!(
+                                "💰 [费率拦截] {} funding={:+.4}% > {:.3}% 阈值，放弃做多",
+                                self.config.symbol,
+                                rate * 100.0,
+                                self.config.funding_long_block_pct
+                            );
+                        }
+                        !blocked
+                    }
+                    None => true, // 无数据放行
+                }
+            };
+
+            let entry_signal = (trend_entry_signal || mean_revert_signal) && funding_ok;
 
             if entry_signal {
                 let entry_price = state.best_ask;

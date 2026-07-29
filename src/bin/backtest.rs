@@ -268,6 +268,22 @@ async fn ensure_data(engine: &BacktestEngine, args: &Args, config: &AppConfig) {
         }
         println!();
     }
+
+    // 资金费率数据（合约情绪指标，fapi公共接口）：缺失时自动下载，失败不阻断回测
+    if !loader.has_local_funding(&args.symbol) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let start_ms = now_ms - args.days * 86400 * 1000;
+        let use_tunnel = env::var("USE_SSH_TUNNEL").is_ok();
+        if let Err(e) = loader
+            .download_funding_rates(&args.symbol, start_ms, now_ms, use_tunnel)
+            .await
+        {
+            eprintln!("⚠️ 资金费率下载失败（资金费率过滤将不可用）: {}", e);
+        }
+    }
 }
 
 /// 参数优化器

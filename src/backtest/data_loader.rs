@@ -208,4 +208,115 @@ impl DataLoader {
         let file_path = format!("{}/history/{}_{}.json", self.data_dir, symbol, interval);
         Path::new(&file_path).exists()
     }
+
+    /// 下载资金费率历史（fapi公共接口，无需签名）
+    /// use_tunnel=true 时通过 SSH 隧道 10443 端口访问，并强制 SNI=fapi.binance.com
+    pub async fn download_funding_rates(
+        &self,
+        symbol: &str,
+        start_time: u64,
+        end_time: u64,
+        use_tunnel: bool,
+    ) -> Result<Vec<FundingRateRecord>, DomainError> {
+        let dir = format!("{}/history", self.data_dir);
+        std::fs::create_dir_all(&dir).ok();
+
+        let mut builder = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30));
+        if use_tunnel {
+            // SSH 隧道：把 fapi.binance.com 解析到本地 10443（保持 SNI 正确）
+            let addr: std::net::SocketAddr = "127.0.0.1:10443".parse().map_err(|e| {
+                crate::error::ServiceError::MarketData(format!("隧道地址解析失败: {}", e))
+            })?;
+            builder = builder.resolve("fapi.binance.com", addr);
+        }
+        let client = builder.build().map_err(|e| {
+            crate::error::ServiceError::MarketData(format!("HTTP客户端构建失败: {}", e))
+        })?;
+
+        let mut all: Vec<FundingRateRecord> = Vec::new();
+        let mut current_start = start_time;
+        println!("📥 下载 {} 资金费率数据...", symbol);
+
+        loop {
+            if current_start >= end_time {
+                break;
+            }
+            let url = format!(
+                "https://fapi.binance.com{}/fapi/v1/fundingRate?symbol={}&startTime={}&endTime={}&limit=1000",
+                if use_tunnel { ":10443" } else { "" },
+                symbol,
+                current_start,
+                end_time
+            );
+            let batch: Vec<FundingRateRecord> = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| {
+                    crate::error::ServiceError::MarketData(format!("获取资金费率失败: {}", e))
+                })?
+                .json()
+                .await
+                .map_err(|e| {
+                    crate::error::ServiceError::MarketData(format!("解析资金费率失败: {}", e))
+                })?;
+
+            if batch.is_empty() {
+                break;
+            }
+            let last_time = batch.last().unwrap().funding_time;
+            all.extend(batch);
+            current_start = last_time + 1;
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            if all.len() % 1000 != 0 {
+                break; // 不足整批，已到末尾
+            }
+        }
+
+        let file_path = format!("{}/{}_funding.json", dir, symbol);
+        let json = serde_json::to_string(&all).map_err(|e| {
+            crate::error::ServiceError::MarketData(format!("序列化资金费率失败: {}", e))
+        })?;
+        std::fs::write(&file_path, &json)
+            .map_err(|e| crate::error::InfrastructureError::io_with_operation("保存资金费率", e))?;
+        println!("✅ 资金费率已保存: {} ({} 条)", file_path, all.len());
+        Ok(all)
+    }
+
+    /// 加载资金费率历史，返回 (时间ms, 费率f64) 按时间升序
+    pub fn load_funding_rates(&self, symbol: &str) -> Result<Vec<(u64, f64)>, DomainError> {
+        let file_path = format!("{}/history/{}_funding.json", self.data_dir, symbol);
+        let content = std::fs::read_to_string(&file_path)
+            .map_err(|e| crate::error::InfrastructureError::io_with_operation("读取资金费率", e))?;
+        let records: Vec<FundingRateRecord> = serde_json::from_str(&content)
+            .map_err(|e| crate::error::ServiceError::MarketData(format!("解析资金费率: {}", e)))?;
+        let mut out: Vec<(u64, f64)> = records
+            .into_iter()
+            .filter_map(|r| {
+                r.funding_rate
+                    .parse::<f64>()
+                    .ok()
+                    .map(|v| (r.funding_time, v))
+            })
+            .collect();
+        out.sort_by_key(|r| r.0);
+        Ok(out)
+    }
+
+    pub fn has_local_funding(&self, symbol: &str) -> bool {
+        let file_path = format!("{}/history/{}_funding.json", self.data_dir, symbol);
+        Path::new(&file_path).exists()
+    }
+}
+
+/// 资金费率记录（Binance合约公共数据 fapi/v1/fundingRate）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingRateRecord {
+    #[serde(rename = "fundingTime")]
+    pub funding_time: u64,
+    #[serde(rename = "fundingRate")]
+    pub funding_rate: String, // API返回字符串如 "0.00006689"
 }

@@ -344,6 +344,49 @@ impl BacktestReport {
         }
         println!("   单笔期望值:     {:.4} USDT", self.expectancy_usdt);
 
+        // 多空拆分统计（做空交易以出场原因“空”前缀识别）
+        let shorts: Vec<_> = self
+            .trades
+            .iter()
+            .filter(|t| t.exit_reason.starts_with('空'))
+            .collect();
+        if !shorts.is_empty() {
+            let longs: Vec<_> = self
+                .trades
+                .iter()
+                .filter(|t| !t.exit_reason.starts_with('空'))
+                .collect();
+            let split = |arr: &[&TradeRecord]| {
+                let n = arr.len();
+                let wins = arr.iter().filter(|t| t.pnl_pct > 0.0).count();
+                let sum: f64 = arr.iter().map(|t| t.pnl_pct).sum();
+                (n, wins, sum)
+            };
+            let (ln, lw, ls) = split(&longs);
+            let (sn, sw, ss) = split(&shorts);
+            println!("\n⚖️  多空拆分:");
+            println!(
+                "   多头: {}笔 胜率{:.1}% 盈亏总和{:+.2}%",
+                ln,
+                if ln > 0 {
+                    lw as f64 / ln as f64 * 100.0
+                } else {
+                    0.0
+                },
+                ls
+            );
+            println!(
+                "   空头: {}笔 胜率{:.1}% 盈亏总和{:+.2}%",
+                sn,
+                if sn > 0 {
+                    sw as f64 / sn as f64 * 100.0
+                } else {
+                    0.0
+                },
+                ss
+            );
+        }
+
         println!("\n📅 时间范围:");
         println!("   回测天数:       {:.1}天", self.backtest_days);
 

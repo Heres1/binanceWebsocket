@@ -49,15 +49,17 @@ pub struct BinanceConfig {
 #[derive(Deserialize, Clone, Debug)]
 pub struct StrategyConfig {
     pub symbol: String,
-    pub quantity_per_trade: f64,     // 每笔交易数量(BTC)
-    pub take_profit_pct: f64,        // 硬止盈百分比（上限）
-    pub stop_loss_pct: f64,          // 初始止损百分比
-    pub max_hold_seconds: u64,       // 最大持仓时间(秒)
-    pub cooldown_seconds: u64,       // 交易冷却时间(秒)
-    pub max_daily_trades: u32,       // 日最大交易次数
-    pub max_daily_loss_pct: f64,     // 日最大亏损百分比
-    pub rsi_oversold: f64,           // RSI超卖线
-    pub rsi_overbought: f64,         // RSI超买线
+    pub quantity_per_trade: f64, // 每笔交易数量(BTC)
+    pub take_profit_pct: f64,    // 硬止盈百分比（上限）
+    pub stop_loss_pct: f64,      // 初始止损百分比
+    pub max_hold_seconds: u64,   // 最大持仓时间(秒)
+    pub cooldown_seconds: u64,   // 交易冷却时间(秒)
+    pub max_daily_trades: u32,   // 日最大交易次数
+    pub max_daily_loss_pct: f64, // 日最大亏损百分比
+    pub rsi_oversold: f64,       // RSI超卖线
+    pub rsi_overbought: f64,     // RSI超买线
+    #[serde(default = "default_short_rsi_overbought")]
+    pub short_rsi_overbought: f64, // 做空专用RSI超买线（rsi_overbought常被设为100以禁用多头超买离场，做空需独立阈值，与rsi_oversold=40镜像）
     pub volume_ratio_threshold: f64, // 买卖量比阈值
     #[serde(default = "default_breakeven_trigger")]
     pub breakeven_trigger_pct: f64, // 触发保本止损的浮盈百分比
@@ -150,10 +152,26 @@ pub struct StrategyConfig {
     pub partial_take_profit_ratio: f64, // 分批止盈卖出比例（剩余仓位保本+继续奔跑）
     #[serde(default = "default_trend_break_exit")]
     pub trend_break_exit: bool, // 趋势破坏提前认亏：浮亏且EMA死叉+跌破EMA50时立即出场，不等硬止损
+
+    // === 订单流信号（新数据源：CVD累计成交量差） ===
+    #[serde(default = "default_use_cvd_filter")]
+    pub use_cvd_filter: bool, // CVD确认过滤：入场要求近N根K线主动买盘净主导（过滤价涨但卖盘主导的假信号）
+    #[serde(default = "default_cvd_lookback")]
+    pub cvd_lookback: usize, // CVD净变化计算窗口（K线根数）
+
+    // === 资金费率信号（新数据源：合约情绪指标） ===
+    #[serde(default = "default_use_funding_filter")]
+    pub use_funding_filter: bool, // 资金费率过滤：费率过热（多头拥挤付费）时禁止做多入场
+    #[serde(default = "default_funding_long_block_pct")]
+    pub funding_long_block_pct: f64, // 做多禁入资金费率阈值%（如0.03=0.03%，每8h结算）
 }
 
 fn default_strategy_type() -> String {
     "TrendMomentum".to_string()
+}
+
+fn default_short_rsi_overbought() -> f64 {
+    60.0
 }
 
 fn default_breakeven_trigger() -> f64 {
@@ -302,6 +320,22 @@ fn default_partial_take_profit_ratio() -> f64 {
 
 fn default_trend_break_exit() -> bool {
     true
+}
+
+fn default_use_cvd_filter() -> bool {
+    false
+}
+
+fn default_cvd_lookback() -> usize {
+    20
+}
+
+fn default_use_funding_filter() -> bool {
+    false
+}
+
+fn default_funding_long_block_pct() -> f64 {
+    0.03
 }
 
 /// 做空配置

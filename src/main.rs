@@ -193,13 +193,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ==========================================
     // 7. 注册动量短线策略（多品种）
     // ==========================================
+    // 资金费率过滤：启用时启动后台轮询并注入策略（合约情绪指标）
+    let funding_cache = if config.strategy.use_funding_filter {
+        let cache = rust_binance_event_driven::services::new_funding_cache();
+        rust_binance_event_driven::services::spawn_funding_poller(
+            trading_pairs.iter().map(|p| p.symbol.clone()).collect(),
+            cache.clone(),
+        );
+        Some(cache)
+    } else {
+        None
+    };
     for pair in &trading_pairs {
         let mut strategy_config = config.strategy.clone();
         strategy_config.symbol = pair.symbol.clone();
         strategy_config.quantity_per_trade = pair.quantity_per_trade;
         strategy_config.allow_short = pair.allow_short;
 
-        let strategy = Arc::new(MomentumStrategy::new(strategy_config, event_bus.clone()));
+        let strategy = Arc::new(MomentumStrategy::new(
+            strategy_config,
+            event_bus.clone(),
+            funding_cache.clone(),
+        ));
         event_bus.subscribe(strategy);
     }
 

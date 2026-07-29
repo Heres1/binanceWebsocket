@@ -126,6 +126,13 @@ partial_take_profit_ratio = 0.5
 # 趋势破坏提前认亏：浮亏>0.3%且5m EMA死叉+跌破EMA50时立即出场，不等硬止损
 trend_break_exit = false
 
+# === 资金费率过滤（合约情绪，180天BTC回测 -20.15%→-7.66%） ===
+# 费率>阈值(多头拥挤付费)时禁止做多；0.0=只在费率≤0(空头付费/市场恐惧)时做多
+# 实盘由 funding_rate_service 每10分钟轮询 fapi 公共接口；数据缺失时放行不冻结交易
+use_funding_filter = true
+funding_long_block_pct = 0.0
+# 做空侧对称：费率<-阈值(空头拥挤)时禁止做空（回测引擎内生效）
+
 # === 执行层（成本端突破：限价单省滑点） ===
 # 开仓BUY限价单优先：挂低于信号价 limit_entry_offset_pct% 的买单，等待≤limit_entry_wait_seconds秒，未成交撤单转市价兑底
 use_limit_entry = true

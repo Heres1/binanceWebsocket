@@ -104,7 +104,9 @@ struct EngineState {
 
     // RSI状态
     rsi_was_oversold: bool,
-    rsi_oversold_bars: usize, // 超卖标志已持续的K线数（过期机制）
+    rsi_oversold_bars: usize,   // 超卖标志已持续的K线数（过期机制）
+    rsi_was_overbought: bool,   // 做空对称：1m RSI曾超买
+    rsi_overbought_bars: usize, // 超买标志已持续的K线数（过期机制）
 
     // 突破入场状态
     recent_highs: Vec<f64>,  // 最近20根K线最高价缓冲区
@@ -121,6 +123,15 @@ struct EngineState {
 
     // 分批止盈状态（收益端结构优化）
     partial_tp_done: bool, // 本笔是否已执行分批止盈
+
+    // 订单流指标：CVD累计成交量差（主动买-主动卖）
+    cvd: f64,
+    cvd_history: Vec<f64>, // 最近60根K线的CVD值（算净变化）
+
+    // 资金费率（合约情绪指标，8h一条，前向填充对齐）
+    funding_rates: Vec<(u64, f64)>, // (时间ms, 费率)
+    funding_idx: usize,
+    current_funding: f64, // 当前生效的资金费率
 
     // ATR/ADX指标
     atr_5m: ATR,
@@ -162,6 +173,8 @@ impl EngineState {
             last_day: 0,
             rsi_was_oversold: false,
             rsi_oversold_bars: 0,
+            rsi_was_overbought: false,
+            rsi_overbought_bars: 0,
             recent_highs: Vec::with_capacity(20),
             recent_lows: Vec::with_capacity(20),
             lowest_since_entry: f64::MAX,
@@ -170,6 +183,11 @@ impl EngineState {
             ema50_history: Vec::with_capacity(20),
             last_exit_was_stoploss: false,
             partial_tp_done: false,
+            cvd: 0.0,
+            cvd_history: Vec::with_capacity(64),
+            funding_rates: Vec::new(),
+            funding_idx: 0,
+            current_funding: 0.0,
             atr_5m: ATR::new(14, 100),
             adx_5m: ADX::new(14),
             entry_atr: 0.0,
@@ -268,6 +286,14 @@ impl BacktestEngine {
         let end_time = events.last().map(|(k, _)| k.close_time).unwrap_or(0);
 
         let mut state = EngineState::new(self.config.initial_capital);
+        // 资金费率数据（存在则加载，缺失则空向量=不过滤）
+        state.funding_rates = self
+            .data_loader
+            .load_funding_rates(symbol)
+            .unwrap_or_default();
+        if self.config.strategy.use_funding_filter {
+            println!("   资金费率: {} 条（过滤开启）", state.funding_rates.len());
+        }
         let mut trades: Vec<TradeRecord> = Vec::new();
         let mut trade_id = 0;
 
@@ -277,6 +303,14 @@ impl BacktestEngine {
             }
 
             let timestamp = kline.close_time;
+
+            // 资金费率前向填充：推进到最近一条已结算费率
+            while state.funding_idx < state.funding_rates.len()
+                && state.funding_rates[state.funding_idx].0 <= timestamp
+            {
+                state.current_funding = state.funding_rates[state.funding_idx].1;
+                state.funding_idx += 1;
+            }
 
             if *is_1m {
                 state.kline_1m_count += 1;
@@ -296,6 +330,18 @@ impl BacktestEngine {
                     }
                 }
 
+                // 做空对称：超买标志跟踪（同样30根过期，用做空独立阈值）
+                if rsi > self.config.strategy.short_rsi_overbought {
+                    state.rsi_was_overbought = true;
+                    state.rsi_overbought_bars = 0;
+                } else if state.rsi_was_overbought {
+                    state.rsi_overbought_bars += 1;
+                    if state.rsi_overbought_bars > 30 {
+                        state.rsi_was_overbought = false;
+                        state.rsi_overbought_bars = 0;
+                    }
+                }
+
                 // 用K线收盘价模拟盘口（K线模式近似）
                 state.best_bid = kline.close;
                 state.best_ask = kline.close;
@@ -310,6 +356,14 @@ impl BacktestEngine {
                 state.volume_ratio.add_trade(timestamp, buy_vol, false);
                 // is_buyer_maker=true 表示卖方主动成交
                 state.volume_ratio.add_trade(timestamp, sell_vol, true);
+
+                // CVD累计成交量差：delta = 主动买量 - 主动卖量 = 2×taker_buy - 总量
+                let cvd_delta = 2.0 * buy_vol - kline.volume;
+                state.cvd += cvd_delta;
+                state.cvd_history.push(state.cvd);
+                if state.cvd_history.len() > 60 {
+                    state.cvd_history.remove(0);
+                }
 
                 // 更新最近20根K线最高价缓冲区
                 state.recent_highs.push(kline.high);
@@ -889,7 +943,19 @@ impl BacktestEngine {
                     false
                 };
 
-                let entry_signal = trend_entry_signal || mean_revert_signal;
+                // CVD确认过滤：近N根K线主动买盘净主导（CVD净上升）才允许入场
+                let cvd_ok = !self.config.strategy.use_cvd_filter || {
+                    let lookback = self.config.strategy.cvd_lookback;
+                    state.cvd_history.len() > lookback
+                        && state.cvd > state.cvd_history[state.cvd_history.len() - 1 - lookback]
+                };
+
+                // 资金费率过滤：费率过热（多头拥挤付费）时禁止做多入场
+                let funding_ok = !self.config.strategy.use_funding_filter
+                    || state.current_funding <= self.config.strategy.funding_long_block_pct / 100.0;
+
+                let entry_signal =
+                    (trend_entry_signal || mean_revert_signal) && cvd_ok && funding_ok;
 
                 if entry_signal {
                     let entry_quantity = dynamic_entry_quantity(
@@ -918,15 +984,22 @@ impl BacktestEngine {
                     state.daily_trades += 1;
                     state.entry_atr = state.atr_5m.value().unwrap_or(0.0);
                 } else if self.config.strategy.allow_short {
-                    // 做空入场（与实盘momentum_strategy.rs L864-895一致）
+                    // 做空入场（与做多对称：超买回落实路径 + 跌破路径）
                     let price_below_ema50_pct = if ema_trend > 0.0 {
                         (ema_trend - kline.close) / ema_trend * 100.0
                     } else {
                         0.0
                     };
+                    // EMA50宏观下降（与多头ema50_macro_rising对称）
+                    let ema50_macro_falling = if state.ema50_history.len() >= 20 {
+                        ema_trend < state.ema50_history[0]
+                    } else {
+                        false
+                    };
                     let short_trend_env_ok = ema_trend > 0.0
                         && price_below_ema50_pct > 0.15  // 至少低于EMA50 0.15%
-                        && ema21_slope < -0.03; // 斜率<-0.03% 确认下降动能
+                        && ema21_slope < -0.03 // 斜率<-0.03% 确认下降动能
+                        && ema50_macro_falling;
 
                     let trend_down = ema_fast_5m < ema_slow_5m;
                     let short_trend_strength = if ema_slow_5m > 0.0 {
@@ -949,17 +1022,28 @@ impl BacktestEngine {
                         false
                     };
 
-                    let rsi_overbought_short = rsi > 70.0;
+                    // 与多头rsi_recovering对称：曾超买且回落（不再要求当前RSI>70，
+                    // 旧条件在下降趋势中几乎不可能满足，180天仅触发2笔）
+                    let rsi_falling_from_ob = state.rsi_was_overbought
+                        && rsi < (self.config.strategy.short_rsi_overbought - 5.0)
+                        && rsi > self.config.strategy.rsi_oversold;
                     let sell_pressure =
                         vol_ratio < (1.0 / self.config.strategy.volume_ratio_threshold);
+
+                    // 资金费率做空过滤（与多头对称的逆向逻辑）：费率为负=空头拥挤付费，
+                    // 不做空（容易被轧空）；只在费率 >= -阈值 时允许做空
+                    let short_funding_ok = !self.config.strategy.use_funding_filter
+                        || state.current_funding
+                            >= -self.config.strategy.funding_long_block_pct / 100.0;
 
                     let short_signal = short_trend_env_ok
                         && adx_above_threshold
                         && short_di_direction_ok
+                        && short_funding_ok
                         && ((breakdown_signal && trend_down && short_trend_strong)
                             || (trend_down
                                 && short_trend_strong
-                                && rsi_overbought_short
+                                && rsi_falling_from_ob
                                 && sell_pressure));
 
                     if short_signal {
@@ -984,6 +1068,8 @@ impl BacktestEngine {
                         state.breakeven_active = false;
                         state.rsi_was_oversold = false;
                         state.rsi_oversold_bars = 0;
+                        state.rsi_was_overbought = false;
+                        state.rsi_overbought_bars = 0;
                         state.last_trade_time = timestamp;
                         state.daily_trades += 1;
                         state.entry_atr = state.atr_5m.value().unwrap_or(0.0);
