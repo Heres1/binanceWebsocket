@@ -188,7 +188,7 @@ connection_mode = "direct"
 # 3年跨周期回测验证（2023-03~2026-03）：年化+49.4%，仅17次调仓，熊市自动空仓
 # 逻辑：90日动量最高 + 价格>50日均线 → 全仓持有；否则空仓持USDT
 [rotation]
-symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "TRXUSDT", "LINKUSDT", "LTCUSDT", "AVAXUSDT", "DOTUSDT"]
 momentum_lookback_days = 90
 ma_filter_days = 50
 rebalance_interval_days = 30

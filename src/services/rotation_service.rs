@@ -80,11 +80,15 @@ pub struct RotationService {
 
 /// 按交易对 stepSize 向下取整数量
 fn round_step_size(quantity: f64, symbol: &str) -> f64 {
+    // 与 Binance exchangeInfo LOT_SIZE.stepSize 保持一致（2026-08 查询）
     let decimals: u32 = match symbol {
-        "BTCUSDT" => 5,
-        "ETHUSDT" => 4,
-        "SOLUSDT" => 2,
-        _ => 5,
+        "BTCUSDT" => 5,  // stepSize 0.00001
+        "ETHUSDT" => 4,  // stepSize 0.0001
+        "SOLUSDT" | "BNBUSDT" | "LTCUSDT" => 3, // stepSize 0.001
+        "LINKUSDT" | "DOTUSDT" | "AVAXUSDT" => 2, // stepSize 0.01
+        "ADAUSDT" | "XRPUSDT" | "TRXUSDT" => 1, // stepSize 0.1
+        "DOGEUSDT" => 0, // stepSize 1
+        _ => 2,          // 未知品种保守取2位，避免超精度被拒单
     };
     let factor = 10_f64.powi(decimals as i32);
     ((quantity * factor) + 1e-9).floor() / factor
@@ -483,6 +487,18 @@ impl RotationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_round_step_size_all_symbols() {
+        // 与 Binance LOT_SIZE stepSize 对齐，超精度下单会被拒单
+        assert!((round_step_size(1.23456789, "BTCUSDT") - 1.23456).abs() < 1e-9);
+        assert!((round_step_size(12.34567, "ETHUSDT") - 12.3456).abs() < 1e-9);
+        assert!((round_step_size(100.12345, "SOLUSDT") - 100.123).abs() < 1e-9);
+        assert!((round_step_size(100.12345, "BNBUSDT") - 100.123).abs() < 1e-9);
+        assert!((round_step_size(250.789, "LINKUSDT") - 250.78).abs() < 1e-9);
+        assert!((round_step_size(666.666, "XRPUSDT") - 666.6).abs() < 1e-9);
+        assert!((round_step_size(2500.7, "DOGEUSDT") - 2500.0).abs() < 1e-9);
+    }
 
     #[test]
     fn test_trailing_stop_not_triggered_below_threshold() {
