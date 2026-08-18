@@ -29,6 +29,12 @@ pub struct AccountBalance {
     pub sol_locked: f64,
 }
 
+impl Default for AccountBalance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AccountBalance {
     pub fn new() -> Self {
         Self {
@@ -388,7 +394,7 @@ impl OrderExecutionService {
                     Err(e) => {
                         consecutive_failures += 1;
                         // 日志防抖：前3次每次都写，之后每10次写一次
-                        if consecutive_failures <= 3 || consecutive_failures % 10 == 0 {
+                        if consecutive_failures <= 3 || consecutive_failures.is_multiple_of(10) {
                             log::warn!(
                                 "定期余额同步失败(连续{}次): {} | 下次重试: {}s后",
                                 consecutive_failures,
@@ -585,11 +591,11 @@ impl OrderExecutionService {
         // 平仓SELL始终市价单（止损止盈时效优先）
         let use_limit = side == "BUY" && !is_exit && self.use_limit_entry;
         let order_result = if use_limit {
-            match self.place_limit_then_market(&signal, actual_quantity).await {
+            match self.place_limit_then_market(signal, actual_quantity).await {
                 Ok(r) => r,
                 Err(e) => {
                     log::error!("限价优先下单失败，回退市价单: {}", e);
-                    self.publish_submit_event(&signal, side, "MARKET", actual_quantity, None)
+                    self.publish_submit_event(signal, side, "MARKET", actual_quantity, None)
                         .await;
                     self.client
                         .place_order(&signal.symbol, side, "MARKET", actual_quantity, None, None)
@@ -597,7 +603,7 @@ impl OrderExecutionService {
                 }
             }
         } else {
-            self.publish_submit_event(&signal, side, "MARKET", actual_quantity, None)
+            self.publish_submit_event(signal, side, "MARKET", actual_quantity, None)
                 .await;
             self.client
                 .place_order(

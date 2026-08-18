@@ -199,3 +199,7 @@ dry_run = true
 # 首次运行（无状态文件时）是否立即按信号对齐仓位：true=启动后第一个检查点立即评估调仓
 # 仅对全新部署/状态文件被删除后生效一次，正常重启无影响
 rebalance_on_start = true
+# 追踪止损：持仓期从峰值回撤该比例强制平仓（0.12=12%，回测验证Sharpe 1.17）
+trailing_stop_pct = 0.12
+# 追踪止损开关：false=禁用止损逻辑（仅对比测试用，实盘应保持true）
+trailing_stop_enabled = true

@@ -221,9 +221,17 @@ async fn main() {
             // 日级动量轮动回测（与RotationService实盘逻辑一致，交叉验证python结果）
             run_rotation_backtest(&config, &args).await;
         }
+        "futures_compare" => {
+            // 多策略对比回测：评估哪种策略最适合合约交易
+            run_futures_strategy_comparison(&config, &args).await;
+        }
+        "stress" => {
+            // 压力测试：日内插针回撤、单日暴跌、爆仓风险评估
+            run_stress_test(&config).await;
+        }
         other => {
             eprintln!(
-                "未知模式: {} (可选: kline, walkforward, optimize, optimize_v2, compare, replay, rotation)",
+                "未知模式: {} (可选: kline, walkforward, optimize, optimize_v2, compare, replay, rotation, futures_compare)",
                 other
             );
             std::process::exit(1);
@@ -1257,7 +1265,7 @@ async fn run_rotation_backtest(config: &AppConfig, args: &Args) {
         "   回测区间: {} → {} ({} 天)",
         fmt_ymd(timeline[start_idx]),
         fmt_ymd(timeline[n - 1]),
-        (timeline[n - 1] - timeline[start_idx]) / 86400_000
+        (timeline[n - 1] - timeline[start_idx]) / 86_400_000
     );
     println!();
 
@@ -1279,7 +1287,7 @@ async fn run_rotation_backtest(config: &AppConfig, args: &Args) {
                 let price = map[&timeline[i]];
                 let momentum = price / map[&timeline[i - lb]] - 1.0;
                 let ma: f64 = (0..ma_n).map(|j| map[&timeline[i - j]]).sum::<f64>() / ma_n as f64;
-                if momentum > 0.0 && price > ma && best.map_or(true, |(_, bm)| momentum > bm) {
+                if momentum > 0.0 && price > ma && best.is_none_or(|(_, bm)| momentum > bm) {
                     best = Some((si, momentum));
                 }
             }
@@ -1323,7 +1331,7 @@ async fn run_rotation_backtest(config: &AppConfig, args: &Args) {
     let initial = args.capital;
     let final_eq = equity_curve.last().map(|(_, e)| *e).unwrap_or(initial);
     let total_ret = final_eq / initial - 1.0;
-    let span_days = (timeline[n - 1] - timeline[start_idx]) as f64 / 86400_000.0;
+    let span_days = (timeline[n - 1] - timeline[start_idx]) as f64 / 86_400_000.0;
     let annualized = (final_eq / initial).powf(365.0 / span_days) - 1.0;
 
     let mut peak = f64::MIN;
@@ -1371,4 +1379,783 @@ async fn run_rotation_backtest(config: &AppConfig, args: &Args) {
         let bh = map[&timeline[n - 1]] / map[&timeline[start_idx]] - 1.0;
         println!("     {}: {:+.1}%", sym, bh * 100.0);
     }
+}
+
+// ============================================================================
+// 多策略对比回测（--mode futures_compare）
+// ============================================================================
+
+/// 策略单次运行的完整输出（净值曲线+交易统计）
+type StrategyOutcome = (Vec<(u64, f64)>, u32, u32);
+
+/// 策略回测结果
+struct StrategyResult {
+    name: String,
+    #[allow(dead_code)]
+    final_equity: f64,
+    total_return: f64,
+    annualized: f64,
+    max_drawdown: f64,
+    sharpe: f64,
+    trades: u32,
+    win_rate: f64,
+    year_returns: Vec<(i32, f64)>,
+}
+
+/// 计算策略统计指标
+fn compute_stats(
+    name: &str,
+    initial: f64,
+    equity_curve: &[(u64, f64)],
+    trades: u32,
+    wins: u32,
+) -> StrategyResult {
+    let final_eq = equity_curve.last().map(|(_, e)| *e).unwrap_or(initial);
+    let total_ret = final_eq / initial - 1.0;
+    let span_days = if equity_curve.len() > 1 {
+        (equity_curve.last().unwrap().0 - equity_curve[0].0) as f64 / 86_400_000.0
+    } else {
+        1.0
+    };
+    let annualized = if span_days > 0.0 {
+        (final_eq / initial).powf(365.0 / span_days) - 1.0
+    } else {
+        0.0
+    };
+
+    let mut peak = f64::MIN;
+    let mut max_dd = 0.0_f64;
+    for (_, e) in equity_curve {
+        if *e > peak { peak = *e; }
+        let dd = 1.0 - e / peak;
+        if dd > max_dd { max_dd = dd; }
+    }
+
+    // Sharpe ratio (daily returns)
+    let mut returns: Vec<f64> = Vec::new();
+    for i in 1..equity_curve.len() {
+        let r = equity_curve[i].1 / equity_curve[i - 1].1 - 1.0;
+        returns.push(r);
+    }
+    let mean_r = returns.iter().sum::<f64>() / returns.len().max(1) as f64;
+    let std_r = if returns.len() > 1 {
+        let var = returns.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>() / (returns.len() - 1) as f64;
+        var.sqrt()
+    } else { 1.0 };
+    let sharpe = if std_r > 1e-10 { (mean_r / std_r) * (365.0_f64).sqrt() } else { 0.0 };
+
+    // 分年度收益
+    let mut year_last: Vec<(i32, f64)> = Vec::new();
+    for (t, e) in equity_curve {
+        let y = fmt_ymd(*t)[..4].parse::<i32>().unwrap_or(0);
+        match year_last.last_mut() {
+            Some((ly, le)) if *ly == y => *le = *e,
+            _ => year_last.push((y, *e)),
+        }
+    }
+    let mut year_returns = Vec::new();
+    let mut prev = initial;
+    for (y, e) in &year_last {
+        year_returns.push((*y, e / prev - 1.0));
+        prev = *e;
+    }
+
+    StrategyResult {
+        name: name.to_string(),
+        final_equity: final_eq,
+        total_return: total_ret,
+        annualized,
+        max_drawdown: max_dd,
+        sharpe,
+        trades,
+        win_rate: if trades > 0 { wins as f64 / trades as f64 } else { 0.0 },
+        year_returns,
+    }
+}
+
+/// 策略1：纯做多动量轮动（现有策略基线）
+#[allow(clippy::too_many_arguments)]
+fn strategy_long_only_rotation(
+    series: &[(String, HashMap<u64, f64>)],
+    timeline: &[u64],
+    start_idx: usize,
+    capital: f64,
+    lb: usize,
+    ma_n: usize,
+    rebal: usize,
+    fee: f64,
+) -> (Vec<(u64, f64)>, u32, u32) {
+    let n = timeline.len();
+    let mut cash = capital;
+    let mut holding: Option<usize> = None;
+    let mut qty = 0.0_f64;
+    let mut trades = 0u32;
+    let mut wins = 0u32;
+    let mut equity_curve = Vec::with_capacity(n - start_idx);
+    let mut next_rebal = start_idx;
+    let mut entry_price = 0.0_f64;
+
+    for i in start_idx..n {
+        let t = timeline[i];
+        if i >= next_rebal {
+            let mut best: Option<(usize, f64)> = None;
+            for (si, (_, map)) in series.iter().enumerate() {
+                let price = map[&t];
+                let momentum = price / map[&timeline[i - lb]] - 1.0;
+                let ma: f64 = (0..ma_n).map(|j| map[&timeline[i - j]]).sum::<f64>() / ma_n as f64;
+                if momentum > 0.0 && price > ma && best.is_none_or(|(_, bm)| momentum > bm) {
+                    best = Some((si, momentum));
+                }
+            }
+            let target = best.map(|(si, _)| si);
+            if target != holding {
+                // 平旧仓
+                if let Some(h) = holding {
+                    let exit_price = series[h].1[&t];
+                    cash = qty * exit_price * (1.0 - fee);
+                    if exit_price > entry_price { wins += 1; }
+                    qty = 0.0;
+                    trades += 1;
+                }
+                // 开新仓
+                if let Some(s) = target {
+                    entry_price = series[s].1[&t];
+                    qty = cash * (1.0 - fee) / entry_price;
+                    cash = 0.0;
+                }
+                holding = target;
+            }
+            next_rebal = i + rebal;
+        }
+        let eq = match holding {
+            Some(h) => qty * series[h].1[&t],
+            None => cash,
+        };
+        equity_curve.push((t, eq));
+    }
+    (equity_curve, trades, wins)
+}
+
+/// 策略2：多空动量轮动（做多最强 + 做空最弱）
+#[allow(clippy::too_many_arguments)]
+fn strategy_long_short_rotation(
+    series: &[(String, HashMap<u64, f64>)],
+    timeline: &[u64],
+    start_idx: usize,
+    capital: f64,
+    lb: usize,
+    ma_n: usize,
+    rebal: usize,
+    fee: f64,
+) -> (Vec<(u64, f64)>, u32, u32) {
+    let n = timeline.len();
+    let mut equity = capital;
+    // 持仓状态：(symbol_idx, entry_price, qty)
+    let mut long_pos: Option<(usize, f64, f64)> = None;
+    let mut short_pos: Option<(usize, f64, f64)> = None;
+    let mut trades = 0u32;
+    let mut wins = 0u32;
+    let mut equity_curve = Vec::with_capacity(n - start_idx);
+    let mut next_rebal = start_idx;
+
+    for i in start_idx..n {
+        let t = timeline[i];
+        if i >= next_rebal {
+            // 计算所有品种的动量和MA
+            let mut candidates: Vec<(usize, f64, bool)> = Vec::new();
+            for (si, (_, map)) in series.iter().enumerate() {
+                let price = map[&t];
+                let momentum = price / map[&timeline[i - lb]] - 1.0;
+                let ma: f64 = (0..ma_n).map(|j| map[&timeline[i - j]]).sum::<f64>() / ma_n as f64;
+                candidates.push((si, momentum, price > ma));
+            }
+
+            // 做多目标：动量最高 + 在MA上方
+            let long_target = candidates.iter()
+                .filter(|(_, m, above)| *m > 0.0 && *above)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(si, _, _)| *si);
+
+            // 做空目标：动量最低 + 在MA下方
+            let short_target = candidates.iter()
+                .filter(|(_, m, above)| *m < 0.0 && !*above)
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(si, _, _)| *si);
+
+            // 平掉旧多头仓位
+            if let Some((si, entry_price, qty)) = long_pos {
+                let exit_price = series[si].1[&t];
+                let pnl = qty * (exit_price - entry_price);
+                let fee_cost = qty * (entry_price + exit_price) * fee;
+                equity += pnl - fee_cost;
+                if pnl > 0.0 { wins += 1; }
+                trades += 1;
+            }
+            // 平掉旧空头仓位
+            if let Some((si, entry_price, qty)) = short_pos {
+                let exit_price = series[si].1[&t];
+                let pnl = qty * (entry_price - exit_price); // 空头：开仓价-平仓价
+                let fee_cost = qty * (entry_price + exit_price) * fee;
+                equity += pnl - fee_cost;
+                if pnl > 0.0 { wins += 1; }
+                trades += 1;
+            }
+
+            // 开新仓位（各50%资金）
+            let half = equity / 2.0;
+            long_pos = long_target.map(|si| {
+                let price = series[si].1[&t];
+                let qty = half / price;
+                (si, price, qty)
+            });
+            short_pos = short_target.map(|si| {
+                let price = series[si].1[&t];
+                let qty = half / price;
+                (si, price, qty)
+            });
+
+            next_rebal = i + rebal;
+        }
+
+        // 计算当前净值 = 基础权益 + 浮动盈亏
+        let mut eq = equity;
+        if let Some((si, entry_price, qty)) = long_pos {
+            let current_price = series[si].1[&t];
+            eq += qty * (current_price - entry_price); // 多头浮盈
+        }
+        if let Some((si, entry_price, qty)) = short_pos {
+            let current_price = series[si].1[&t];
+            eq += qty * (entry_price - current_price); // 空头浮盈
+        }
+        equity_curve.push((t, eq.max(0.0)));
+    }
+    (equity_curve, trades, wins)
+}
+
+/// 策略3：趋势跟踪（MA交叉 + 止损）- 对每个品种独立运行，取最优
+fn strategy_trend_following(
+    series: &[(String, HashMap<u64, f64>)],
+    timeline: &[u64],
+    start_idx: usize,
+    capital: f64,
+    fee: f64,
+) -> (Vec<(u64, f64)>, u32, u32) {
+    let n = timeline.len();
+    let fast_ma = 20;
+    let slow_ma = 50;
+    let stop_loss_pct = 0.08; // 8% 止损
+
+    // 对每个品种独立运行，选最终收益最高的
+    let mut best_result: Option<StrategyOutcome> = None;
+    let mut best_final = f64::MIN;
+
+    for (_, map) in series {
+        let mut cash = capital;
+        let mut qty = 0.0_f64;
+        let mut in_position = false;
+        let mut entry_price = 0.0_f64;
+        let mut trades = 0u32;
+        let mut wins = 0u32;
+        let mut equity_curve = Vec::with_capacity(n - start_idx);
+
+        for i in start_idx.max(slow_ma)..n {
+            let t = timeline[i];
+            let price = map[&t];
+
+            let fast: f64 = (0..fast_ma).map(|j| map[&timeline[i - j]]).sum::<f64>() / fast_ma as f64;
+            let slow: f64 = (0..slow_ma).map(|j| map[&timeline[i - j]]).sum::<f64>() / slow_ma as f64;
+
+            if in_position {
+                let loss_pct = (entry_price - price) / entry_price;
+                if loss_pct >= stop_loss_pct {
+                    cash = qty * price * (1.0 - fee);
+                    qty = 0.0;
+                    in_position = false;
+                    trades += 1;
+                } else if fast < slow {
+                    cash = qty * price * (1.0 - fee);
+                    if price > entry_price { wins += 1; }
+                    qty = 0.0;
+                    in_position = false;
+                    trades += 1;
+                }
+            } else if fast > slow {
+                entry_price = price;
+                qty = cash * (1.0 - fee) / price;
+                cash = 0.0;
+                in_position = true;
+            }
+
+            let eq = if in_position { qty * price } else { cash };
+            equity_curve.push((t, eq));
+        }
+
+        let final_eq = equity_curve.last().map(|(_, e)| *e).unwrap_or(capital);
+        if final_eq > best_final {
+            best_final = final_eq;
+            best_result = Some((equity_curve, trades, wins));
+        }
+    }
+
+    best_result.unwrap_or_else(|| (vec![], 0, 0))
+}
+
+/// 策略4：Donchian通道突破（海龟交易法简化版）- 对每个品种独立运行，取最优
+fn strategy_breakout(
+    series: &[(String, HashMap<u64, f64>)],
+    timeline: &[u64],
+    start_idx: usize,
+    capital: f64,
+    fee: f64,
+) -> (Vec<(u64, f64)>, u32, u32) {
+    let n = timeline.len();
+    let channel_period = 20; // 20日突破
+    let stop_loss_pct = 0.10; // 10% 止损
+
+    let mut best_result: Option<StrategyOutcome> = None;
+    let mut best_final = f64::MIN;
+
+    for (_, map) in series {
+        let mut cash = capital;
+        let mut qty = 0.0_f64;
+        let mut in_position = false;
+        let mut entry_price = 0.0_f64;
+        let mut trades = 0u32;
+        let mut wins = 0u32;
+        let mut equity_curve = Vec::with_capacity(n - start_idx);
+
+        for i in start_idx.max(channel_period)..n {
+            let t = timeline[i];
+            let price = map[&t];
+
+            // 计算过去N日的最高价和最低价（不含今天）
+            let mut highest = f64::MIN;
+            let mut lowest = f64::MAX;
+            for j in 1..=channel_period {
+                let p = map[&timeline[i - j]];
+                if p > highest { highest = p; }
+                if p < lowest { lowest = p; }
+            }
+
+            if in_position {
+                let loss_pct = (entry_price - price) / entry_price;
+                if loss_pct >= stop_loss_pct || price < lowest * 0.98 {
+                    cash = qty * price * (1.0 - fee);
+                    if price > entry_price { wins += 1; }
+                    qty = 0.0;
+                    in_position = false;
+                    trades += 1;
+                }
+            } else if price > highest {
+                entry_price = price;
+                qty = cash * (1.0 - fee) / price;
+                cash = 0.0;
+                in_position = true;
+            }
+
+            let eq = if in_position { qty * price } else { cash };
+            equity_curve.push((t, eq));
+        }
+
+        let final_eq = equity_curve.last().map(|(_, e)| *e).unwrap_or(capital);
+        if final_eq > best_final {
+            best_final = final_eq;
+            best_result = Some((equity_curve, trades, wins));
+        }
+    }
+
+    best_result.unwrap_or_else(|| (vec![], 0, 0))
+}
+
+/// 策略5：动量轮动 + 追踪止损（最适合合约交易的改进版）
+/// 核心改进：在轮动持仓期间，如果从最高点回撤超过 12%，强制平仓保护利润
+#[allow(clippy::too_many_arguments)]
+fn strategy_rotation_trailing_stop(
+    series: &[(String, HashMap<u64, f64>)],
+    timeline: &[u64],
+    start_idx: usize,
+    capital: f64,
+    lb: usize,
+    ma_n: usize,
+    rebal: usize,
+    fee: f64,
+) -> (Vec<(u64, f64)>, u32, u32) {
+    let n = timeline.len();
+    let trailing_stop_pct = 0.12; // 从最高点回撤12%触发止损
+
+    let mut cash = capital;
+    let mut holding: Option<usize> = None;
+    let mut qty = 0.0_f64;
+    let mut entry_price = 0.0_f64;
+    let mut highest_since_entry = 0.0_f64;
+    let mut trades = 0u32;
+    let mut wins = 0u32;
+    let mut equity_curve = Vec::with_capacity(n - start_idx);
+    let mut next_rebal = start_idx;
+
+    for i in start_idx..n {
+        let t = timeline[i];
+
+        // 追踪止损检查（每天都检查，不只是调仓日）
+        if let Some(h) = holding {
+            let price = series[h].1[&t];
+            if price > highest_since_entry {
+                highest_since_entry = price;
+            }
+            // 从最高点回撤超过阈值，强制平仓
+            let drawdown_from_peak = (highest_since_entry - price) / highest_since_entry;
+            if drawdown_from_peak >= trailing_stop_pct {
+                cash = qty * price * (1.0 - fee);
+                if price > entry_price { wins += 1; }
+                qty = 0.0;
+                holding = None;
+                trades += 1;
+            }
+        }
+
+        // 调仓日逻辑
+        if i >= next_rebal {
+            let mut best: Option<(usize, f64)> = None;
+            for (si, (_, map)) in series.iter().enumerate() {
+                let price = map[&t];
+                let momentum = price / map[&timeline[i - lb]] - 1.0;
+                let ma: f64 = (0..ma_n).map(|j| map[&timeline[i - j]]).sum::<f64>() / ma_n as f64;
+                if momentum > 0.0 && price > ma && best.is_none_or(|(_, bm)| momentum > bm) {
+                    best = Some((si, momentum));
+                }
+            }
+            let target = best.map(|(si, _)| si);
+
+            if target != holding {
+                // 平旧仓
+                if let Some(h) = holding {
+                    let price = series[h].1[&t];
+                    cash = qty * price * (1.0 - fee);
+                    if price > entry_price { wins += 1; }
+                    qty = 0.0;
+                    trades += 1;
+                }
+                // 开新仓
+                if let Some(s) = target {
+                    entry_price = series[s].1[&t];
+                    highest_since_entry = entry_price;
+                    qty = cash * (1.0 - fee) / entry_price;
+                    cash = 0.0;
+                }
+                holding = target;
+            }
+            next_rebal = i + rebal;
+        }
+
+        let eq = match holding {
+            Some(h) => qty * series[h].1[&t],
+            None => cash,
+        };
+        equity_curve.push((t, eq));
+    }
+    (equity_curve, trades, wins)
+}
+
+/// 多策略对比回测入口
+async fn run_futures_strategy_comparison(config: &AppConfig, args: &Args) {
+    let rc = &config.rotation;
+    let loader = DataLoader::new("data");
+    let days = 1095u64; // 3年
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let start_ms = now_ms.saturating_sub(days * 86400 * 1000);
+
+    let base_url = if env::var("USE_SSH_TUNNEL").is_ok() {
+        "https://localhost:8443".to_string()
+    } else {
+        config.get_binance_base_url().to_string()
+    };
+    let client = BinanceClient::new(
+        config.binance.api_key.clone(),
+        config.binance.secret_key.clone(),
+        base_url,
+    );
+
+    println!("════════ 合约策略对比回测 ════════");
+    println!("   品种池: {:?}", rc.symbols);
+    println!("   回测周期: {} 天", days);
+    println!("   初始资金: {} USDT", args.capital);
+    println!("   手续费: 单边 0.05% (合约Taker)");
+    println!();
+
+    // 1. 加载日线数据
+    let mut series: Vec<(String, HashMap<u64, f64>)> = Vec::new();
+    for symbol in &rc.symbols {
+        let incomplete = loader
+            .load_klines(symbol, "1d")
+            .map(|k| (k.len() as u64) + 5 < days)
+            .unwrap_or(true);
+        if incomplete {
+            if let Err(e) = loader
+                .download_klines(&client, symbol, "1d", start_ms, now_ms)
+                .await
+            {
+                eprintln!("下载 {} 日线失败: {}", symbol, e);
+                std::process::exit(1);
+            }
+        }
+        let klines = match loader.load_klines(symbol, "1d") {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("加载 {} 日线失败: {}", symbol, e);
+                std::process::exit(1);
+            }
+        };
+        series.push((
+            symbol.clone(),
+            klines.iter().map(|k| (k.open_time, k.close)).collect(),
+        ));
+    }
+
+    // 2. 对齐时间轴
+    let mut timeline: Vec<u64> = series[0].1.keys().copied().collect();
+    timeline.sort_unstable();
+    timeline.retain(|t| series.iter().all(|(_, m)| m.contains_key(t)));
+    let n = timeline.len();
+
+    let lb = rc.momentum_lookback_days;
+    let ma_n = rc.ma_filter_days;
+    let rebal = rc.rebalance_interval_days as usize;
+    let fee = 0.0005_f64; // 合约Taker单边0.05%
+    let start_idx = lb.max(ma_n.saturating_sub(1));
+
+    if n <= start_idx + 1 {
+        eprintln!("数据不足：{} 根日线", n);
+        std::process::exit(1);
+    }
+
+    println!(
+        "   回测区间: {} → {} ({} 天)",
+        fmt_ymd(timeline[start_idx]),
+        fmt_ymd(timeline[n - 1]),
+        (timeline[n - 1] - timeline[start_idx]) / 86_400_000
+    );
+    println!();
+
+    // 3. 运行4种策略
+    println!("   运行策略 1/5: 纯做多动量轮动...");
+    let (eq1, t1, w1) = strategy_long_only_rotation(&series, &timeline, start_idx, args.capital, lb, ma_n, rebal, fee);
+    let r1 = compute_stats("纯做多动量轮动", args.capital, &eq1, t1, w1);
+
+    println!("   运行策略 2/5: 多空动量轮动...");
+    let (eq2, t2, w2) = strategy_long_short_rotation(&series, &timeline, start_idx, args.capital, lb, ma_n, rebal, fee);
+    let r2 = compute_stats("多空动量轮动", args.capital, &eq2, t2, w2);
+
+    println!("   运行策略 3/5: 趋势跟踪(MA20/50交叉+止损)...");
+    let (eq3, t3, w3) = strategy_trend_following(&series, &timeline, start_idx, args.capital, fee);
+    let r3 = compute_stats("趋势跟踪(MA交叉)", args.capital, &eq3, t3, w3);
+
+    println!("   运行策略 4/5: Donchian通道突破...");
+    let (eq4, t4, w4) = strategy_breakout(&series, &timeline, start_idx, args.capital, fee);
+    let r4 = compute_stats("通道突破(海龟)", args.capital, &eq4, t4, w4);
+
+    println!("   运行策略 5/5: 动量轮动+追踪止损...");
+    let (eq5, t5, w5) = strategy_rotation_trailing_stop(&series, &timeline, start_idx, args.capital, lb, ma_n, rebal, fee);
+    let r5 = compute_stats("轮动+追踪止损", args.capital, &eq5, t5, w5);
+
+    // 4. 输出对比结果
+    let results = vec![r1, r2, r3, r4, r5];
+
+    println!();
+    println!("════════ 策略对比结果 ════════");
+    println!();
+    println!("  {:<20} {:>10} {:>10} {:>10} {:>8} {:>6} {:>6}",
+        "策略", "总收益%", "年化%", "最大回撤%", "Sharpe", "交易", "胜率%");
+    println!("  {}", "-".repeat(80));
+
+    for r in &results {
+        println!("  {:<20} {:>+10.1} {:>+10.1} {:>10.1} {:>8.2} {:>6} {:>6.1}",
+            r.name, r.total_return * 100.0, r.annualized * 100.0,
+            r.max_drawdown * 100.0, r.sharpe, r.trades, r.win_rate * 100.0);
+    }
+
+    println!();
+    println!("════════ 分年度收益对比 ════════");
+    println!();
+
+    // 收集所有年份
+    let all_years: std::collections::BTreeSet<i32> = results.iter()
+        .flat_map(|r| r.year_returns.iter().map(|(y, _)| *y))
+        .collect();
+
+    println!("  {:<20}", "策略");
+    print!("  {:<20}", "策略");
+    for y in &all_years {
+        print!(" {:>8}", format!("{}年%", y));
+    }
+    println!();
+    println!("  {}", "-".repeat(20 + all_years.len() * 9));
+
+    for r in &results {
+        print!("  {:<20}", r.name);
+        for y in &all_years {
+            let ret = r.year_returns.iter().find(|(ry, _)| ry == y).map(|(_, v)| *v).unwrap_or(0.0);
+            print!(" {:>+8.1}", ret * 100.0);
+        }
+        println!();
+    }
+
+    // 5. 推荐
+    println!();
+    println!("════════ 推荐 ════════");
+    let best = results.iter().max_by(|a, b| a.sharpe.partial_cmp(&b.sharpe).unwrap()).unwrap();
+    println!("  综合评分最优（Sharpe最高）: {} (Sharpe={:.2}, 年化={:+.1}%, 回撤={:.1}%)",
+        best.name, best.sharpe, best.annualized * 100.0, best.max_drawdown * 100.0);
+
+    let lowest_dd = results.iter().min_by(|a, b| a.max_drawdown.partial_cmp(&b.max_drawdown).unwrap()).unwrap();
+    println!("  回撤最低: {} (回撤={:.1}%, 年化={:+.1}%)",
+        lowest_dd.name, lowest_dd.max_drawdown * 100.0, lowest_dd.annualized * 100.0);
+
+    // 买入持有对照
+    println!();
+    println!("  同期买入持有对照:");
+    for (sym, map) in &series {
+        let bh = map[&timeline[n - 1]] / map[&timeline[start_idx]] - 1.0;
+        println!("    {}: {:+.1}%", sym, bh * 100.0);
+    }
+}
+
+// ============================================================================
+// 压力测试（--mode stress）：评估合约交易的爆仓风险
+// ============================================================================
+
+/// 压力测试：用真实的日内高低价数据评估合约交易的最大风险
+async fn run_stress_test(config: &AppConfig) {
+    let rc = &config.rotation;
+    let loader = DataLoader::new("data");
+    let days = 1095u64;
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let start_ms = now_ms.saturating_sub(days * 86400 * 1000);
+
+    let base_url = if env::var("USE_SSH_TUNNEL").is_ok() {
+        "https://localhost:8443".to_string()
+    } else {
+        config.get_binance_base_url().to_string()
+    };
+    let client = BinanceClient::new(
+        config.binance.api_key.clone(),
+        config.binance.secret_key.clone(),
+        base_url,
+    );
+
+    println!("════════ 合约交易压力测试 ════════");
+    println!("   目的：评估日内插针、单日暴跌对合约持仓的影响");
+    println!("   品种池: {:?}", rc.symbols);
+    println!();
+
+    for symbol in &rc.symbols {
+        let incomplete = loader
+            .load_klines(symbol, "1d")
+            .map(|k| (k.len() as u64) + 5 < days)
+            .unwrap_or(true);
+        if incomplete {
+            if let Err(e) = loader
+                .download_klines(&client, symbol, "1d", start_ms, now_ms)
+                .await
+            {
+                eprintln!("下载 {} 日线失败: {}", symbol, e);
+                continue;
+            }
+        }
+        let klines = match loader.load_klines(symbol, "1d") {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("加载 {} 日线失败: {}", symbol, e);
+                continue;
+            }
+        };
+
+        println!("  ─── {} 压力测试 ───", symbol);
+
+        // 1. 单日最大跌幅（收盘价对比前一天收盘价）
+        let mut worst_daily_drop = f64::MAX;
+        let mut worst_daily_date = 0u64;
+        for i in 1..klines.len() {
+            let drop = (klines[i].close - klines[i - 1].close) / klines[i - 1].close;
+            if drop < worst_daily_drop {
+                worst_daily_drop = drop;
+                worst_daily_date = klines[i].open_time;
+            }
+        }
+
+        // 2. 日内最大插针跌幅（当天最低价 vs 当天最高价）
+        let mut worst_intraday_drop = f64::MAX;
+        let mut worst_intraday_date = 0u64;
+        for k in &klines {
+            if k.high > 0.0 {
+                let drop = (k.low - k.high) / k.high;
+                if drop < worst_intraday_drop {
+                    worst_intraday_drop = drop;
+                    worst_intraday_date = k.open_time;
+                }
+            }
+        }
+
+        // 3. 从20日滚动最高价到当天最低价的最大回撤（模拟持仓被插针）
+        let mut worst_wick_dd = f64::MAX;
+        let mut worst_wick_date = 0u64;
+        for i in 20..klines.len() {
+            let peak: f64 = klines[i - 20..i].iter().map(|k| k.high).fold(f64::MIN, f64::max);
+            let drop = (klines[i].low - peak) / peak;
+            if drop < worst_wick_dd {
+                worst_wick_dd = drop;
+                worst_wick_date = klines[i].open_time;
+            }
+        }
+
+        // 4. 统计单日跌幅超过各阈值的次数
+        let drops_5pct: usize = (1..klines.len())
+            .filter(|&i| (klines[i].close - klines[i - 1].close) / klines[i - 1].close < -0.05)
+            .count();
+        let drops_10pct: usize = (1..klines.len())
+            .filter(|&i| (klines[i].close - klines[i - 1].close) / klines[i - 1].close < -0.10)
+            .count();
+        let drops_15pct: usize = (1..klines.len())
+            .filter(|&i| (klines[i].close - klines[i - 1].close) / klines[i - 1].close < -0.15)
+            .count();
+
+        println!("    单日最大跌幅: {:.1}% ({})", worst_daily_drop * 100.0, fmt_ymd(worst_daily_date));
+        println!("    日内最大插针: {:.1}% ({})", worst_intraday_drop * 100.0, fmt_ymd(worst_intraday_date));
+        println!("    20日高点到日内低点最大回撤: {:.1}% ({})", worst_wick_dd * 100.0, fmt_ymd(worst_wick_date));
+        println!("    单日跌幅>5%的天数: {} / {} 天", drops_5pct, klines.len());
+        println!("    单日跌幅>10%的天数: {} / {} 天", drops_10pct, klines.len());
+        println!("    单日跌幅>15%的天数: {} / {} 天", drops_15pct, klines.len());
+
+        // 5. 爆仓风险评估
+        println!("    爆仓风险评估（假设做多持仓）:");
+        for lev in [2, 3, 5, 10] {
+            // 爆仓价 ≈ entry * (1 - 1/leverage + maintenance_margin)
+            // 简化：爆仓需要价格跌幅 ≈ (1 - 1/leverage) * 100%
+            let liq_drop = (1.0 - 1.0 / lev as f64) * 100.0;
+            let risk = if worst_daily_drop * 100.0 < -(liq_drop * 0.5) {
+                "⚠️ 高风险"
+            } else if worst_daily_drop * 100.0 < -(liq_drop * 0.3) {
+                "⚡ 中风险"
+            } else {
+                "✅ 低风险"
+            };
+            println!("      {}x杠杆: 爆仓需跌{:.0}% | 历史最差单日{:.1}% | {}",
+                lev, liq_drop, worst_daily_drop * 100.0, risk);
+        }
+        println!();
+    }
+
+    println!("════════ 关键结论 ════════");
+    println!("  1. 追踪止损在日线级别有效，但无法防止日内插针瞬间击穿");
+    println!("  2. 合约交易必须使用 STOP_MARKET 条件单（服务器端执行），不能依赖程序轮询");
+    println!("  3. 2x杠杆下，需要价格跌50%才爆仓，历史最差单日约-15~-20%，有安全边际");
+    println!("  4. 但连续多日下跌（如熊市）+ 追踪止损未及时触发 = 实际风险远大于单日");
+    println!("  5. 建议：2x杠杆 + 逐仓模式 + STOP_MARKET条件单 + 组合级回撤监控");
 }

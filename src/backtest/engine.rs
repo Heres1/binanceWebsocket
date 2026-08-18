@@ -661,19 +661,17 @@ impl BacktestEngine {
                     } else {
                         atr_sl
                     }
+                } else if lowest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
+                    state.trailing_active = true;
+                    state.lowest_since_entry
+                        * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
+                } else if state.breakeven_active
+                    || lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct
+                {
+                    state.breakeven_active = true;
+                    state.entry_price
                 } else {
-                    if lowest_pnl_pct >= self.config.strategy.trailing_trigger_pct {
-                        state.trailing_active = true;
-                        state.lowest_since_entry
-                            * (1.0 + self.config.strategy.trailing_distance_pct / 100.0)
-                    } else if state.breakeven_active
-                        || lowest_pnl_pct >= self.config.strategy.breakeven_trigger_pct
-                    {
-                        state.breakeven_active = true;
-                        state.entry_price
-                    } else {
-                        state.entry_price * (1.0 + self.config.strategy.stop_loss_pct / 100.0)
-                    }
+                    state.entry_price * (1.0 + self.config.strategy.stop_loss_pct / 100.0)
                 };
 
                 let tp_price =
@@ -1717,16 +1715,14 @@ impl BacktestEngine {
                     } else {
                         atr_sl
                     }
+                } else if highest_pnl_pct >= strategy.trailing_trigger_pct {
+                    state.trailing_active = true;
+                    state.highest_since_entry * (1.0 - strategy.trailing_distance_pct / 100.0)
+                } else if highest_pnl_pct >= strategy.breakeven_trigger_pct {
+                    state.breakeven_active = true;
+                    state.entry_price
                 } else {
-                    if highest_pnl_pct >= strategy.trailing_trigger_pct {
-                        state.trailing_active = true;
-                        state.highest_since_entry * (1.0 - strategy.trailing_distance_pct / 100.0)
-                    } else if highest_pnl_pct >= strategy.breakeven_trigger_pct {
-                        state.breakeven_active = true;
-                        state.entry_price
-                    } else {
-                        state.entry_price * (1.0 - strategy.stop_loss_pct / 100.0)
-                    }
+                    state.entry_price * (1.0 - strategy.stop_loss_pct / 100.0)
                 };
 
                 let tp_price = state.entry_price * (1.0 + strategy.take_profit_pct / 100.0);
@@ -1827,16 +1823,14 @@ impl BacktestEngine {
                     } else {
                         atr_sl
                     }
+                } else if lowest_pnl_pct >= strategy.trailing_trigger_pct {
+                    state.trailing_active = true;
+                    state.lowest_since_entry * (1.0 + strategy.trailing_distance_pct / 100.0)
+                } else if lowest_pnl_pct >= strategy.breakeven_trigger_pct {
+                    state.breakeven_active = true;
+                    state.entry_price
                 } else {
-                    if lowest_pnl_pct >= strategy.trailing_trigger_pct {
-                        state.trailing_active = true;
-                        state.lowest_since_entry * (1.0 + strategy.trailing_distance_pct / 100.0)
-                    } else if lowest_pnl_pct >= strategy.breakeven_trigger_pct {
-                        state.breakeven_active = true;
-                        state.entry_price
-                    } else {
-                        state.entry_price * (1.0 + strategy.stop_loss_pct / 100.0)
-                    }
+                    state.entry_price * (1.0 + strategy.stop_loss_pct / 100.0)
                 };
 
                 let tp_price = state.entry_price * (1.0 - strategy.take_profit_pct / 100.0);

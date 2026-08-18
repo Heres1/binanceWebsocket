@@ -571,7 +571,7 @@ impl MarketDataService {
                 // bookTicker没有"e"字段，通过stream名称判断
                 if stream_name
                     .as_ref()
-                    .map_or(false, |s| s.contains("bookTicker"))
+                    .is_some_and(|s| s.contains("bookTicker"))
                     || data.get("b").is_some() && data.get("a").is_some() && data.get("s").is_some()
                 {
                     let event = self.parse_book_ticker(&data)?;

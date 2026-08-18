@@ -24,6 +24,19 @@ pub struct LoggerConfig {
     buffer_size: Option<usize>, // 缓冲区大小
 }
 
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        LoggerConfig {
+            level: LevelFilter::Info,
+            format: LogFormat::Text,
+            file_path: None,
+            rotate_size: Some(100 * 1024 * 1024), // 单文件100MB上限
+            max_files: 10,                        // 保留最近10个历史日志
+            buffer_size: Some(1024),
+        }
+    }
+}
+
 impl LoggerConfig {
     pub fn new(
         level: LevelFilter,
@@ -45,17 +58,6 @@ impl LoggerConfig {
     pub fn with_buffer_size(mut self, buffer_size: usize) -> Self {
         self.buffer_size = Some(buffer_size);
         self
-    }
-
-    pub fn default() -> Self {
-        LoggerConfig {
-            level: LevelFilter::Info,
-            format: LogFormat::Text,
-            file_path: None,
-            rotate_size: Some(100 * 1024 * 1024), // 单文件100MB上限
-            max_files: 10,                        // 保留最近10个历史日志
-            buffer_size: Some(1024),
-        }
     }
 
     pub fn level(&self) -> &LevelFilter {
@@ -245,39 +247,33 @@ impl AsyncLogger {
                 }
             }
 
-            loop {
-                match receiver.recv() {
-                    Ok(msg) => {
-                        let formatted_msg = Self::format_message(&config_clone, &msg);
+            while let Ok(msg) = receiver.recv() {
+                let formatted_msg = Self::format_message(&config_clone, &msg);
 
-                        // 检查是否需要分割（单文件超过上限）
-                        if let Some(ref mut monitor) = size_monitor {
-                            if monitor.should_split() {
-                                if let Some(new_file) = monitor.split() {
-                                    current_file = Some(new_file);
-                                    // 更新软链接指向新文件
-                                    if let Some(ref base_path) = config_clone.file_path {
-                                        let _ =
-                                            Self::update_symlink(base_path, &monitor.current_path);
-                                    }
-                                }
+                // 检查是否需要分割（单文件超过上限）
+                if let Some(ref mut monitor) = size_monitor {
+                    if monitor.should_split() {
+                        if let Some(new_file) = monitor.split() {
+                            current_file = Some(new_file);
+                            // 更新软链接指向新文件
+                            if let Some(ref base_path) = config_clone.file_path {
+                                let _ = Self::update_symlink(base_path, &monitor.current_path);
                             }
-                        }
-
-                        // 写入日志文件
-                        if let Some(ref mut file) = current_file {
-                            if writeln!(file, "{}", formatted_msg).is_err() {
-                                eprintln!("日志写入失败");
-                            }
-                            let _ = file.flush();
-                        }
-
-                        // 只有WARN和ERROR级别输出到控制台
-                        if msg.level <= log::Level::Warn {
-                            println!("{}", formatted_msg);
                         }
                     }
-                    Err(_) => break,
+                }
+
+                // 写入日志文件
+                if let Some(ref mut file) = current_file {
+                    if writeln!(file, "{}", formatted_msg).is_err() {
+                        eprintln!("日志写入失败");
+                    }
+                    let _ = file.flush();
+                }
+
+                // 只有WARN和ERROR级别输出到控制台
+                if msg.level <= log::Level::Warn {
+                    println!("{}", formatted_msg);
                 }
             }
         });

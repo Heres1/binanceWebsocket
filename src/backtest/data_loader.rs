@@ -271,7 +271,7 @@ impl DataLoader {
             all.extend(batch);
             current_start = last_time + 1;
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            if all.len() % 1000 != 0 {
+            if !all.len().is_multiple_of(1000) {
                 break; // 不足整批，已到末尾
             }
         }

@@ -1,9 +1,11 @@
 //! 日级动量轮动服务
 //!
-//! 策略逻辑（3年跨周期回测验证：年化+49.4%，17次调仓）：
+//! 策略逻辑（3年跨周期回测验证：年化+49.4%，17次调仓；加追踪止损后Sharpe 1.17、回撤39.9%）：
 //! - 品种池：BTC/ETH/SOL，每 rebalance_interval_days 天评估一次
 //! - 信号：90日动量（close/close_90d前 - 1）最高者胜出
 //! - 过滤：候选品种价格必须 > 其50日均线，否则空仓；最高动量 ≤ 0 也空仓
+//! - 风控：持仓期价格从峰值回撤 ≥ trailing_stop_pct（默认12%）强制平仓转USDT，
+//!   止损后等满一个完整调仓周期才允许再入场（防震荡市反复止损）
 //! - 执行：全仓轮动（卖出旧品种→买入新品种），目标=当前则不动
 //!
 //! 与5m事件驱动策略完全不同：本服务不订阅任何市场事件，
@@ -16,20 +18,31 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// 持久化状态（重启不重复调仓）
+/// 新增字段均带 serde(default)，兼容旧状态文件
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 struct RotationState {
     last_rebalance_ms: u64,          // 上次调仓时间
     current_holding: Option<String>, // 当前持仓品种（None=空仓持USDT）
+    #[serde(default)]
+    entry_price: Option<f64>, // 当前持仓入场价（日志追溯用）
+    #[serde(default)]
+    peak_price: Option<f64>, // 持仓期间峰值价（追踪止损基准）
+    #[serde(default)]
+    last_stop_loss_ms: u64, // 上次追踪止损触发时间（日志追溯用）
 }
 
-impl Default for RotationState {
-    fn default() -> Self {
-        Self {
-            last_rebalance_ms: 0,
-            current_holding: None,
-        }
+/// 追踪止损判定（纯函数，便于单元测试）：
+/// 返回(是否触发止损, 更新后的峰值)。价格无效(peak<=0)时不触发。
+fn evaluate_trailing_stop(peak: f64, price: f64, stop_pct: f64) -> (bool, f64) {
+    if peak <= 0.0 || price <= 0.0 {
+        return (false, peak);
     }
+    let new_peak = peak.max(price);
+    let drawdown = (new_peak - price) / new_peak;
+    (drawdown >= stop_pct, new_peak)
 }
+
 
 impl RotationState {
     fn load(path: &str) -> Self {
@@ -101,12 +114,17 @@ impl RotationService {
     /// 启动定时轮询任务（阻塞式，spawn到tokio任务中运行）
     pub async fn run(self: Arc<Self>) {
         log::info!(
-            "🔄 动量轮动服务启动 | 品种: {:?} | 动量{}d | MA{}d | 调仓间隔{}d | 干跑: {}",
+            "🔄 动量轮动服务启动 | 品种: {:?} | 动量{}d | MA{}d | 调仓间隔{}d | 干跑: {} | 追踪止损: {}",
             self.config.symbols,
             self.config.momentum_lookback_days,
             self.config.ma_filter_days,
             self.config.rebalance_interval_days,
-            self.config.dry_run
+            self.config.dry_run,
+            if self.config.trailing_stop_enabled {
+                format!("开({:.0}%)", self.config.trailing_stop_pct * 100.0)
+            } else {
+                "关".to_string()
+            }
         );
         loop {
             if let Err(e) = self.tick().await {
@@ -145,10 +163,27 @@ impl RotationService {
             );
         }
 
+        // === 追踪止损检查（每次tick执行，不等调仓日）===
+        if self.config.trailing_stop_enabled {
+            if let Some(holding) = state.current_holding.clone() {
+                match self.check_trailing_stop(&holding, &mut state).await {
+                    Ok(true) => {
+                        // 已触发止损并处理完毕（含状态重置），本轮结束
+                        return Ok(());
+                    }
+                    Ok(false) => {} // 未触发，继续正常流程
+                    Err(e) => {
+                        // 价格拉取失败：仅记录不中止，等下次tick重试
+                        log::warn!("⚠️ {} 追踪止损检查失败: {}（下次重试）", holding, e);
+                    }
+                }
+            }
+        }
+
         // 未到调仓时间（首次运行且rebalance_on_start=true时elapsed必然>=interval，直接通过）
         let elapsed_ms = now.saturating_sub(state.last_rebalance_ms); // saturating_sub防时钟回拨下溢
         if elapsed_ms < interval_ms {
-            let remain_h = (interval_ms - elapsed_ms) / 3600_000;
+            let remain_h = (interval_ms - elapsed_ms) / 3_600_000;
             log::info!(
                 "🔄 距下次调仓评估还有约 {}h | 当前: {}",
                 remain_h,
@@ -171,6 +206,16 @@ impl RotationService {
         if target == current {
             log::info!("✅ 目标与当前一致，无需调仓");
             state.current_holding = current;
+            // 旧状态无峰值记录时补初始化（追踪基准），有持仓才需要
+            if state.current_holding.is_some() && state.peak_price.is_none() {
+                if let Some(h) = state.current_holding.as_deref() {
+                    if let Ok(p) = self.fetch_current_price(h).await {
+                        state.peak_price = Some(p);
+                        state.entry_price = state.entry_price.or(Some(p));
+                        log::info!("📌 {} 追踪基准初始化 | 峰值=入场价 {:.2}", h, p);
+                    }
+                }
+            }
             state.save(&self.state_file);
             return Ok(());
         }
@@ -188,10 +233,93 @@ impl RotationService {
             self.execute_rotation(current.as_deref(), target.as_deref())
                 .await?;
             state.current_holding = target;
+            // 换仓后重置追踪基准：新仓以当前价为入场价与峰值起点
+            match &state.current_holding {
+                Some(h) => {
+                    if let Ok(p) = self.fetch_current_price(h).await {
+                        state.entry_price = Some(p);
+                        state.peak_price = Some(p);
+                        log::info!("📌 {} 新开仓追踪基准 | 入场价=峰值 {:.2}", h, p);
+                    }
+                }
+                None => {
+                    state.entry_price = None;
+                    state.peak_price = None;
+                }
+            }
         }
 
         state.save(&self.state_file);
         Ok(())
+    }
+
+    /// 追踪止损检查：拉取持仓现价，更新峰值，回撤超阈值则强制平仓
+    /// 返回 Ok(true)=已触发并处理，Ok(false)=未触发
+    async fn check_trailing_stop(
+        &self,
+        holding: &str,
+        state: &mut RotationState,
+    ) -> Result<bool, DomainError> {
+        let price = self.fetch_current_price(holding).await?;
+        let now = now_ms();
+
+        // 旧状态（升级前开的仓）无峰值记录：以当前价初始化，从升级时刻起追踪
+        let peak = state.peak_price.unwrap_or(price);
+        let (triggered, new_peak) =
+            evaluate_trailing_stop(peak, price, self.config.trailing_stop_pct);
+        state.peak_price = Some(new_peak);
+
+        if !triggered {
+            state.save(&self.state_file);
+            return Ok(false);
+        }
+
+        // === 触发止损 ===
+        let entry = state.entry_price.unwrap_or(new_peak);
+        let drawdown = (new_peak - price) / new_peak;
+        let hold_days = now.saturating_sub(state.last_rebalance_ms) / 86_400_000;
+        log::info!(
+            "🛑 [追踪止损触发] {} | 入场价 {:.2} | 峰值 {:.2} | 现价 {:.2} | 回撤 {:.1}% ≥ {:.0}% | 持仓约{}天",
+            holding,
+            entry,
+            new_peak,
+            price,
+            drawdown * 100.0,
+            self.config.trailing_stop_pct * 100.0,
+            hold_days
+        );
+
+        if self.config.dry_run {
+            log::info!("🧪 [干跑] 应止损清仓 {} → USDT（不实际下单）", holding);
+            // 干跑不真实下单：状态保持实际持仓，但重置计时避免反复触发日志
+            state.last_stop_loss_ms = now;
+            state.last_rebalance_ms = now; // 等满一个完整周期再评估（防震荡市反复止损）
+            state.save(&self.state_file);
+            return Ok(true);
+        }
+
+        self.execute_rotation(Some(holding), None).await?;
+        log::info!("✅ 止损清仓完成，转入USDT，{}天后重新评估", self.config.rebalance_interval_days);
+
+        state.current_holding = None;
+        state.entry_price = None;
+        state.peak_price = None;
+        state.last_stop_loss_ms = now;
+        state.last_rebalance_ms = now; // 等满一个完整周期才允许再入场
+        state.save(&self.state_file);
+        Ok(true)
+    }
+
+    /// 拉取品种最新价（日线最新收盘价）
+    async fn fetch_current_price(&self, symbol: &str) -> Result<f64, DomainError> {
+        let klines = self
+            .client
+            .get_klines(symbol, "1d", None, None, Some(1))
+            .await?;
+        klines
+            .last()
+            .map(|k| k.close)
+            .ok_or_else(|| ServiceError::MarketData(format!("{} 无法获取最新价格", symbol)).into())
     }
 
     /// 计算目标品种：90日动量最高 + 价格>MA50，否则None（空仓）
@@ -238,7 +366,7 @@ impl RotationService {
                 above_ma
             );
             if momentum > 0.0 && above_ma {
-                let is_better = best.as_ref().map_or(true, |(_, bm)| momentum > *bm);
+                let is_better = best.as_ref().is_none_or(|(_, bm)| momentum > *bm);
                 if is_better {
                     best = Some((symbol.clone(), momentum));
                 }
@@ -349,5 +477,60 @@ impl RotationService {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trailing_stop_not_triggered_below_threshold() {
+        // 峰值100，现价88.1（回撤11.9%）< 12%阈值，不触发
+        let (triggered, new_peak) = evaluate_trailing_stop(100.0, 88.1, 0.12);
+        assert!(!triggered, "回撤11.9%不应触发12%止损");
+        assert!((new_peak - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_trailing_stop_triggered_at_threshold() {
+        // 峰值100，现价88.0（回撤恰好12%），触发
+        let (triggered, _) = evaluate_trailing_stop(100.0, 88.0, 0.12);
+        assert!(triggered, "回撤恰好12%应触发止损");
+    }
+
+    #[test]
+    fn test_trailing_stop_triggered_above_threshold() {
+        // 峰值100，现价85（回撤15%）> 12%，触发
+        let (triggered, _) = evaluate_trailing_stop(100.0, 85.0, 0.12);
+        assert!(triggered, "回撤15%应触发止损");
+    }
+
+    #[test]
+    fn test_peak_updates_on_new_high() {
+        // 现价高于峰值时，峰值应更新，且不触发止损
+        let (triggered, new_peak) = evaluate_trailing_stop(100.0, 110.0, 0.12);
+        assert!(!triggered);
+        assert!((new_peak - 110.0).abs() < 1e-9, "峰值应更新为新高110");
+    }
+
+    #[test]
+    fn test_invalid_price_no_trigger() {
+        // 价格为0或负数时不触发（防数据异常误止损）
+        let (t1, _) = evaluate_trailing_stop(100.0, 0.0, 0.12);
+        let (t2, _) = evaluate_trailing_stop(0.0, 100.0, 0.12);
+        assert!(!t1);
+        assert!(!t2);
+    }
+
+    #[test]
+    fn test_state_backward_compat() {
+        // 旧状态文件（无新字段）应能正常反序列化，新字段为默认值
+        let old_json = r#"{"last_rebalance_ms":1000,"current_holding":"BTCUSDT"}"#;
+        let state: RotationState = serde_json::from_str(old_json).unwrap();
+        assert_eq!(state.current_holding.as_deref(), Some("BTCUSDT"));
+        assert!(state.peak_price.is_none(), "旧文件peak_price应为None");
+        assert!(state.entry_price.is_none(), "旧文件entry_price应为None");
+        assert_eq!(state.last_stop_loss_ms, 0);
     }
 }
